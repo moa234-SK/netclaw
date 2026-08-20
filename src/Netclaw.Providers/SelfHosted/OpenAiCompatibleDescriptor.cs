@@ -34,6 +34,9 @@ public sealed class OpenAiCompatibleDescriptor : IProviderDescriptor
     public Task<ProviderProbeResult> ProbeAsync(
         ProviderEntry entry, CancellationToken ct = default)
     {
+        if (!OpenAiCompatibleRequestHeaders.TryResolve(entry, out var requestHeaders, out var headerError))
+            return Task.FromResult(new ProviderProbeResult(false, headerError, []));
+
         var effectiveBase = string.IsNullOrWhiteSpace(entry.Endpoint)
             ? DefaultEndpoint
             : entry.Endpoint;
@@ -50,6 +53,7 @@ public sealed class OpenAiCompatibleDescriptor : IProviderDescriptor
                 var apiKey = entry.ApiKey?.Value;
                 if (!string.IsNullOrWhiteSpace(apiKey))
                     request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                OpenAiCompatibleRequestHeaders.Apply(request, requestHeaders);
             },
             ParseModels,
             ct,

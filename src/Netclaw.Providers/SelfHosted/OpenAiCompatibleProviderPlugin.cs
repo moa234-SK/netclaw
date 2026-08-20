@@ -25,6 +25,10 @@ public sealed class OpenAiCompatibleProviderPlugin : ProviderPluginBase<OpenAiCo
 
     public override IChatClient CreateChatClient(ProviderEntry entry, ModelReference model)
     {
+        if (!OpenAiCompatibleRequestHeaders.TryResolve(entry, out var requestHeaders, out var headerError))
+            throw new InvalidOperationException(
+                $"Cannot create chat client for provider '{model.Provider}' (openai-compatible): {headerError}");
+
         var endpoint = OpenAiCompatibleEndpoint.FromBaseUrl(
             entry.Endpoint ?? DefaultEndpoint,
             entry.ApiKey?.Value);
@@ -33,7 +37,9 @@ public sealed class OpenAiCompatibleProviderPlugin : ProviderPluginBase<OpenAiCo
             CreateLlmHttpClient(endpoint.BaseUri),
             endpoint,
             model.ModelId,
-            _loggerFactory.CreateLogger<OpenAiCompatibleChatClient>());
+            OpenAiCompatibleWireProfile.Generic,
+            _loggerFactory.CreateLogger<OpenAiCompatibleChatClient>(),
+            requestHeaders: requestHeaders);
     }
 
     // OpenAiCompatibleChatClient forwards ChatOptions.AdditionalProperties verbatim as

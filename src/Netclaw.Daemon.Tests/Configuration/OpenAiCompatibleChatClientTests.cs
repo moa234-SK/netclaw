@@ -1141,6 +1141,34 @@ data: [DONE]
         return toolsElement.GetRawText();
     }
 
+    [Fact]
+    public async Task CustomRequestHeaders_AppliedAlongsideBearerAuth()
+    {
+        using var handler = new RecordingHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("{\"id\":\"1\",\"model\":\"test\",\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}", Encoding.UTF8, "application/json")
+        });
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("http://localhost:8000") };
+        var endpoint = OpenAiCompatibleEndpoint.FromBaseUrl("http://localhost:8000", "sk-test");
+        var client = new OpenAiCompatibleChatClient(
+            httpClient, endpoint, "test-model", OpenAiCompatibleWireProfile.Generic,
+            requestHeaders: new Dictionary<string, string>
+            {
+                ["x-team-id"] = "team-1",
+                ["x-agent-id"] = "agent-1"
+            });
+
+        await client.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, "hello")],
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        var request = handler.Requests.Single();
+        Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
+        Assert.Equal("sk-test", request.Headers.Authorization?.Parameter);
+        Assert.Equal("team-1", request.Headers.GetValues("x-team-id").Single());
+        Assert.Equal("agent-1", request.Headers.GetValues("x-agent-id").Single());
+    }
+
     private sealed class RecordingHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, HttpResponseMessage> _handler;

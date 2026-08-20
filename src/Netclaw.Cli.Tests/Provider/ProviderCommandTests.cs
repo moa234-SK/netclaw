@@ -9,6 +9,7 @@ using Netclaw.Cli.Provider;
 using Netclaw.Configuration;
 using Netclaw.Configuration.Secrets;
 using Netclaw.Providers.OAuth;
+using Netclaw.Providers.SelfHosted;
 using Netclaw.Tests.Utilities;
 using Xunit;
 
@@ -122,6 +123,77 @@ public sealed class ProviderCommandTests : IDisposable
         var config = ReadConfigFile(_paths.NetclawConfigPath);
         var provider = config.RootElement.GetProperty("Providers").GetProperty("my-openai");
         Assert.Equal("ApiKey", provider.GetProperty("AuthMethod").GetString());
+    }
+
+    [Fact]
+    public async Task Add_OpenAiCompatibleWithHeaders_WritesVendorOptionsHeaders()
+    {
+        var exitCode = await ProviderCommand.RunAsync(
+            ["provider", "add", "mem-proxy", "openai-compatible",
+             "--endpoint", "http://localhost:8096/openclaw/default",
+             "--api-key", "sk-mem-test",
+             "--header", "x-team-id=team-1",
+             "--header", "x-agent-id=agent-1"],
+            _paths, output: _output);
+
+        Assert.Equal(0, exitCode);
+
+        var config = ReadConfigFile(_paths.NetclawConfigPath);
+        var provider = config.RootElement.GetProperty("Providers").GetProperty("mem-proxy");
+        var headers = provider.GetProperty("VendorOptions").GetProperty("Headers");
+        Assert.Equal("team-1", headers.GetProperty("x-team-id").GetString());
+        Assert.Equal("agent-1", headers.GetProperty("x-agent-id").GetString());
+
+        // Round-trip: the persisted shape must bind to what runtime code consumes.
+        var loaded = ProviderCommand.LoadProviders(_paths);
+        Assert.True(OpenAiCompatibleRequestHeaders.TryResolve(
+            loaded["mem-proxy"], out var requestHeaders, out var error), error);
+        Assert.NotNull(requestHeaders);
+        Assert.Equal("team-1", requestHeaders!["x-team-id"]);
+        Assert.Equal("agent-1", requestHeaders["x-agent-id"]);
+    }
+
+    [Fact]
+    public async Task Add_ReservedHeader_RejectedBeforePersistence()
+    {
+        var exitCode = await ProviderCommand.RunAsync(
+            ["provider", "add", "mem-proxy", "openai-compatible",
+             "--endpoint", "http://localhost:8096/openclaw/default",
+             "--api-key", "sk-mem-test",
+             "--header", "Authorization=stolen"],
+            _paths, output: _output);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("reserved", _output.ToString());
+        Assert.False(File.Exists(_paths.NetclawConfigPath));
+    }
+
+    [Fact]
+    public async Task Add_MalformedHeaderSpec_RejectedBeforePersistence()
+    {
+        var exitCode = await ProviderCommand.RunAsync(
+            ["provider", "add", "mem-proxy", "openai-compatible",
+             "--endpoint", "http://localhost:8096/openclaw/default",
+             "--api-key", "sk-mem-test",
+             "--header", "no-separator"],
+            _paths, output: _output);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("invalid --header", _output.ToString());
+        Assert.False(File.Exists(_paths.NetclawConfigPath));
+    }
+
+    [Fact]
+    public async Task Add_HeaderForNonOpenAiCompatibleType_Rejected()
+    {
+        var exitCode = await ProviderCommand.RunAsync(
+            ["provider", "add", "my-ollama", "ollama",
+             "--endpoint", "http://my-gpu-server:11434",
+             "--header", "x-team-id=t1"],
+            _paths, output: _output);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("only supported for provider type 'openai-compatible'", _output.ToString());
     }
 
     [Fact]

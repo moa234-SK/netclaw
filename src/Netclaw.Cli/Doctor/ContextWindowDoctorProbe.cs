@@ -23,6 +23,11 @@ internal static class ContextWindowDoctorProbe
 
         using var httpClient = new HttpClient { Timeout = ProbeTimeout };
 
+        // Bad header config is rejected loudly at daemon startup and by the
+        // provider probe; here a parse failure just leaves the context window
+        // unknown, which is this probe's designed "cannot determine" outcome.
+        OpenAiCompatibleRequestHeaders.TryResolve(entry, out var requestHeaders, out _);
+
         IModelCapabilityResolver? resolver = entry.Type.ToLowerInvariant() switch
         {
             "ollama" => new OllamaCapabilityResolver(
@@ -33,7 +38,8 @@ internal static class ContextWindowDoctorProbe
                 httpClient,
                 NullLogger<OpenAiCompatibleCapabilityResolver>.Instance,
                 entry.Endpoint,
-                entry.ApiKey?.Value),
+                entry.ApiKey?.Value,
+                requestHeaders),
             _ => null
         };
 

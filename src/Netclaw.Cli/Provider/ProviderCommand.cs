@@ -11,6 +11,7 @@ using Netclaw.Configuration;
 using Netclaw.Providers;
 using Netclaw.Providers.GitHubCopilot;
 using Netclaw.Providers.OAuth;
+using Netclaw.Providers.SelfHosted;
 using Netclaw.Configuration.Secrets;
 
 namespace Netclaw.Cli.Provider;
@@ -93,13 +94,14 @@ internal static class ProviderCommand
 
     private static async Task<int> RunAddAsync(string[] args, NetclawPaths paths, ProviderDescriptorRegistry registry, TextWriter writer)
     {
-        // Parse: netclaw provider add <name> <type> [--api-key <key>] [--endpoint <url>] [--auth <method>]
+        // Parse: netclaw provider add <name> <type> [--api-key <key>] [--endpoint <url>] [--auth <method>] [--header <name>=<value>]...
         if (args.Length < 4)
         {
-            writer.WriteLine("Usage: netclaw provider add <name> <type> [--api-key <key>] [--endpoint <url>] [--auth <method>]");
+            writer.WriteLine("Usage: netclaw provider add <name> <type> [--api-key <key>] [--endpoint <url>] [--auth <method>] [--header <name>=<value>]...");
             writer.WriteLine();
             writer.WriteLine("Types: " + string.Join(", ", registry.KnownTypeKeys));
             writer.WriteLine("Auth methods: api-key, oauth-device");
+            writer.WriteLine("Note: --header (repeatable) is supported for type 'openai-compatible' only.");
             return 1;
         }
 
@@ -118,6 +120,7 @@ internal static class ProviderCommand
         string? authFlag = null;
         string? gitHubHost = null;
         string? gitHubApiBase = null;
+        var headerSpecs = new List<string>();
 
         for (var i = 4; i < args.Length; i++)
         {
@@ -139,6 +142,12 @@ internal static class ProviderCommand
                 continue;
             }
 
+            if (args[i] is "--header" && i + 1 < args.Length)
+            {
+                headerSpecs.Add(args[++i]);
+                continue;
+            }
+
             if (args[i] is "--github-host" && i + 1 < args.Length)
             {
                 gitHubHost = args[++i];
@@ -150,6 +159,13 @@ internal static class ProviderCommand
                 gitHubApiBase = args[++i];
                 continue;
             }
+        }
+
+        IReadOnlyDictionary<string, object?>? headerVendorOptions = null;
+        if (headerSpecs.Count > 0)
+        {
+            if (!TryBuildHeaderVendorOptions(type, headerSpecs, writer, out headerVendorOptions))
+                return 1;
         }
 
         AuthMethod? requestedAuthMethod = null;
@@ -263,7 +279,8 @@ internal static class ProviderCommand
 
         ProviderCredentialWriter.WriteProvider(
             paths, name, type, authMethod, endpoint,
-            oauthResult: null, apiKey: apiKey, registry);
+            oauthResult: null, apiKey: apiKey, registry,
+            vendorOptions: vendorOptions ?? headerVendorOptions);
 
         writer.WriteLine($"Added provider '{name}' ({type})");
         WriteProviderGuidance(descriptor, writer);
@@ -280,6 +297,52 @@ internal static class ProviderCommand
            && string.IsNullOrWhiteSpace(apiKey)
            && string.Equals(providerType, "openai", StringComparison.OrdinalIgnoreCase)
            && supportedAuth.Contains(AuthMethod.OAuthDevice);
+
+    /// <summary>
+    /// Converts repeatable <c>--header name=value</c> CLI tokens into the
+    /// VendorOptions shape the openai-compatible plugin consumes
+    /// (<c>{ "Headers": { name: value } }</c>). Validates before persistence so
+    /// an invalid header never reaches netclaw.json.
+    /// </summary>
+    internal static bool TryBuildHeaderVendorOptions(
+        string providerType,
+        IReadOnlyList<string> headerSpecs,
+        TextWriter writer,
+        out IReadOnlyDictionary<string, object?>? vendorOptions)
+    {
+        vendorOptions = null;
+
+        if (!string.Equals(providerType, "openai-compatible", StringComparison.OrdinalIgnoreCase))
+        {
+            writer.WriteLine("Error: --header is only supported for provider type 'openai-compatible'.");
+            return false;
+        }
+
+        var parsed = new Dictionary<string, string>();
+        foreach (var spec in headerSpecs)
+        {
+            var separator = spec.IndexOf('=');
+            if (separator <= 0 || separator == spec.Length - 1)
+            {
+                writer.WriteLine($"Error: invalid --header '{spec}'. Use --header <name>=<value>.");
+                return false;
+            }
+
+            parsed[spec[..separator]] = spec[(separator + 1)..];
+        }
+
+        if (!OpenAiCompatibleRequestHeaders.TryValidate(parsed, out var headers, out var error))
+        {
+            writer.WriteLine($"Error: {error}");
+            return false;
+        }
+
+        vendorOptions = new Dictionary<string, object?>
+        {
+            ["Headers"] = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase)
+        };
+        return true;
+    }
 
     internal static bool TryBuildGitHubCopilotVendorOptions(
         string providerType,
@@ -621,6 +684,7 @@ internal static class ProviderCommand
         writer.WriteLine();
         writer.WriteLine("Examples:");
         writer.WriteLine("  netclaw provider add my-ollama ollama --endpoint http://my-gpu-server:11434");
+        writer.WriteLine("  netclaw provider add mem-proxy openai-compatible --endpoint http://localhost:8096/openclaw/default/v1 --header x-team-id=t1 --header x-agent-id=a1");
         writer.WriteLine("  netclaw provider add my-anthropic anthropic --api-key sk-ant-...");
         writer.WriteLine("  netclaw provider add my-openai openai --auth oauth-device");
         writer.WriteLine("  netclaw provider add copilot-ghe github-copilot --auth oauth-device --github-host https://example.ghe.com --github-api-base https://api.example.ghe.com");

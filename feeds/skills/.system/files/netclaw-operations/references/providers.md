@@ -22,7 +22,7 @@ and a `type` (well-known identifier). Manage them with `netclaw provider`:
 |------|------|-------|
 | `ollama` | Endpoint only | `--endpoint http://host:11434` |
 | `openai` | API key **or** OAuth (ChatGPT sub) | Codex backend for OAuth path |
-| `openai-compatible` | Endpoint; optional API key (Bearer) | Generic OpenAI-shape proxies, llama.cpp, vLLM. Also DwarfStar (ds4): `--endpoint http://127.0.0.1:8000`, run `ds4-server` separately, model ids `deepseek-v4-flash` / `deepseek-v4-pro`, context window auto-detected. For gated endpoints (LiteLLM, intranet gateways), add `--api-key <key>`; the key is stored in `secrets.json` and sent as `Authorization: Bearer`. `netclaw init` and the `netclaw provider` TUI offer the same choice ("No auth (local endpoint)" vs "API Key"). An entry that declares `AuthMethod: ApiKey` without a stored key is reported by `netclaw doctor`. |
+| `openai-compatible` | Endpoint; optional API key (Bearer) | Generic OpenAI-shape proxies, llama.cpp, vLLM. Also DwarfStar (ds4): `--endpoint http://127.0.0.1:8000`, run `ds4-server` separately, model ids `deepseek-v4-flash` / `deepseek-v4-pro`, context window auto-detected. For gated endpoints (LiteLLM, intranet gateways), add `--api-key <key>`; the key is stored in `secrets.json` and sent as `Authorization: Bearer`. `netclaw init` and the `netclaw provider` TUI offer the same choice ("No auth (local endpoint)" vs "API Key"). An entry that declares `AuthMethod: ApiKey` without a stored key is reported by `netclaw doctor`. Supports repeatable `--header <name>=<value>` for proxies that require routing headers (see "Static request headers" below). |
 | `anthropic` | API key | `sk-ant-...` |
 | `openrouter` | API key | `sk-or-...` |
 | `github-copilot` | OAuth device flow only | Requires active Copilot subscription on the GitHub account |
@@ -34,6 +34,32 @@ Provider-specific behavior toggles belong under
 `Providers.<name>.VendorOptions`. Netclaw keeps that bag opaque at the core
 config layer; each provider plugin deserializes and validates its own typed
 options instead of adding provider-specific properties to `ProviderEntry`.
+
+### Static request headers (`openai-compatible` only)
+
+Proxies in front of an OpenAI-compatible endpoint often require routing
+headers. Example: TencentDB Agent Memory MemoryProxy registers a session from
+`x-team-id` / `x-agent-id` / `x-task-id` / `x-conversation-id` headers instead
+of an interactive form. Add them at provider creation:
+
+```bash
+netclaw provider add mem-proxy openai-compatible \
+  --endpoint http://localhost:8096/openclaw/default \
+  --api-key <user-key> \
+  --header x-team-id=<team-id> \
+  --header x-agent-id=<agent-id> \
+  --header x-task-id=<task-id> \
+  --header x-conversation-id=<session-id>
+```
+
+`--header <name>=<value>` is repeatable and stores
+`Providers.<name>.VendorOptions.Headers` in `netclaw.json`. The headers ride
+on every request Netclaw sends to that endpoint (chat completions, model
+listing, capability probes). `Authorization`, `Content-Type`, `Content-Length`,
+and `Host` are rejected — use `--api-key` for bearer auth. Invalid names,
+empty values, line breaks, and case-insensitive duplicates are rejected before
+anything is persisted. To change headers later, edit `VendorOptions.Headers`
+in `netclaw.json` and restart the daemon.
 
 ### Degraded mode: No-Op chat client
 

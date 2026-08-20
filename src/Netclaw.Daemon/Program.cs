@@ -500,6 +500,12 @@ static void ConfigureDaemonServices(
     var openAiCompatibleApiKey = mainProviderType?.Equals("openai-compatible", StringComparison.OrdinalIgnoreCase) == true
         ? mainProvider?.ApiKey?.Value
         : null;
+    IReadOnlyDictionary<string, string>? openAiCompatibleRequestHeaders = null;
+    if (mainProviderType?.Equals("openai-compatible", StringComparison.OrdinalIgnoreCase) == true
+        && !OpenAiCompatibleRequestHeaders.TryResolve(mainProvider!, out openAiCompatibleRequestHeaders, out var headerError))
+    {
+        throw new InvalidOperationException($"Invalid provider configuration: {headerError}");
+    }
 
     services.AddSingleton<ModelCapabilities>(sp =>
     {
@@ -1005,7 +1011,8 @@ static void ConfigureDaemonServices(
                 sp.GetRequiredService<IHttpClientFactory>().CreateClient(nameof(OpenAiCompatibleCapabilityResolver)),
                 sp.GetRequiredService<ILogger<OpenAiCompatibleCapabilityResolver>>(),
                 openAiCompatibleEndpoint,
-                openAiCompatibleApiKey));
+                openAiCompatibleApiKey,
+                openAiCompatibleRequestHeaders));
     }
     // modelId → provider type lookup for CompositeCapabilityResolver scoping.
     // Covers Main + optional Compaction independently so multi-provider

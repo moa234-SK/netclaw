@@ -39,6 +39,7 @@ public sealed class OpenAiCompatibleChatClient : IChatClient
     private readonly OpenAiCompatibleEndpoint _endpoint;
     private readonly string _modelId;
     private readonly OpenAiCompatibleWireProfile _wireProfile;
+    private readonly IReadOnlyDictionary<string, string>? _requestHeaders;
     private readonly ILogger _logger;
 
     public OpenAiCompatibleChatClient(HttpClient httpClient, OpenAiCompatibleEndpoint endpoint, string modelId,
@@ -52,13 +53,16 @@ public sealed class OpenAiCompatibleChatClient : IChatClient
         OpenAiCompatibleEndpoint endpoint,
         string modelId,
         OpenAiCompatibleWireProfile wireProfile,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        IReadOnlyDictionary<string, string>? requestHeaders = null)
     {
         _httpClient = httpClient;
         _endpoint = endpoint;
         _modelId = modelId;
         _wireProfile = wireProfile;
         _logger = logger ?? NullLogger.Instance;
+        // Absence is a real state: no proxy in front means no routing headers.
+        _requestHeaders = requestHeaders is { Count: > 0 } ? requestHeaders : null;
     }
 
     public async Task<ChatResponse> GetResponseAsync(
@@ -492,6 +496,8 @@ public sealed class OpenAiCompatibleChatClient : IChatClient
 
         if (!string.IsNullOrWhiteSpace(_endpoint.ApiKey))
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _endpoint.ApiKey);
+
+        OpenAiCompatibleRequestHeaders.Apply(request, _requestHeaders);
 
         return request;
     }

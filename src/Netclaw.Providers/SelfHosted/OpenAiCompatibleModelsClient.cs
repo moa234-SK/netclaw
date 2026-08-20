@@ -12,11 +12,16 @@ public sealed class OpenAiCompatibleModelsClient
 {
     private readonly HttpClient _httpClient;
     private readonly OpenAiCompatibleEndpoint _endpoint;
+    private readonly IReadOnlyDictionary<string, string>? _requestHeaders;
 
-    public OpenAiCompatibleModelsClient(HttpClient httpClient, OpenAiCompatibleEndpoint endpoint)
+    public OpenAiCompatibleModelsClient(
+        HttpClient httpClient,
+        OpenAiCompatibleEndpoint endpoint,
+        IReadOnlyDictionary<string, string>? requestHeaders = null)
     {
         _httpClient = httpClient;
         _endpoint = endpoint;
+        _requestHeaders = requestHeaders is { Count: > 0 } ? requestHeaders : null;
     }
 
     public async Task<string[]> ListModelIdsAsync(CancellationToken cancellationToken = default)
@@ -43,5 +48,7 @@ public sealed class OpenAiCompatibleModelsClient
     {
         if (!string.IsNullOrWhiteSpace(_endpoint.ApiKey))
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _endpoint.ApiKey);
+
+        OpenAiCompatibleRequestHeaders.Apply(request, _requestHeaders);
     }
 }

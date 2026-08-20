@@ -33,16 +33,19 @@ public sealed class OpenAiCompatibleCapabilityResolver : IModelCapabilityResolve
     private readonly HttpClient _httpClient;
     private readonly ILogger<OpenAiCompatibleCapabilityResolver> _logger;
     private readonly OpenAiCompatibleEndpoint _endpoint;
+    private readonly IReadOnlyDictionary<string, string>? _requestHeaders;
 
     public OpenAiCompatibleCapabilityResolver(
         HttpClient httpClient,
         ILogger<OpenAiCompatibleCapabilityResolver> logger,
         string endpoint,
-        string? apiKey = null)
+        string? apiKey = null,
+        IReadOnlyDictionary<string, string>? requestHeaders = null)
     {
         _httpClient = httpClient;
         _logger = logger;
         _endpoint = OpenAiCompatibleEndpoint.FromBaseUrl(endpoint, apiKey);
+        _requestHeaders = requestHeaders is { Count: > 0 } ? requestHeaders : null;
         _httpClient.BaseAddress ??= _endpoint.BaseUri;
     }
 
@@ -123,5 +126,7 @@ public sealed class OpenAiCompatibleCapabilityResolver : IModelCapabilityResolve
     {
         if (!string.IsNullOrWhiteSpace(_endpoint.ApiKey))
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _endpoint.ApiKey);
+
+        OpenAiCompatibleRequestHeaders.Apply(request, _requestHeaders);
     }
 }
