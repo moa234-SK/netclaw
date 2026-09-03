@@ -59,7 +59,7 @@ public sealed class SubAgentSpawnerTests : TestKit
                 new GitWorkingContextInspector(TimeProvider.System),
                 NullLogger<WorkingContextSnapshotProvider>.Instance,
                 environment),
-            NullLogger<SubAgentSpawner>.Instance);
+            NullLogger<SubAgentSpawner>.Instance, NoOpToolInvocationGovernor.Instance);
 
         var childProbe = CreateTestProbe("subagent-child");
         var context = TestToolExecutionContext.CreateBound("console/subagent-parent", "/tmp/netclaw/sessions/parent", new TestToolExecutionContextOptions
@@ -192,7 +192,7 @@ public sealed class SubAgentSpawnerTests : TestKit
             new WorkingContextSnapshotProvider(
                 new GitWorkingContextInspector(TimeProvider.System),
                 NullLogger<WorkingContextSnapshotProvider>.Instance),
-            NullLogger<SubAgentSpawner>.Instance);
+            NullLogger<SubAgentSpawner>.Instance, NoOpToolInvocationGovernor.Instance);
 
         var notifications = new List<SubAgentNotificationInfo>();
         var childProbe = CreateTestProbe("subagent-tool-metadata-child");
@@ -537,6 +537,7 @@ public sealed class SubAgentSpawnerTests : TestKit
                 new GitWorkingContextInspector(TimeProvider.System),
                 NullLogger<WorkingContextSnapshotProvider>.Instance),
             NullLogger<SubAgentSpawner>.Instance,
+            NoOpToolInvocationGovernor.Instance,
             sessionMetrics: metrics);
 
         var context = TestToolExecutionContext.CreateBound("console/subagent-parent", "/tmp/netclaw/sessions/parent", new TestToolExecutionContextOptions
@@ -592,7 +593,7 @@ public sealed class SubAgentSpawnerTests : TestKit
             approvalService: null,
             new StaticSystemPromptProvider("You are an inspector."),
             workingContextSnapshots,
-            NullLogger<SubAgentSpawner>.Instance);
+            NullLogger<SubAgentSpawner>.Instance, NoOpToolInvocationGovernor.Instance);
     }
 
     private static GitWorkingContextSnapshot GitSnapshot(string worktree, params string[] changedFiles) => new()

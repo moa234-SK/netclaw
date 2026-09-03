@@ -131,7 +131,7 @@ internal static class SkillCommand
             return 1;
         }
 
-        return RenderInventory(inventory!.Skills, output);
+        return RenderInventory(inventory!.Skills!, output);
     }
 
     private static int RenderInventory(IReadOnlyList<SkillInventory.SkillRow> skills, TextWriter output)

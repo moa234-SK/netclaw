@@ -68,6 +68,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
     private readonly IChatClient _chatClient;
     private readonly ToolAccessPolicy _toolAccessPolicy;
     private readonly IToolApprovalService? _approvalService;
+    private readonly IToolInvocationGovernor _governor;
     private readonly ISystemPromptProvider _promptProvider;
     private readonly int _maxToolIterations;
 
@@ -164,7 +165,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ToolAccessPolicy toolAccessPolicy,
         IToolApprovalService? approvalService = null,
         int maxToolIterations = DefaultMaxToolIterations,
-        Telemetry.ISessionMetrics? sessionMetrics = null)
+        Telemetry.ISessionMetrics? sessionMetrics = null,
+        IToolInvocationGovernor? governor = null)
         : this(
             definition,
             chatClient,
@@ -172,7 +174,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             NullSystemPromptProvider.Instance,
             approvalService,
             maxToolIterations,
-            sessionMetrics)
+            sessionMetrics,
+            governor)
     {
     }
 
@@ -183,7 +186,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ISystemPromptProvider promptProvider,
         IToolApprovalService? approvalService,
         int maxToolIterations,
-        Telemetry.ISessionMetrics? sessionMetrics)
+        Telemetry.ISessionMetrics? sessionMetrics,
+        IToolInvocationGovernor? governor = null)
     {
         if (maxToolIterations <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxToolIterations), maxToolIterations,
@@ -199,6 +203,12 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         _toolAccessPolicy = toolAccessPolicy;
         _promptProvider = promptProvider;
         _approvalService = approvalService;
+        // The governor flows from the parent session: a null here means the
+        // spawner ran without governance wiring (tests, non-DI hosts) and the
+        // NoOp keeps the executor contract non-nullable. The production path
+        // requires the governor on SubAgentSpawner, so this default is only
+        // reachable through direct actor construction.
+        _governor = governor ?? NoOpToolInvocationGovernor.Instance;
         _maxToolIterations = maxToolIterations;
         _projectInstructions = definition.ProjectInstructions;
         _log = Context.GetLogger();
@@ -222,7 +232,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ToolAccessPolicy toolAccessPolicy,
         IToolApprovalService? approvalService = null,
         int maxToolIterations = DefaultMaxToolIterations,
-        Telemetry.ISessionMetrics? sessionMetrics = null)
+        Telemetry.ISessionMetrics? sessionMetrics = null,
+        IToolInvocationGovernor? governor = null)
     {
         return Props.Create(() => new SubAgentActor(
             definition,
@@ -230,7 +241,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             toolAccessPolicy,
             approvalService,
             maxToolIterations,
-            sessionMetrics));
+            sessionMetrics,
+            governor));
     }
 
     internal static Props CreatePropsWithProjectInstructionProvider(
@@ -240,7 +252,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ISystemPromptProvider promptProvider,
         IToolApprovalService? approvalService = null,
         int maxToolIterations = DefaultMaxToolIterations,
-        Telemetry.ISessionMetrics? sessionMetrics = null)
+        Telemetry.ISessionMetrics? sessionMetrics = null,
+        IToolInvocationGovernor? governor = null)
     {
         ArgumentNullException.ThrowIfNull(promptProvider);
         return Props.CreateBy(new SubAgentActorProducer(
@@ -250,7 +263,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             promptProvider,
             approvalService,
             maxToolIterations,
-            sessionMetrics));
+            sessionMetrics,
+            governor));
     }
 
     private sealed class SubAgentActorProducer(
@@ -260,7 +274,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
         ISystemPromptProvider promptProvider,
         IToolApprovalService? approvalService,
         int maxToolIterations,
-        Telemetry.ISessionMetrics? sessionMetrics) : IIndirectActorProducer
+        Telemetry.ISessionMetrics? sessionMetrics,
+        IToolInvocationGovernor? governor) : IIndirectActorProducer
     {
         public Type ActorType => typeof(SubAgentActor);
 
@@ -272,7 +287,8 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
                 promptProvider,
                 approvalService,
                 maxToolIterations,
-                sessionMetrics);
+                sessionMetrics,
+                governor);
 
         public void Release(ActorBase actor)
         {
@@ -768,7 +784,7 @@ public sealed class SubAgentActor : ReceiveActor, IWithTimers
             _definition.Name, toolNames);
 
         var self = Self;
-        var executor = new DispatchingToolExecutor(_toolRegistry, _toolAccessPolicy, _approvalService);
+        var executor = new DispatchingToolExecutor(_toolRegistry, _toolAccessPolicy, _approvalService, governor: _governor);
         var setWorkingDirectoryTool =
             _toolRegistry.GetByName(SetWorkingDirectoryTool.ToolName) as SetWorkingDirectoryTool;
         Func<string, ToolInvocationContext, bool>? canDeclareWorkingDirectory =

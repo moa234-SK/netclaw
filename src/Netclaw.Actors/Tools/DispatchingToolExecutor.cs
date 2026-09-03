@@ -25,15 +25,18 @@ public sealed class DispatchingToolExecutor : IToolExecutor, ISessionScratchRetr
     private readonly ToolAccessPolicy _policy;
     private readonly IToolApprovalService? _approvalService;
     private readonly ShellPolicyCoordinator _shellPolicyCoordinator;
+    private readonly IToolInvocationGovernor _governor;
     private readonly ILogger _logger;
 
     public DispatchingToolExecutor(ToolRegistry registry, ToolAccessPolicy policy,
-        IToolApprovalService? approvalService = null, ILogger<DispatchingToolExecutor>? logger = null)
+        IToolApprovalService? approvalService = null, ILogger<DispatchingToolExecutor>? logger = null,
+        IToolInvocationGovernor? governor = null)
     {
         _registry = registry;
         _policy = policy;
         _approvalService = approvalService;
         _shellPolicyCoordinator = new ShellPolicyCoordinator(policy, approvalService);
+        _governor = governor ?? NoOpToolInvocationGovernor.Instance;
         _logger = logger ?? (ILogger)NullLogger.Instance;
     }
 
@@ -310,6 +313,20 @@ public sealed class DispatchingToolExecutor : IToolExecutor, ISessionScratchRetr
             var missingToolDecision = ToolAuthorizationDecision.Deny("tool_not_found");
             LogAuthorizationDecision(toolCall.Name, missingToolDecision);
             return (missingToolDecision, null);
+        }
+
+        // Additive deny-overrides gate (external governance, e.g. ACS/Rego).
+        // Runs after tool resolution — unknown tools deny above — and before the
+        // native policy so a governance deny never triggers approval-prompt or
+        // shell-preflight work for a call that is already doomed. The governor's
+        // deny is categorical (not approvable) and rides the same decision/audit
+        // surface as every other deny.
+        var governorDecision = await _governor.CheckAsync(tool, context, toolCall.Arguments, ct);
+        if (governorDecision.DenyReason is { } governorDenyReason)
+        {
+            var governorAuthorization = ToolAuthorizationDecision.Deny(governorDenyReason);
+            LogAuthorizationDecision(toolCall.Name, governorAuthorization);
+            return (governorAuthorization, null);
         }
 
         if (string.Equals(tool.Name, ShellTool.ToolName, StringComparison.Ordinal))

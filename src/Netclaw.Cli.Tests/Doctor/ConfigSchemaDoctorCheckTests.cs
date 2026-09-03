@@ -423,6 +423,76 @@ public sealed class ConfigSchemaDoctorCheckTests
         Assert.Contains("MaxToolCallsPerTurn", result.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task ReturnsPass_WhenGovernanceSectionValid()
+    {
+        var basePath = CreateTempBasePath();
+        var paths = new NetclawPaths(basePath);
+        paths.EnsureDirectoriesExist();
+
+        await File.WriteAllTextAsync(paths.NetclawConfigPath,
+            """
+            {
+              "configVersion": 1,
+              "Governance": {
+                "Enabled": true,
+                "ManifestPath": "acs/manifest.yaml",
+                "OpaPath": "/usr/local/bin/opa"
+              }
+            }
+            """, TestContext.Current.CancellationToken);
+
+        var check = new ConfigSchemaDoctorCheck(paths);
+        var result = await check.RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(DoctorSeverity.Pass, result.Severity);
+    }
+
+    [Fact]
+    public async Task ReturnsPass_WhenGovernanceSectionOmitted()
+    {
+        var basePath = CreateTempBasePath();
+        var paths = new NetclawPaths(basePath);
+        paths.EnsureDirectoriesExist();
+
+        await File.WriteAllTextAsync(paths.NetclawConfigPath,
+            """
+            {
+              "configVersion": 1
+            }
+            """, TestContext.Current.CancellationToken);
+
+        var check = new ConfigSchemaDoctorCheck(paths);
+        var result = await check.RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(DoctorSeverity.Pass, result.Severity);
+    }
+
+    [Fact]
+    public async Task ReturnsError_WhenGovernanceSectionHasUnknownProperty()
+    {
+        var basePath = CreateTempBasePath();
+        var paths = new NetclawPaths(basePath);
+        paths.EnsureDirectoriesExist();
+
+        await File.WriteAllTextAsync(paths.NetclawConfigPath,
+            """
+            {
+              "configVersion": 1,
+              "Governance": {
+                "Enabled": false,
+                "ConflictStrategy": "DenyOverrides"
+              }
+            }
+            """, TestContext.Current.CancellationToken);
+
+        var check = new ConfigSchemaDoctorCheck(paths);
+        var result = await check.RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(DoctorSeverity.Error, result.Severity);
+        Assert.Contains("ConflictStrategy", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static async Task<DoctorCheckResult> RunCheckAsync(string? configJson = null)

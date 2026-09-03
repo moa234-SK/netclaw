@@ -638,6 +638,28 @@
       },
       "additionalProperties": false
     },
+    "Governance": {
+      "type": "object",
+      "description": "Agent Control Specification (ACS) Rego policy integration. Disabled by default; when Enabled, ACS policy evaluation runs as an additive deny-overrides layer over the existing tool gate (either gate denying blocks the call).",
+      "properties": {
+        "Enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, the manifest must validate and OPA must resolve, or the daemon refuses to start."
+        },
+        "ManifestPath": {
+          "type": "string",
+          "default": "acs/manifest.yaml",
+          "description": "ACS manifest path. Relative paths resolve against the Netclaw config directory."
+        },
+        "OpaPath": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Optional explicit OPA binary or directory. Falls back to ACS_OPA_PATH, then PATH."
+        }
+      },
+      "additionalProperties": false
+    },
     "Daemon": {
       "type": "object",
       "description": "Daemon network and exposure configuration.",

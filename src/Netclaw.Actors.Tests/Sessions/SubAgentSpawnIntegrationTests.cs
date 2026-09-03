@@ -194,7 +194,8 @@ public class SubAgentSpawnIntegrationTests : LlmSessionTestBase
             new WorkingContextSnapshotProvider(
                 new GitWorkingContextInspector(TimeProvider.System),
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<WorkingContextSnapshotProvider>.Instance),
-            Microsoft.Extensions.Logging.Abstractions.NullLogger<SubAgentSpawner>.Instance);
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<SubAgentSpawner>.Instance,
+            NoOpToolInvocationGovernor.Instance);
 
         registry.Register(new SpawnAgentTool(subAgentRegistry, spawner, subAgentPaths));
         _recordingFileReadTool = new RecordingContextTool("file_read", "stub file content", "file");

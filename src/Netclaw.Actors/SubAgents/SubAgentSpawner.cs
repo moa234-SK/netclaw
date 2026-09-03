@@ -52,6 +52,7 @@ public sealed class SubAgentSpawner
         ISystemPromptProvider promptProvider,
         IWorkingContextSnapshotProvider workingContextSnapshots,
         ILogger<SubAgentSpawner> logger,
+        IToolInvocationGovernor governor,
         SubAgentConfig? subAgentConfig = null,
         Telemetry.ISessionMetrics? sessionMetrics = null)
     {
@@ -63,8 +64,16 @@ public sealed class SubAgentSpawner
         _workingContextSnapshots = workingContextSnapshots;
         _subAgentConfig = subAgentConfig ?? new SubAgentConfig();
         _logger = logger;
+        _governor = governor ?? throw new ArgumentNullException(nameof(governor));
         _sessionMetrics = sessionMetrics;
     }
+
+    // Additive deny-overrides gate (external governance) forwarded to every
+    // spawned SubAgentActor. Required, not nullable: a null governor on the
+    // sub-agent path would silently disable governance checks exactly where
+    // least-supervised code runs. The no-op (disabled) state is expressed by
+    // injecting NoOpToolInvocationGovernor, never by omission.
+    private readonly IToolInvocationGovernor _governor;
 
     /// <summary>
     /// Spawn a subagent as a child of the owning session, execute the task, and return the result.
@@ -211,7 +220,8 @@ public sealed class SubAgentSpawner
             _promptProvider,
             _approvalService,
             SubAgentMaxToolIterations,
-            _sessionMetrics);
+            _sessionMetrics,
+            _governor);
         var actorName = $"subagent-{definition.Name}-{runId}";
         IActorRef subAgent;
         try

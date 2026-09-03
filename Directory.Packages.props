@@ -29,6 +29,9 @@
   <!-- App dependencies -->
   <ItemGroup>
     <PackageVersion Include="Akka.Hosting" Version="$(AkkaHostingVersion)" />
+    <!-- ACS policy runtime (Microsoft Agent Governance Toolkit). Beta line:
+         the only published line; native Rust core ships inside the nupkg. -->
+    <PackageVersion Include="AgentControlSpecification" Version="0.3.1-beta.1" />
     <PackageVersion Include="Akka.Cluster.Sharding" Version="$(AkkaHostingVersion)" />
     <PackageVersion Include="Akka.Persistence" Version="$(AkkaHostingVersion)" />
     <PackageVersion Include="Akka.Persistence.Hosting" Version="$(AkkaHostingVersion)" />

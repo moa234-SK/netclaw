@@ -28,6 +28,7 @@ using Netclaw.Actors.SubAgents;
 using Netclaw.Actors.Tools;
 using Netclaw.Channels;
 using Netclaw.Configuration;
+using Netclaw.Governance;
 using Netclaw.Configuration.Http;
 using Netclaw.Providers;
 using Netclaw.Providers.OAuth;
@@ -586,6 +587,30 @@ static void ConfigureDaemonServices(
     services.AddSingleton(effectivePolicyDefaults);
     services.AddSingleton<TrustContextDeriver>();
 
+    // ACS policy governance (Agent Control Specification, Rego) — disabled by
+    // default. When enabled, evaluation runs as an additive deny-overrides
+    // layer over the existing tool gate. Build() fails loud (no silent
+    // fallback) when the manifest is missing/invalid or OPA does not resolve,
+    // so an empty or partial policy can never implicitly allow every call.
+    var governanceConfig = configuration.GetSection("Governance")
+        .Get<GovernanceConfig>() ?? new GovernanceConfig();
+    services.AddSingleton(governanceConfig);
+    services.AddSingleton(sp => AcsGovernance.Build(
+        governanceConfig,
+        paths,
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger("Netclaw.Governance")));
+
+    // The governor is the additive deny-overrides ACS gate consulted inside
+    // DispatchingToolExecutor (main sessions, sub-agents, streaming paths).
+    // Registered as IToolInvocationGovernor and injected as a hard dependency
+    // downstream: the disabled state is the NoOp instance, never a null.
+    services.AddSingleton<IToolInvocationGovernor>(sp =>
+        governanceConfig.Enabled
+            ? new AcsToolInvocationGovernor(
+                sp.GetRequiredService<AcsGovernance>(),
+                sp.GetRequiredService<ILogger<AcsToolInvocationGovernor>>())
+            : NoOpToolInvocationGovernor.Instance);
+
     // Reminder limits stay private. Netclaw sets the library acknowledgement
     // lease in WithReminderManager because an LLM attempt can take one hour.
     services.AddSingleton<ReminderDefinitionStore>();
@@ -816,7 +841,8 @@ static void ConfigureDaemonServices(
             toolRegistry,
             toolAccessPolicy,
             sp.GetService<IToolApprovalService>(),
-            sp.GetRequiredService<ILogger<DispatchingToolExecutor>>()));
+            sp.GetRequiredService<ILogger<DispatchingToolExecutor>>(),
+            sp.GetRequiredService<Netclaw.Actors.Tools.IToolInvocationGovernor>()));
     // Operational notification webhooks
     var notificationsConfig = configuration.GetSection("Notifications")
         .Get<NotificationsConfig>() ?? new NotificationsConfig();
