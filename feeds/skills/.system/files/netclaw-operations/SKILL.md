@@ -3,7 +3,7 @@ name: netclaw-operations
 description: "REQUIRED when the user asks about scheduling, reminders, cron jobs, timers, background jobs, diagnostics, troubleshooting, MCP tools, daemon health, identity updates, or Netclaw capabilities and self-maintenance."
 metadata:
   author: netclaw
-  version: "2.61.0"
+  version: "2.65.4"
 ---
 
 # Netclaw Operations
@@ -41,6 +41,10 @@ a reference file — load the one matching the user's intent with
 
 When available, use `file_read` for a known local file read.
 When available, use `file_list` for a known local directory listing.
+Use `file_search` for bounded recursive name or literal text search.
+Use `file_read` for image metadata.
+Issue independent `file_read` calls in parallel when several paths are known.
+Use `tool_output_read` to continue a spilled result by call id.
 When available, use `file_write` or `file_edit` for a known local file change.
 When available, use `web_search` for external discovery and `web_fetch` for a known external page.
 When available, use `shell_execute` for local search, VCS, builds, tests, processes, or requested shell behavior.
@@ -48,6 +52,8 @@ Do not substitute shell commands when a listed first-party tool satisfies the ta
 Do not delegate a known file operation that an available file tool can complete.
 After a successful file tool result, do not use shell only to verify it unless the user requests shell behavior.
 For disposable text, use `file_write` then `file_read`; do not attempt a shell redirect first.
+Use `load_tool` directly for a known exact tool name.
+Use `search_tools` when the capability is known but its exact tool name is not.
 
 Keep shell approval friction bounded:
 
@@ -55,9 +61,11 @@ Keep shell approval friction bounded:
 2. Use one operation per call. Keep independent searches and diagnostics separate; do not join them with separators or labels.
 3. Add a pipeline only when the requested result requires it.
 4. Do not use shell only to verify a successful structured tool result.
-5. After an approval-required result, do not retry or substitute shell variants.
-6. A `Tool access denied:` result is terminal; do not change scope, retry, or substitute another tool.
-7. Apply one `Tool execution deferred:` correction unchanged; otherwise use a structured tool or report the block once.
+5. If approval is required but no interactive requester is available, do not retry or substitute the call during that turn.
+6. After an access denial, do not retry that call during the same user turn.
+7. Do not change its scope or substitute another tool to evade the denial.
+8. A later explicit user request can start a new call. Apply the normal approval policy to that call.
+9. Apply one `Tool execution deferred:` correction unchanged; otherwise use a structured tool or report the block once.
 
 ## Project Directory
 
@@ -142,9 +150,9 @@ Tool output is bounded to a small inline budget
 the context window. When a tool's output exceeds that budget you get a head+tail
 view inline plus a pointer to the full output — not the whole thing:
 
-- **`shell_execute`** spills the full (redacted) output to
-  `{session}/tool-calls/{toolCallId}.log` and gives you the path. Read a slice with
-  `file_read` (`StartLine`/`Limit`) or `grep` it — do NOT re-run the command to see more.
+- **`shell_execute`** retains the full redacted output inside the current session.
+  Use `tool_output_read` with the returned `CallId`, `Start`, and `Limit` values.
+  Do not request a path or rerun the source tool to read more.
 - **`file_read`** on a large file returns the head and steers you to read a
   specific range with `StartLine`/`Limit` or `grep` (`StartLine` is a 1-based line
   number — line 1 is the first line). Don't `cat` a huge file through
@@ -153,13 +161,14 @@ view inline plus a pointer to the full output — not the whole thing:
   `check_background_job` returns a tail, and you can `file_read`/`grep` the log for the rest.
   Netclaw deletes a terminal job's definition and logs 24 hours after completion.
 
-Reading a targeted range or grepping is always cheaper than re-running a command or
-re-reading a whole file. Secret-bearing values are redacted from all tool output.
+Use bounded continuation before re-running a command or re-reading a whole file.
+Secret-bearing values are redacted from all tool output.
 
 ## Tool Discovery
 
-Only a core toolset is always loaded. Use `search_tools(query)` to find additional
-or MCP tools by capability before concluding a tool doesn't exist. Full guidance:
+Only a core toolset is always loaded. Use `load_tool(name)` when an exact deferred
+tool name is known. Use `search_tools(query)` to find tools by capability when the
+name is unknown. Full guidance:
 `skill_read_resource('netclaw-operations', 'references/tools.md')`.
 
 MCP servers can also supply workflow skills. These skills use names such as
@@ -483,7 +492,9 @@ Add or switch model providers (including OAuth login) and configure search backe
 ## Diagnostics, Kill Switches & Self-Maintenance
 
 When something is broken, start with `netclaw status`, then `netclaw doctor`. Feature
-kill switches and self-update/health are covered in the reference. Full guidance:
+kill switches and self-update/health are covered in the reference. Memory embeddings
+can be backfilled with `netclaw memory backfill-embeddings [--force]`; doctor checks
+memory embedding availability. Full guidance:
 `skill_read_resource('netclaw-operations', 'references/diagnostics.md')`.
 
 ## Identity

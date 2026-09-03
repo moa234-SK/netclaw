@@ -33,6 +33,7 @@
     <ProjectReference Include="..\Netclaw.Actors\Netclaw.Actors.csproj" />
     <ProjectReference Include="..\Netclaw.Configuration\Netclaw.Configuration.csproj" />
     <ProjectReference Include="..\Netclaw.Governance\Netclaw.Governance.csproj" />
+    <ProjectReference Include="..\Netclaw.Embeddings\Netclaw.Embeddings.csproj" />
     <ProjectReference Include="..\Netclaw.Channels\Netclaw.Channels.csproj" />
     <ProjectReference Include="..\Netclaw.Channels.Slack\Netclaw.Channels.Slack.csproj" />
     <ProjectReference Include="..\Netclaw.Providers\Netclaw.Providers.csproj" />

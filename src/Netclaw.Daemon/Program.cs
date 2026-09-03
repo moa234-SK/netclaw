@@ -48,10 +48,26 @@ using Netclaw.Daemon.Lifecycle;
 using Netclaw.Daemon.Reminders;
 using Netclaw.Daemon.Skills;
 using Netclaw.Daemon.Webhooks;
+using Netclaw.Embeddings;
 using Netclaw.Search;
 using Netclaw.Tools;
 using Netclaw.Security;
 using static Microsoft.Extensions.Logging.LogLevel;
+
+// Handled first, before any directory creation, lock-file acquisition, or host startup:
+// `netclawd --version`/`-v` must print the version and exit rather than booting a real
+// daemon instance (alpha.onnx.2 production canary regression).
+if (DaemonCliArgs.IsVersionRequest(args))
+{
+    // Fully qualified: Program.cs (top-level statements) sits in the global namespace, and both
+    // Netclaw.Daemon and Netclaw.Configuration are `using`-imported here, so the unqualified
+    // "BuildInfo" is ambiguous between the two. Netclaw.Daemon.BuildInfo is the daemon-specific
+    // facade that reads the daemon assembly's own metadata (see that type's remarks).
+    Console.WriteLine(
+        $"netclawd {Netclaw.Daemon.BuildInfo.FullVersion} "
+        + $"(commit {Netclaw.Daemon.BuildInfo.CommitHash}, built {Netclaw.Daemon.BuildInfo.BuildTimestamp})");
+    return;
+}
 
 var bootstrapPaths = new NetclawPaths();
 try
@@ -317,6 +333,7 @@ static async Task RunDaemonAsync(
         .WithTags("Stats")
         .RequireAuthorization();
     app.MapWebhookEndpoints();
+    app.MapWebhookRouteEndpoints();
     app.MapMattermostActionEndpoint();
 
     app.MapPairingEndpoints();
@@ -635,65 +652,9 @@ static void ConfigureDaemonServices(
         .Get<SearchConfig>() ?? new SearchConfig();
     var searchBackend = searchConfig.Enabled ? CreateSearchBackend(searchConfig) : null;
 
-    // ConfigDirectory is hard-denied for agent writes and shell access to
-    // close the prompt-injection vector where an injected payload would
-    // instruct the agent to rewrite tool-approvals.json, hard-deny-overrides.json,
-    // or netclaw.json and grant itself global trust. Operators retain agency
-    // by editing config files outside the agent (their own editor) or via
-    // dedicated CLI commands that bypass the agent's tool-call path.
-    // Individual high-sensitivity paths (Secrets, Keys, etc.) are also listed
-    // explicitly for self-documenting intent — ConfigDirectory subsumes them
-    // but the explicit entries make the security purpose obvious to readers.
-    var writeDenyList = new[]
-    {
-        paths.ConfigDirectory,
-        paths.SecretsPath,
-        paths.KeysDirectory,
-        paths.SqliteDbPath,
-        // SQLite sidecars mirror the shell indicator list — they hold the same
-        // raw page data as the DB and must not be writable through tools either.
-        paths.SqliteDbPath + "-wal",
-        paths.SqliteDbPath + "-shm",
-        paths.SqliteDbPath + "-journal",
-        paths.PidFilePath,
-        paths.LockFilePath,
-        paths.RestartManifestPath,
-        // Skill directories managed by the sync service — writes from agent tools
-        // are lost on the next sync cycle and corrupt the sync service's view of
-        // on-disk state. The sync service writes directly via filesystem, not tools.
-        paths.SystemSkillsDirectory,
-        paths.ServerFeedsDirectory,
-    };
-    var readDenyList = new[]
-    {
-        paths.SecretsPath,
-        paths.KeysDirectory,
-        paths.WebhooksDirectory,
-    };
-    var shellIndicatorList = new[]
-    {
-        paths.ConfigDirectory,
-        paths.SecretsPath,
-        paths.WebhooksDirectory,
-        paths.KeysDirectory,
-        paths.SqliteDbPath,
-        // SQLite sidecars hold raw page data (webhook secrets, OAuth tokens)
-        // and are reachable via the read-deny union, so they must be denied
-        // exactly like the DB itself. Shell's substring scan already catches
-        // them (command text contains "netclaw.db"); the path-boundary matcher
-        // in ToolPathPolicy does not, hence the explicit entries (#1724).
-        paths.SqliteDbPath + "-wal",
-        paths.SqliteDbPath + "-shm",
-        paths.SqliteDbPath + "-journal",
-        paths.PidFilePath,
-        paths.LockFilePath,
-        paths.RestartManifestPath,
-    };
-    var toolPathPolicy = new ToolPathPolicy(
-        shellEnvironment,
-        writeDenyList,
-        readDenyList,
-        shellIndicatorList);
+    // Agent tools cannot read or change the control plane. This also protects the
+    // complete operator-only tool catalogs from model-visible name disclosure.
+    var toolPathPolicy = DaemonToolPathPolicyFactory.Create(paths, shellEnvironment);
     services.AddSingleton(toolPathPolicy);
 
     // Load operator-authored hard-deny overrides (additive only — see
@@ -831,6 +792,50 @@ static void ConfigureDaemonServices(
         toolRegistry.Register(new SqliteGetMemoriesTool(memoryStore));
         toolRegistry.Register(new SqliteStoreMemoryTool(new SQLiteMemoryCheckpointSink(memoryStore, TimeProvider.System)));
         toolRegistry.Register(new SqliteUpdateMemoryTool(memoryStore));
+
+        // Embedding foundation (memory-core-redesign Slice 2). The holder always exists —
+        // starts pointed at an Unavailable stub so any consumer resolving it before warmup
+        // completes gets a safe, explicit degraded value rather than a null reference — and
+        // EmbeddingWarmupHostedService populates it at startup (see that type's remarks for why
+        // a mutable holder is required instead of constructor injection).
+        services.AddHttpClient("EmbeddingModelProvisioner").AddNetclawHeaders("embedding-provisioner");
+        services.AddSingleton<IReadOnlyDictionary<string, EmbeddingModelManifestEntry>>(
+            EmbeddingModelProvisioner.Allowlist);
+        services.AddSingleton(sp => new EmbeddingModelProvisioner(
+            sp.GetRequiredService<IHttpClientFactory>().CreateClient("EmbeddingModelProvisioner"),
+            EmbeddingModelProvisioner.Allowlist));
+
+        // Initial prefix/floor are resolved from the allowlist entry (memory-query-prefix design
+        // D2/D3) rather than hardcoded empty/null placeholders: an unknown ModelId degrades to
+        // "no prefix, no calibration" here (TryGetValue returns null) exactly like any other
+        // missing-manifest-entry condition elsewhere — the daemon still starts, and
+        // EmbeddingWarmupHostedService's own load attempt is what surfaces the loud failure.
+        EmbeddingModelProvisioner.Allowlist.TryGetValue(memoryConfig.Embeddings.ModelId, out var initialEmbeddingEntry);
+        services.AddSingleton(_ => new MemoryEmbedderHolder(
+            new UnavailableMemoryEmbedder(memoryConfig.Embeddings.ModelId, "embedding warmup has not completed yet"),
+            initialQueryPrefix: initialEmbeddingEntry?.QueryPrefix ?? string.Empty,
+            initialCalibratedMinCosineSimilarity: initialEmbeddingEntry?.CalibratedMinCosineSimilarity));
+
+        // Vector index for the curation evaluator's embedding kNN nominator (memory-core-
+        // redesign Slice 3 Stage B, task 3.1). Registered alongside MemoryEmbedderHolder above:
+        // both are optional dependencies of MemoryCurationActor/MemoryCurationEngine that
+        // degrade to the lexical content-term search when either is absent or the embedder is
+        // unavailable.
+        services.AddSingleton(new MemoryVectorIndexHolder(memoryStore));
+
+        // Post-floor relevance gate (memory-relevance-gate D4). Same holder-and-warmup pattern
+        // as MemoryEmbedderHolder above; also an optional dependency of
+        // SQLiteMemoryRecallCoordinator, which degrades to floor-only behavior when this holder's
+        // current scorer is unavailable.
+        services.AddSingleton<IReadOnlyDictionary<string, RelevanceModelManifestEntry>>(
+            EmbeddingModelProvisioner.RelevanceAllowlist);
+        services.AddSingleton(_ => new RelevanceScorerHolder(
+            new UnavailableRelevanceScorer(
+                EmbeddingModelProvisioner.DefaultRelevanceModelId, "relevance gate warmup has not completed yet"),
+            initialCalibratedThreshold: EmbeddingModelProvisioner.RelevanceAllowlist[EmbeddingModelProvisioner.DefaultRelevanceModelId].CalibratedThreshold));
+
+        services.AddSingleton<EmbeddingWarmupHostedService>();
+        services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<EmbeddingWarmupHostedService>());
     }
 
     services.AddSingleton<IMemoryExtractor>(NullMemoryExtractor.Instance);
@@ -1091,7 +1096,9 @@ static void ConfigureDaemonServices(
         sp.GetService<IMemoryRecallCoordinator>() ?? NullMemoryRecallCoordinator.Instance,
         sp.GetService<IMemoryCheckpointSink>() ?? NullMemoryCheckpointSink.Instance,
         sp.GetService<SQLiteMemoryStore>(),
-        sp.GetService<MemoryConfig>()));
+        sp.GetService<MemoryConfig>(),
+        sp.GetService<MemoryEmbedderHolder>(),
+        sp.GetService<MemoryVectorIndexHolder>()));
 
     services.AddSingleton(sp => new SessionObservability(
         sp.GetService<Netclaw.Actors.Telemetry.ISessionMetrics>(),
@@ -1143,6 +1150,7 @@ static void ConfigureDaemonServices(
 
         akkaBuilder.WithNetclawSerialization();
         akkaBuilder.WithNetclawActors(shellEnvironment, reminderStorage);
+        akkaBuilder.WithWebhookRouteActor();
         akkaBuilder.WithSessionLogDispatcher(paths.SessionLogsDirectory, sp.GetRequiredService<TimeProvider>());
         akkaBuilder.WithSignalRGateway();
         akkaBuilder.WithDailyStatsActor();
@@ -1159,6 +1167,12 @@ static void ConfigureDaemonServices(
 
             var bgJobManager = registry.Get<Netclaw.Actors.Hosting.BackgroundJobManagerActorKey>();
             toolRegistry.WithBackgroundJobTools(bgJobManager);
+
+            // Route mutation tools ask the webhook route actor, so they register
+            // here rather than with the other first-party tools. The webhooks
+            // config gate matches the one on `list_webhooks` above.
+            if (webhooksConfig.Enabled)
+                toolRegistry.WithWebhookRouteTools(registry.Get<Netclaw.Actors.Hosting.WebhookRouteActorKey>());
 
             // Drain all active LLM sessions during any actor system termination (SIGTERM, daemon stop).
             // Runs in an early CoordinatedShutdown phase while actors are still alive.

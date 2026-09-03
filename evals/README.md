@@ -80,7 +80,7 @@ log patterns** (skill loading, memory recall, checkpoint formation).
 | Identity & Self-Awareness | 5 | Bot knows its name, version, repo, session ID, and routes all identity-file concerns without a skill dependency |
 | Skill Discovery and Activation | 20 | Models load relevant file, feed, and MCP prompt skills while they skip unrelated skills |
 | Memory Pipeline | 4 | Memory recall is active, identity-vs-memory routing is correct, explicit saves use memory tools, and automatic checkpointing still fires |
-| Tool Discovery & Use | 13 | Progressive discovery, file-vs-shell selection, web-vs-local search, and timestamped webhook configuration |
+| Tool Discovery & Use | 16 | Progressive discovery, structured workspace selection, web search, and timestamped webhook configuration |
 | Grounding & Alignment | 4 | Uses tools to verify facts, admits uncertainty, and resolves announced attachment paths from the authoritative session root |
 | Autonomy & Execution | 2 | Executes tasks rather than describing them |
 | Deployment Mission | 1 | Applies the disk mission playbook, loads its required skill, and returns reviewed sales email |
@@ -150,6 +150,7 @@ the missing values. In non-interactive contexts it fails loudly.
 | `NETCLAW_IMAGE` | `ghcr.io/netclaw-dev/netclaw:latest` | Image ref |
 | `NETCLAW_EVAL_PORT` | `5299` | Host-side port for the eval daemon |
 | `NETCLAW_BIN` | `netclaw` | Path to the netclaw CLI on the host |
+| `NETCLAW_EVAL_ASSET_ROOT` | Current checkout | Checkout that supplies identity, skills, agents, and config fixtures |
 
 ### Eval suite knobs (optional)
 
@@ -186,6 +187,11 @@ NETCLAW_EVAL_RUNS=10 NETCLAW_EVAL_TIMEOUT=180 \
   ./evals/run-evals.sh
 ```
 
+For a baseline and treatment comparison, use the same harness commit. Point
+`NETCLAW_EVAL_ASSET_ROOT` at the checkout that produced each image. Also use
+that checkout's CLI. The archived run metadata records the image identity,
+harness commit, asset commit, and dirty state.
+
 ## Results Database
 
 Results are accumulated in `$EVAL_HOME/evals/results.db` during execution.
@@ -193,6 +199,9 @@ On exit, the harness archives the database, run metadata, daemon log, and
 per-turn stdout under `evals/runs/<run-id>/` before deleting the throwaway
 home. These archives are gitignored and can be compared locally without
 touching the operator's `~/.netclaw/` state.
+
+Raw archives can contain prompts, session identities, tool calls, and provider
+configuration. Do not publish them. Publish only reviewed PII-free aggregates.
 
 Requires `sqlite3` CLI — if not available, the script still runs but
 skips persistence.
