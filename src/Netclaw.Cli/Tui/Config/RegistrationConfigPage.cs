@@ -32,6 +32,8 @@ internal sealed class RegistrationConfigPage : ReactivePage<RegistrationConfigVi
 
         ViewModel.Enabled.Subscribe(_ => _contentNode?.Invalidate()).DisposeWith(Subscriptions);
         ViewModel.BaseUrlDraft.Subscribe(_ => _contentNode?.Invalidate()).DisposeWith(Subscriptions);
+        ViewModel.ApiBaseUrlDraft.Subscribe(_ => _contentNode?.Invalidate()).DisposeWith(Subscriptions);
+        ViewModel.AutoPair.Subscribe(_ => _contentNode?.Invalidate()).DisposeWith(Subscriptions);
         ViewModel.HeartbeatIntervalDraft.Subscribe(_ => _contentNode?.Invalidate()).DisposeWith(Subscriptions);
         ViewModel.SelectedIndex.Subscribe(_ => _contentNode?.Invalidate()).DisposeWith(Subscriptions);
         ViewModel.IsSaved.Subscribe(_ => _contentNode?.Invalidate()).DisposeWith(Subscriptions);
@@ -54,6 +56,7 @@ internal sealed class RegistrationConfigPage : ReactivePage<RegistrationConfigVi
         _contentNode = new DynamicLayoutNode(() =>
         {
             var baseUrl = ViewModel.BaseUrlDraft.Value;
+            var apiBaseUrl = ViewModel.ApiBaseUrlDraft.Value;
             var interval = ViewModel.HeartbeatIntervalDraft.Value;
 
             var layout = Layouts.Vertical()
@@ -63,6 +66,12 @@ internal sealed class RegistrationConfigPage : ReactivePage<RegistrationConfigVi
                 .WithChild(Row(RegistrationConfigViewModel.BaseUrlRow,
                     "Panel base URL",
                     string.IsNullOrWhiteSpace(baseUrl) ? "– not set" : baseUrl))
+                .WithChild(Row(RegistrationConfigViewModel.ApiBaseUrlRow,
+                    "Daemon API URL",
+                    string.IsNullOrWhiteSpace(apiBaseUrl) ? "– not set (telemetry-only)" : apiBaseUrl))
+                .WithChild(Row(RegistrationConfigViewModel.AutoPairRow,
+                    "Auto-pair panel",
+                    ViewModel.AutoPair.Value ? "on" : "off"))
                 .WithChild(Row(RegistrationConfigViewModel.IntervalRow,
                     "Heartbeat seconds",
                     string.IsNullOrWhiteSpace(interval) ? "300 (default)" : interval))
@@ -81,6 +90,12 @@ internal sealed class RegistrationConfigPage : ReactivePage<RegistrationConfigVi
                     .WithForeground(Color.Gray))
                 .WithChild(new TextNode(
                         "  HTTPS. The interval must be between 30 and 86400 seconds.")
+                    .WithForeground(Color.Gray))
+                .WithChild(new TextNode(
+                        "  Auto-pair requires the daemon API URL and ships a single-use pairing")
+                    .WithForeground(Color.Gray))
+                .WithChild(new TextNode(
+                        "  code in the startup envelope so the panel can pair itself.")
                     .WithForeground(Color.Gray));
 
             return layout;

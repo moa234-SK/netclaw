@@ -31,6 +31,20 @@ The user is prompted for the pairing code. On success, the bearer token is
 saved to `secrets.json` (`DeviceToken` field) and the endpoint is saved to
 `~/.netclaw/client/config.json`.
 
+### Auto-pairing a control panel
+
+Manual pairing needs the operator to copy the code to the panel. With
+`Registration.AutoPair: true` (requires `Registration.ApiBaseUrl`) in
+`netclaw.json`, the daemon mints a single-use code at startup and includes
+it as `pairingCode` in the registration envelope. The panel exchanges it
+itself at `POST {apiBaseUrl}/api/pair/exchange` with
+`{"code": "...", "deviceName": "panel"}`. The code rides the startup
+envelope only — never heartbeats. If the panel missed it (it was down, or
+the 5-minute TTL lapsed), fall back to the manual flow above.
+
+The pairing code grants command authority. It does not authenticate the
+registration sender to the panel.
+
 ### Device management
 
 | Action | Command |

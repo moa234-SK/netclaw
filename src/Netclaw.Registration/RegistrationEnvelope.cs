@@ -42,6 +42,18 @@ public sealed class RegistrationEnvelope : IWireType
     /// </summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ApiBaseUrl { get; init; }
+
+    /// <summary>
+    /// Single-use device pairing code (<c>XXXX-XXXX</c>, 5-minute TTL)
+    /// the panel exchanges at <c>{apiBaseUrl}/api/pair/exchange</c> with
+    /// device name <c>panel</c>. Present only on the startup send and only
+    /// when the operator set <c>Registration.AutoPair</c> and
+    /// <c>Registration.ApiBaseUrl</c>; omitted from heartbeats and change
+    /// sends. This code provisions command authority — it does not
+    /// authenticate the sender to the panel.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PairingCode { get; init; }
 }
 
 /// <summary>

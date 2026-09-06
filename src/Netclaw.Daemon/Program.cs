@@ -1052,7 +1052,8 @@ static void ConfigureDaemonServices(
         services.AddSelfRegistration(
             registrationConfig,
             paths,
-            sp => new DaemonStatusSnapshotProvider(sp.GetRequiredService<DaemonRuntimeStatusService>()));
+            sp => new DaemonStatusSnapshotProvider(sp.GetRequiredService<DaemonRuntimeStatusService>()),
+            sp => new DaemonPairingCodeProvider(sp.GetRequiredService<PairingCodeService>()));
     }
 
     // System prompt (file-based, with first-run seed)

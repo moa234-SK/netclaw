@@ -21,18 +21,21 @@ public static class RegistrationServiceCollectionExtensions
         this IServiceCollection services,
         RegistrationConfig config,
         NetclawPaths paths,
-        Func<IServiceProvider, IStatusSnapshotProvider> statusProviderFactory)
+        Func<IServiceProvider, IStatusSnapshotProvider> statusProviderFactory,
+        Func<IServiceProvider, IRegistrationPairingProvider> pairingProviderFactory)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(paths);
         ArgumentNullException.ThrowIfNull(statusProviderFactory);
+        ArgumentNullException.ThrowIfNull(pairingProviderFactory);
 
         RegistrationConfigValidator.ValidateOrThrow(config);
 
         services.AddSingleton(config);
         services.AddSingleton(new RegistrationStateStore(paths));
         services.AddSingleton(statusProviderFactory);
+        services.AddSingleton(pairingProviderFactory);
         services.AddHttpClient<SelfRegistrationService>(client =>
                 client.Timeout = SelfRegistrationService.SendTimeout)
             .AddNetclawHeaders("self-registration");

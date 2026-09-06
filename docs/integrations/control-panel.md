@@ -25,7 +25,8 @@ Envelope:
   "instanceId": "agent-03",
   "registeredAtUtc": "2026-09-06T09:15:00Z",
   "status": { "...": "equals GET /api/health/status body" },
-  "apiBaseUrl": "https://agent-03.corp.local:5000"
+  "apiBaseUrl": "https://agent-03.corp.local:5000",
+  "pairingCode": "A3KD-7W2M"
 }
 ```
 
@@ -34,11 +35,52 @@ Envelope:
 - `apiBaseUrl` is present **only** when the agent's operator set
   `Registration.ApiBaseUrl`. Present = commandable at that URL.
   Absent = telemetry-only; do not send commands to that agent.
+- `pairingCode` is present **only** on the agent's startup send, and only
+  when the operator set `Registration.AutoPair` (which requires
+  `ApiBaseUrl`). See § 2.
 - Persist the last envelope per instanceId. Heartbeats carry no URL.
 
 ## 2. Authority (one-time per agent)
 
-Commands require a device bearer token issued by the agent:
+Commands require a device bearer token issued by the agent. Two ways to
+obtain it:
+
+### 2a. Automatic (auto-pairing envelope)
+
+When the operator sets `Registration.AutoPair`, each agent startup
+envelope carries a fresh single-use `pairingCode` (5-minute TTL):
+
+1. On envelope arrival, immediately exchange it:
+   `POST {apiBaseUrl}/api/pair/exchange` with
+   `{ "code": "...", "deviceName": "panel" }`.
+   The response carries the bearer token.
+2. Store `{ instanceId → (apiBaseUrl, token) }`.
+3. Never log the `pairingCode` value.
+
+Panel-side rules (MUST):
+
+- Bind `instanceId → apiBaseUrl` at first sight of the instanceId. When a
+  later envelope carries a **different** `apiBaseUrl` for a known
+  instanceId, do not auto-exchange and do not overwrite the binding.
+  Escalate to the operator instead. The registration stream is
+  unauthenticated, so this rule blocks a spoofed envelope from
+  redirecting command traffic to an attacker host.
+- Treat an exchange answer of `409` (device name `panel` already exists)
+  as "already paired". Keep the existing token.
+- Ignore `pairingCode` when you already hold a live token for the
+  instanceId (test liveness with a roster or status call, not with
+  another exchange).
+
+Positive example: panel sees instanceId `agent-03` for the first time
+with `apiBaseUrl` `https://agent-03.corp.local:5000` and `pairingCode`.
+The panel exchanges the code, stores the token, and commands the agent.
+
+Negative example: panel knows `agent-03` at
+`https://agent-03.corp.local:5000`. An envelope arrives for `agent-03`
+with `apiBaseUrl` `https://evil.example.net` and a `pairingCode`. The
+panel keeps the old binding, does not exchange, and raises an alert.
+
+### 2b. Manual (operator-minted code)
 
 1. On the agent host, generate a pairing code (time-limited):
    `netclaw daemon pair`.
@@ -46,6 +88,9 @@ Commands require a device bearer token issued by the agent:
    `POST {apiBaseUrl}/api/pair/exchange` with `{ "code": "...", "deviceName": "panel" }`.
    The response carries the bearer token.
 3. Store `{ instanceId → (apiBaseUrl, token) }` in the panel.
+
+If the panel was down at agent startup and missed the auto-pairing code,
+use this path as the fallback.
 
 Recommendation: use the device name `panel` on every agent so one
 revocation sweep (`DELETE {apiBaseUrl}/api/pair/devices/panel`) cuts
@@ -101,21 +146,27 @@ timestamp. Panels cannot erase ledger entries.
 {
   "Registration": {
     "BaseUrl": "https://panel.corp.local",
-    "ApiBaseUrl": "https://agent-03.corp.local:5000"
+    "ApiBaseUrl": "https://agent-03.corp.local:5000",
+    "AutoPair": true
   }
 }
 ```
 
 `ApiBaseUrl` is deliberate consent: the agent never derives it from
 its bind address, and removing it returns the agent to telemetry-only
-on the next status send. The daemon's HTTP API must be reachable at
-that URL (see the daemon exposure documentation for `ExposureMode`).
+on the next status send. `AutoPair` (default `false`) is a second layer
+of consent: with it on, every agent startup mints and ships one
+single-use pairing code in the envelope. The daemon's HTTP API must be
+reachable at that URL (see the daemon exposure documentation for
+`ExposureMode`).
 
 ## 5. Failure modes
 
 | Symptom | Meaning |
 |---|---|
-| Envelope present, commands 401 | Pairing missing or token revoked — redo step 2 |
+| Envelope present, commands 401 | Pairing missing or token revoked — redo § 2 |
+| `pairingCode` present, exchange 409 | Already paired — keep the existing token |
+| `pairingCode` present, exchange 401 | Code expired (5-minute TTL) — use § 2b manual pairing |
 | Heartbeats arrive, no `apiBaseUrl` | Operator did not advertise the URL — agent is read-only |
 | Commands time out | Network path or exposure misconfigured on the agent |
 | 409 on every command | Session is in a gated state — resume first |

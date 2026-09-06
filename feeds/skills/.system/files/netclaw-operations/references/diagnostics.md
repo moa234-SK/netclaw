@@ -97,14 +97,19 @@ config section (if present) specifies a supported exposure mode and that
 the corresponding tunnel integration is reachable.
 
 Self-registration to an external control panel is configured in the
-`Registration` section of `netclaw.json` (`BaseUrl`, `Enabled`,
-`HeartbeatIntervalSeconds`). The daemon derives both endpoints from
+`Registration` section of `netclaw.json` (`BaseUrl`, `ApiBaseUrl`,
+`AutoPair`, `Enabled`, `HeartbeatIntervalSeconds`). The daemon derives both
+endpoints from
 `BaseUrl`: `POST {base}/api/v1/agent/status` receives the full
 status envelope (`instanceId`, `registeredAtUtc`, `status`) at startup and
 again on health changes (overall, connector status, build version, or
 model-degraded transitions); `POST {base}/api/v1/agent/heartbeat`
 receives a minimal liveness payload (`instanceId`, `timestamp`) on every
-other tick (default 300 s, minimum 30 s). Container deployments can set
+other tick (default 300 s, minimum 30 s). `ApiBaseUrl` advertises the
+daemon API URL for panel commands; `AutoPair: true` (requires `ApiBaseUrl`)
+ships a single-use `pairingCode` in the startup envelope so the panel can
+pair itself — the config editor and daemon startup both reject `AutoPair`
+without `ApiBaseUrl`. Container deployments can set
 the link from the environment instead:
 `NETCLAW_Registration__BaseUrl` (compose `environment` block).
 Environment values override the file; when the link comes from the

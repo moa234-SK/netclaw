@@ -534,8 +534,11 @@ export NETCLAW_Telemetry__Otlp__Endpoint="http://127.0.0.1:4317"
 
 # Enable control panel self-registration (no netclaw.json section needed).
 # Endpoints are derived: {base}/api/v1/agent/status and
-# {base}/api/v1/agent/heartbeat
+# {base}/api/v1/agent/heartbeat. AutoPair ships a single-use pairing code
+# in the startup envelope; it requires ApiBaseUrl.
 export NETCLAW_Registration__BaseUrl="https://panel.example.com"
+export NETCLAW_Registration__ApiBaseUrl="https://agent-01.corp.local:5000"
+export NETCLAW_Registration__AutoPair="true"
 export NETCLAW_Registration__HeartbeatIntervalSeconds="60"
 
 # Override session settings

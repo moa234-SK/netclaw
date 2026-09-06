@@ -32,6 +32,8 @@ A new `Registration` section in `netclaw.json`:
 {
   "Registration": {
     "BaseUrl": "https://panel.example.com",
+    "ApiBaseUrl": "https://agent-03.corp.local:5000",
+    "AutoPair": true,
     "Enabled": true,
     "HeartbeatIntervalSeconds": 300
   }
@@ -41,6 +43,11 @@ A new `Registration` section in `netclaw.json`:
 - `BaseUrl`: the control panel base URL. An absolute HTTP or HTTPS URI. A
   reverse-proxy path prefix is allowed. When the value is null or empty,
   the feature is off.
+- `ApiBaseUrl`: base URL of this daemon's HTTP API. The daemon advertises
+  it in the envelope so the panel can issue commands. Unset keeps the
+  agent telemetry-only.
+- `AutoPair`: include a single-use pairing code in the startup envelope.
+  Default: `false`. Requires `ApiBaseUrl`. See REG-008.
 - `Enabled`: temporary switch. The operator can pause registration without
   deletion of the link. Default: `true`.
 - `HeartbeatIntervalSeconds`: interval between sends. Default: `300`.
@@ -69,9 +76,15 @@ The status endpoint receives one JSON envelope:
 {
   "instanceId": "build-server-01",
   "registeredAtUtc": "2026-09-03T10:00:00Z",
-  "status": { "overall": "healthy", "...": "same body as /api/health/status" }
+  "status": { "overall": "healthy", "...": "same body as /api/health/status" },
+  "apiBaseUrl": "https://build-server-01.corp.local:5000",
+  "pairingCode": "A3KD-7W2M"
 }
 ```
+
+`apiBaseUrl` and `pairingCode` are optional. They appear only when the
+operator set the matching configuration. See REG-008 for `pairingCode`
+semantics.
 
 The heartbeat endpoint receives a minimal payload:
 
@@ -96,7 +109,9 @@ The heartbeat endpoint receives a minimal payload:
 - The HTTP timeout is 10 seconds.
 - A failed send logs a warning and updates the state file. The daemon keeps
   running.
-- The daemon sends no secrets. The link alone authorizes the daemon.
+- The daemon sends no other secrets. The link alone authorizes the daemon.
+- When `AutoPair` is on and `ApiBaseUrl` is set, the startup envelope
+  carries one single-use pairing code. See REG-008.
 
 ### Registration State
 
@@ -168,9 +183,21 @@ The daemon SHALL make no outbound registration calls when `BaseUrl` is
 unset or `Enabled` is false. The registration HTTP client SHALL identify
 itself with the standard Netclaw headers.
 
+### REG-008 Auto-Pairing
+
+When `AutoPair` is true and `ApiBaseUrl` is set, the daemon SHALL mint one
+single-use pairing code and include it in the startup envelope only. The
+daemon SHALL NOT include the code in heartbeats or change sends. The
+system SHALL reject `AutoPair` without `ApiBaseUrl` before persistence in
+the config editor, and at daemon startup. The pairing code provisions
+command authority. It does not authenticate the sender to the panel. The
+daemon SHALL NOT write the code to logs or to the registration state file.
+`netclaw daemon pair` SHALL stay available as the manual override.
+
 ## Non-Goals (MVP)
 
-- Authentication with the control panel (tokens, mTLS).
+- Authentication of the registration stream itself. The `pairingCode`
+  field does not authenticate the sender to the panel.
 - Commands or acknowledgements from the control panel to the daemon.
 - Multiple registration targets.
 - Registration state inside the `/api/health/status` payload.
@@ -187,6 +214,10 @@ itself with the standard Netclaw headers.
 6. Failed sends do not stop the daemon.
 7. `netclaw doctor` shows Error, Warning, and Pass states as specified.
 8. Unset link produces no outbound calls and no errors.
+9. With `AutoPair` on, the startup envelope carries one single-use code
+   and later sends carry none.
+10. The config editor rejects `AutoPair` without `ApiBaseUrl` before the
+    file changes.
 
 ## Cross-References
 

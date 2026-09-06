@@ -653,6 +653,11 @@
           "format": "uri",
           "description": "Base URL of this daemon's HTTP API, advertised to the control panel so it can issue commands. Explicit consent only — never derived from the bind address. Must be an absolute HTTP or HTTPS URI when set. Unset keeps the agent telemetry-only."
         },
+        "AutoPair": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include a freshly minted single-use pairing code in the startup registration envelope so the control panel can exchange it for a command token automatically. Requires ApiBaseUrl. Default false."
+        },
         "Enabled": {
           "type": "boolean",
           "default": true,

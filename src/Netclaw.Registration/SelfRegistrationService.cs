@@ -12,6 +12,21 @@ using Netclaw.Configuration;
 namespace Netclaw.Registration;
 
 /// <summary>
+/// Mints device pairing codes for the auto-pairing registration flow.
+/// Implemented by the daemon over its <c>PairingCodeService</c>; the seam
+/// keeps this library free of a reference to the daemon executable,
+/// mirroring <see cref="IStatusSnapshotProvider"/>.
+/// </summary>
+public interface IRegistrationPairingProvider
+{
+    /// <summary>
+    /// Mints a single-use pairing code (<c>XXXX-XXXX</c>) that replaces any
+    /// previously pending code. Call only when auto-pairing is active.
+    /// </summary>
+    string MintPairingCode();
+}
+
+/// <summary>
 /// Registers the daemon with an external control panel and keeps it warm.
 /// The status endpoint receives the full envelope at startup and again
 /// whenever the health projection changes; the heartbeat endpoint receives
@@ -30,6 +45,7 @@ public sealed class SelfRegistrationService : BackgroundService
     private readonly ILogger<SelfRegistrationService> _logger;
     private readonly RegistrationConfig _config;
     private readonly IStatusSnapshotProvider _statusProvider;
+    private readonly IRegistrationPairingProvider _pairingProvider;
     private readonly RegistrationStateStore _stateStore;
     private readonly TimeProvider _timeProvider;
     private readonly string _instanceId;
@@ -40,6 +56,7 @@ public sealed class SelfRegistrationService : BackgroundService
         ILogger<SelfRegistrationService> logger,
         RegistrationConfig config,
         IStatusSnapshotProvider statusProvider,
+        IRegistrationPairingProvider pairingProvider,
         RegistrationStateStore stateStore,
         TimeProvider timeProvider)
     {
@@ -47,6 +64,7 @@ public sealed class SelfRegistrationService : BackgroundService
         _logger = logger;
         _config = config;
         _statusProvider = statusProvider;
+        _pairingProvider = pairingProvider;
         _stateStore = stateStore;
         _timeProvider = timeProvider;
         _instanceId = ResolveInstanceId(stateStore);
@@ -72,8 +90,19 @@ public sealed class SelfRegistrationService : BackgroundService
     {
         var status = await _statusProvider.GetStatusAsync(cancellationToken);
         _lastProjection = BuildProjection(status);
-        await PostEnvelopeAsync(status, cancellationToken);
+        var pairingCode = AutoPairActive() ? _pairingProvider.MintPairingCode() : null;
+        await PostEnvelopeAsync(status, pairingCode, cancellationToken);
     }
+
+    /// <summary>
+    /// Auto-pairing consent gate: the operator must set both
+    /// <c>Registration.AutoPair</c> and <c>Registration.ApiBaseUrl</c>.
+    /// The validator already rejects the AutoPair-without-URL shape; this
+    /// gate is the runtime mirror so the code never ships unless the
+    /// panel has an exchange target.
+    /// </summary>
+    private bool AutoPairActive()
+        => _config.AutoPair && !string.IsNullOrWhiteSpace(_config.ApiBaseUrl);
 
     private async Task SendTickAsync(CancellationToken cancellationToken)
     {
@@ -83,7 +112,7 @@ public sealed class SelfRegistrationService : BackgroundService
         {
             // Health transition: the panel needs the fresh full status.
             _lastProjection = projection;
-            await PostEnvelopeAsync(status, cancellationToken);
+            await PostEnvelopeAsync(status, null, cancellationToken);
             return;
         }
 
@@ -91,7 +120,9 @@ public sealed class SelfRegistrationService : BackgroundService
     }
 
     private async Task PostEnvelopeAsync(
-        DaemonRuntimeStatus.Response status, CancellationToken cancellationToken)
+        DaemonRuntimeStatus.Response status,
+        string? pairingCode,
+        CancellationToken cancellationToken)
     {
         var requestUri = RegistrationEndpoints.StatusUri(_config.BaseUrl!);
         var envelope = new RegistrationEnvelope
@@ -102,6 +133,7 @@ public sealed class SelfRegistrationService : BackgroundService
             ApiBaseUrl = string.IsNullOrWhiteSpace(_config.ApiBaseUrl)
                 ? null
                 : _config.ApiBaseUrl.Trim(),
+            PairingCode = pairingCode,
         };
 
         await PostAsync(

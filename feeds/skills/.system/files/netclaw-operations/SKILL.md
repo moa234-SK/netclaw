@@ -3,7 +3,7 @@ name: netclaw-operations
 description: "REQUIRED when the user asks about scheduling, reminders, cron jobs, timers, background jobs, diagnostics, troubleshooting, MCP tools, daemon health, identity updates, or Netclaw capabilities and self-maintenance."
 metadata:
   author: netclaw
-  version: "2.67.2"
+  version: "2.68.0"
 ---
 
 # Netclaw Operations
@@ -534,7 +534,8 @@ Is it a fact about the user to recall later? → memory.
 
 ## Device Pairing
 
-Pair remote devices and manage their access via the pairing flow. Full steps:
+Pair remote devices and manage their access via the pairing flow. Full steps,
+including control-panel auto-pairing via `Registration.AutoPair`:
 `skill_read_resource('netclaw-operations', 'references/devices.md')`.
 
 ## Demo AppHost

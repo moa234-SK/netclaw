@@ -37,6 +37,18 @@ public sealed class RegistrationConfig
     public string? ApiBaseUrl { get; set; }
 
     /// <summary>
+    /// Lets the startup registration envelope carry a freshly minted device
+    /// pairing code so the control panel can exchange it for a command
+    /// token without the manual <c>netclaw daemon pair</c> step. Explicit
+    /// consent only, and it requires <see cref="ApiBaseUrl"/>: the panel
+    /// exchanges the code at the advertised API URL, so a code without a
+    /// URL has no consumer. The code rides the startup envelope only,
+    /// never heartbeats or change sends. Default: <c>false</c>.
+    /// </summary>
+    [ConfigValue(Key = "Registration.AutoPair", PersistTo = ConfigPersistStore.NetclawJson)]
+    public bool AutoPair { get; set; }
+
+    /// <summary>
     /// Temporary switch so the operator can pause registration without
     /// deleting the link. Default: <c>true</c>.
     /// </summary>
@@ -95,6 +107,15 @@ public static class RegistrationConfigValidator
                 || apiUri.Scheme is not ("http" or "https")))
         {
             error = "Registration.ApiBaseUrl must be an absolute HTTP or HTTPS URI when set.";
+            return false;
+        }
+
+        if (config.AutoPair && string.IsNullOrWhiteSpace(config.ApiBaseUrl))
+        {
+            // Validated even while the feature is off, mirroring the
+            // heartbeat-interval rule: a later enable must never activate
+            // an unusable auto-pairing silently.
+            error = "Registration.AutoPair requires Registration.ApiBaseUrl.";
             return false;
         }
 
