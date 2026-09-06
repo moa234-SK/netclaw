@@ -203,6 +203,21 @@ inside; its tools are disabled by design.
 Full operator procedure: `docs/runbooks/session-intervention.md` in the
 Netclaw repository.
 
+## Agent Freeze (whole-agent suspend)
+
+`POST /api/agent/suspend` with body `{"reason":"..."}` freezes the
+whole agent: every channel, session creation, and reminder delivery
+rejects new input; in-flight turns finish and deliver; the process,
+HTTP API, and heartbeat keep running. `POST /api/agent/resume` thaws
+it. `GET /api/agent/interventions` lists the agent-level audit ledger.
+
+The freeze is durable (`agent_intervention` table in `netclaw.db`): a
+suspended agent restarts frozen, because the shipped systemd unit uses
+`Restart=always` and the daemon re-closes the ingress gate at boot.
+The status envelope reports `governance.agentState`. Config hot-reload
+restarts are deferred while frozen. Process termination stays
+host-level — no endpoint kills the daemon.
+
 An external control panel can issue these same commands directly when
 the operator advertises the daemon's API URL via `Registration.ApiBaseUrl`
 in `netclaw.json` and pairs the panel as a device. Panel integration

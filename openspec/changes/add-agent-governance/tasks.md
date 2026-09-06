@@ -39,39 +39,68 @@
 - [x] 2.7 Wire `Program.cs`: `AddAgentGovernance()`, reader into
   `SessionServices`, `MapSessionInterventionEndpoints()`
 
-## 3. Slice 3 — Input safety (later)
+## 3. Slice 3 — Agent intervention (freeze)
 
-- [ ] 3.1 `PromptInjectionDetector` at session ingress (spec delta
+- [x] 3.1 Create `src/Netclaw.Governance/AgentIntervention/AgentInterventionStore.cs`:
+  single-row durable agent state + append-only ledger, fail-closed
+  reads, idempotent DDL
+- [x] 3.2 Create `src/Netclaw.Governance/AgentIntervention/AgentInterventionCoordinator.cs`:
+  durable write first, gate actuation, AGT instance-level lifecycle +
+  audit, idempotent same-state commands
+- [x] 3.3 `SessionIngressGate.AgentSuspendedMessage` constant;
+  shutdown-drain task still drains when the gate was closed by
+  suspension; `DaemonRestartCoordinator` logs the deferred restart
+- [x] 3.4 `DaemonRuntimeStatus.Governance.AgentState` populated from
+  the durable reader; registration projection includes it (suspend /
+  resume triggers a full status envelope)
+- [x] 3.5 Create `src/Netclaw.Daemon/AgentInterventionEndpointRouteBuilderExtensions.cs`:
+  `POST /api/agent/suspend|resume`, `GET /api/agent/interventions`,
+  Operator auth
+- [x] 3.6 `Program.cs`: coordinator registration with the registration
+  instance id (`SelfRegistrationService.ResolveInstanceId` made
+  public), boot freeze check before the host starts,
+  `MapAgentInterventionEndpoints()`
+- [x] 3.7 Spec delta `specs/agent-intervention/spec.md` + proposal
+  capability entry (this slice)
+
+## 4. Slice 4 — Input safety (later)
+
+- [ ] 4.1 `PromptInjectionDetector` at session ingress (spec delta
   required before build)
 
-## 4. Slice 4 — Runtime limits (later)
+## 5. Slice 5 — Runtime limits (later)
 
-- [ ] 4.1 AGT rate limiting wired to per-session budgets (spec delta
+- [ ] 5.1 AGT rate limiting wired to per-session budgets (spec delta
   required before build)
 
-## 5. Slice 5 — Observability (later)
+## 6. Slice 6 — Observability (later)
 
-- [ ] 5.1 Governance metrics + audit export into the existing OTel
+- [ ] 6.1 Governance metrics + audit export into the existing OTel
   pipeline (spec delta required before build)
 
-## 6. Docs and gates
+## 7. Docs and gates
 
-- [x] 6.1 `docs/runbooks/session-intervention.md`
-- [x] 6.2 `netclaw-operations` skill: intervention commands section +
+- [x] 7.1 `docs/runbooks/session-intervention.md`
+- [x] 7.2 `netclaw-operations` skill: intervention commands section +
   version bump
-- [x] 6.3 `dotnet build` passes
-- [x] 6.4 `dotnet slopwatch analyze` passes with no new violations
-- [x] 6.5 `./scripts/Add-FileHeaders.ps1 -Verify` passes
+- [x] 7.3 `dotnet build` passes
+- [x] 7.4 `dotnet slopwatch analyze` passes with no new violations
+- [x] 7.5 `./scripts/Add-FileHeaders.ps1 -Verify` passes
+- [x] 7.6 Runbook + integration doc + skill updated for the agent
+  freeze
 
-## 7. Tests (deferred by operator instruction)
+## 8. Tests (deferred by operator instruction)
 
-- [ ] 7.1 Actor tests: stop/suspend abort mid-turn, gate NACKs,
+- [ ] 8.1 Actor tests: stop/suspend abort mid-turn, gate NACKs,
   recovery gate, quarantine tool denial
-- [ ] 7.2 Store tests: round-trip, idempotent DDL, ledger ordering
-- [ ] 7.3 Coordinator tests: transition matrix, durable-before-actuate
-  ordering
-- [ ] 7.4 Endpoint tests: Operator auth, encoded ids, 409 on invalid
+- [ ] 8.2 Store tests: round-trip, idempotent DDL, ledger ordering
+  (session + agent)
+- [ ] 8.3 Coordinator tests: transition matrix, durable-before-actuate
+  ordering (session + agent)
+- [ ] 8.4 Endpoint tests: Operator auth, encoded ids, 409 on invalid
   transitions
+- [ ] 8.5 Freeze tests: boot re-close after restart, drain runs while
+  frozen, config-reload deferral, projection change triggers envelope
 
 Note: the operator deferred all test work. Do not archive this change
-before section 7 is complete.
+before section 8 is complete.

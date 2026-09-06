@@ -29,6 +29,7 @@ using Netclaw.Actors.Tools;
 using Netclaw.Channels;
 using Netclaw.Configuration;
 using Netclaw.Governance;
+using Netclaw.Governance.AgentIntervention;
 using Netclaw.Governance.SessionIntervention;
 using Netclaw.Configuration.Http;
 using Netclaw.Providers;
@@ -323,6 +324,7 @@ static async Task RunDaemonAsync(
         .WithTags("Sessions")
         .RequireAuthorization();
     app.MapSessionInterventionEndpoints();
+    app.MapAgentInterventionEndpoints();
     app.MapGet("/api/stats", async ValueTask<Ok<DaemonStats.Response>> (DaemonStatsService statsService, int? days, CancellationToken ct) =>
         TypedResults.Ok(await statsService.GetStatsAsync(days, ct)))
         .WithName("GetStats")
@@ -355,6 +357,19 @@ static async Task RunDaemonAsync(
 
     // Reminder REST API
     app.MapReminderEndpoints();
+
+    // Agent freeze boot gate: the systemd unit ships Restart=always, so a
+    // durably suspended agent WILL be resurrected — it must come back
+    // frozen. Closing the gate before the host starts means no channel
+    // ingress can slip through an open gate during startup.
+    var bootAgentState = app.Services.GetRequiredService<IAgentInterventionStateReader>().GetState();
+    if (bootAgentState == AgentInterventionState.Suspended)
+    {
+        app.Services.GetRequiredService<SessionIngressGate>()
+            .TryClose(SessionIngressGate.AgentSuspendedMessage);
+        app.Logger.LogWarning(
+            "Agent starts SUSPENDED (operator intervention). All new session ingress is rejected until POST /api/agent/resume.");
+    }
 
     // Fire startup notification after all hosted services are ready
     app.Lifetime.ApplicationStarted.Register(() =>
@@ -635,6 +650,17 @@ static void ConfigureDaemonServices(
     // intervention. Always on by design: in-proc, zero-config, and the
     // durable SQLite ledger — not AGT — is the authority.
     services.AddAgentGovernance();
+
+    // Agent-level freeze coordinator. Its AGT agent id must equal the
+    // registration instance id so governance classification and panel
+    // dedupe agree on one daemon identity.
+    var agentGovernanceId = SelfRegistrationService.ResolveInstanceId(new RegistrationStateStore(paths));
+    services.AddSingleton(sp => new AgentInterventionCoordinator(
+        sp.GetRequiredService<AgentInterventionStore>(),
+        sp.GetRequiredService<AgentGovernanceRuntime>(),
+        sp.GetRequiredService<SessionIngressGate>(),
+        agentGovernanceId,
+        sp.GetRequiredService<ILogger<AgentInterventionCoordinator>>()));
 
     // Reminder limits stay private. Netclaw sets the library acknowledgement
     // lease in WithReminderManager because an LLM attempt can take one hour.
@@ -1212,8 +1238,13 @@ static void ConfigureDaemonServices(
 
             cs.AddTask(CoordinatedShutdown.PhaseBeforeServiceUnbind, "drain-llm-sessions", async () =>
             {
-                if (!ingressGate.TryClose("Daemon shutting down."))
+                if (!ingressGate.TryClose("Daemon shutting down.")
+                    && ingressGate.ClosedReason != SessionIngressGate.AgentSuspendedMessage)
                 {
+                    // A restart-coordinator close means the drain already ran.
+                    // An agent-suspend close did NOT — the freeze never drains
+                    // sessions — so a frozen agent still gets its graceful
+                    // drain here.
                     drainLogger.LogDebug("Ingress gate already closed; skipping CoordinatedShutdown session drain.");
                     return Akka.Done.Instance;
                 }

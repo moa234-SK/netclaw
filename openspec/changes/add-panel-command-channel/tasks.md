@@ -22,6 +22,11 @@
 - [x] 2.4 `netclaw-operations` skill: panel-command note +
   version bump (2.67.1)
 
+- [x] 2.5 Command surface spec + integration doc extended with the
+  agent freeze commands (`/api/agent/suspend|resume|interventions`,
+  `governance.agentState` in the envelope) — built with the
+  `add-agent-governance` change
+
 ## 3. Gates
 
 - [x] 3.1 `openspec validate add-panel-command-channel`

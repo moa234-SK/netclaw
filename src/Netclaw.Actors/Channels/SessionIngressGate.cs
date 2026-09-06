@@ -23,6 +23,15 @@ public sealed class SessionIngressGate
 {
     public const string RestartInProgressMessage = "Daemon restarting, try again in a minute.";
 
+    /// <summary>
+    /// Closed reason while the whole agent is frozen by an operator
+    /// intervention. Shutdown drain logic distinguishes this from a restart
+    /// close: a suspend close never drained sessions, so the drain task
+    /// must still run.
+    /// </summary>
+    public const string AgentSuspendedMessage =
+        "Agent suspended by an operator. New messages are rejected until the agent is resumed.";
+
     private string? _closedReason;
 
     public bool IsClosed => _closedReason is not null;

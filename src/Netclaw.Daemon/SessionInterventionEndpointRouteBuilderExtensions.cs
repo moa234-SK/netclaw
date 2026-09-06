@@ -141,10 +141,11 @@ public static class SessionInterventionEndpointRouteBuilderExtensions
         }
     }
 
-    private static string ResolveInitiator(ClaimsPrincipal principal)
+    // The paired device id (or "local" for loopback) identifies the
+    // operator surface; both intervention surfaces record it in their
+    // ledgers. Shared by the session and agent endpoint groups.
+    internal static string ResolveInitiator(ClaimsPrincipal principal)
     {
-        // The paired device id (or "local" for loopback) identifies the
-        // operator surface; the ledger records it on every intervention.
         var deviceId = principal.FindFirst(NetclawClaimTypes.DeviceId)?.Value;
         if (!string.IsNullOrWhiteSpace(deviceId))
             return deviceId;

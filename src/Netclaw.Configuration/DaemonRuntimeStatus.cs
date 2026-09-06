@@ -32,6 +32,19 @@ public static class DaemonRuntimeStatus
         public Memory? Memory { get; init; }
 
         public Reminders? Reminders { get; init; }
+
+        public Governance? Governance { get; init; }
+    }
+
+    /// <summary>
+    /// Agent-level governance state. <see cref="Governance.AgentState"/> is
+    /// <c>"active"</c> or <c>"suspended"</c> — the durable agent-level
+    /// intervention state. A suspended agent rejects all new session
+    /// ingress until an operator resumes it.
+    /// </summary>
+    public sealed class Governance : IWireType
+    {
+        public required string AgentState { get; init; }
     }
 
     public sealed class Build : IWireType

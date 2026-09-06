@@ -1,6 +1,7 @@
 # Session Intervention Runbook
 
-How to stop, suspend, quarantine, and resume one Netclaw session.
+How to stop, suspend, quarantine, and resume one Netclaw session — and
+how to freeze the agent as a whole.
 
 External control panels use the same endpoints directly — see
 `docs/integrations/control-panel.md` for the panel-side contract
@@ -76,6 +77,48 @@ unknown command segment, `400` for a malformed path.
 - **The AGT kill switch is in-process classification only.** It records
   kill events and lifecycle transitions for the running process; the
   SQLite ledger answers who killed what and when across restarts.
+
+## Agent freeze (whole-agent suspend)
+
+`POST /api/agent/suspend` freezes the agent: every channel, session
+creation, and reminder delivery rejects new input with the
+agent-suspended reason. In-flight turns finish and deliver. The
+process, HTTP API, and heartbeat keep running — the status envelope
+reports `agentState: suspended` so a control panel sees it.
+
+```bash
+# Freeze the agent (soft: in-flight turns finish)
+curl -X POST http://127.0.0.1:5000/api/agent/suspend \
+  -H "Authorization: Bearer $DEVICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"incident 42 — freeze fleet node"}'
+
+# Thaw
+curl -X POST http://127.0.0.1:5000/api/agent/resume \
+  -H "Authorization: Bearer $DEVICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"incident closed"}'
+
+# Agent-level audit history
+curl http://127.0.0.1:5000/api/agent/interventions \
+  -H "Authorization: Bearer $DEVICE_TOKEN"
+```
+
+Operators must know:
+
+- **The freeze is durable.** State lives in `netclaw.db`
+  (`agent_intervention`). The systemd unit ships `Restart=always`, but
+  a suspended agent boots back frozen — the daemon re-closes the gate
+  before it accepts traffic.
+- **Shutdown still drains.** Stopping the daemon while frozen still
+  drains active sessions gracefully; the freeze does not skip that.
+- **Config hot-reload restarts are deferred** while frozen; apply
+  them after `resume`.
+- **Webhook-triggered command work is outside the freeze** (v1); its
+  paths do not consult the session ingress gate.
+- **Terminating the process stays host-level.** No endpoint kills the
+  daemon — use `netclaw daemon stop` on the host or the service
+  manager. This is deliberate: no token can darken a fleet.
 
 ## Incident recipe
 

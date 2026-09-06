@@ -53,6 +53,7 @@ public sealed class DaemonRuntimeStatusServiceTests : IAsyncLifetime
         ModelSelection? modelSelection = null,
         DaemonConfig? daemonConfig = null,
         NetclawPaths? paths = null,
+        Netclaw.Governance.AgentIntervention.IAgentInterventionStateReader? agentInterventionState = null,
         McpClientManager? mcpClientManager = null,
         SQLiteMemoryStore? sqliteMemoryStore = null,
         IChatClientProvider? chatClientProvider = null,
@@ -72,10 +73,18 @@ public sealed class DaemonRuntimeStatusServiceTests : IAsyncLifetime
             paths ?? CreatePaths(),
             chatClientProvider ?? new TestChatClientProvider(),
             providerValidation ?? new ProviderRuntimeValidation(ProviderRuntimeStatus.Valid, null, []),
+            agentInterventionState ?? new StaticAgentInterventionStateReader(),
             mcpClientManager,
             sqliteMemoryStore,
             memoryEmbedderHolder,
             memoryConfig);
+    }
+
+    private sealed class StaticAgentInterventionStateReader
+        : Netclaw.Governance.AgentIntervention.IAgentInterventionStateReader
+    {
+        public Netclaw.Governance.AgentIntervention.AgentInterventionState GetState()
+            => Netclaw.Governance.AgentIntervention.AgentInterventionState.Active;
     }
 
     private static IChannelRegistry CreateRegistry(

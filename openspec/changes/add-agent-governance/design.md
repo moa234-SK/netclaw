@@ -138,8 +138,36 @@ OPA resolution.
 `resume` clears the durable gate and commands a resident actor if
 one exists. If the actor is gone (stopped), the coordinator's ask
 materializes it; recovery sees `Active` and the actor idles until the
-next real message. The warm-up cost is one journal replay — accepted
+next real message. The warm-up cost is one journal replay - accepted
 for simplicity.
+
+### D11: Agent freeze reuses the global ingress gate
+
+The agent-level freeze closes the existing `SessionIngressGate` with
+a dedicated constant reason instead of adding a second gate. Every
+ingress path (channel gateways, pipeline, session creation,
+reminder delivery via gateway actors) already consults it, and a
+second gate would double the check surface and drift.
+
+Three owned interactions follow from sharing the gate:
+
+1. The shutdown drain task treats a closed gate as proof that a
+   drain already ran. That proof only holds for a restart-coordinator
+   close, so the task now drains anyway when the closed reason is
+   the agent-suspend message.
+2. `DaemonRestartCoordinator` cannot close the gate while the agent
+   is frozen, which previously read as "restart already in
+   progress". It now logs the deferral explicitly; the restart waits
+   for resume.
+3. The boot check reads the durable agent state before the host
+   starts and re-closes the gate, because the shipped systemd unit
+   uses `Restart=always` and would otherwise resurrect an unfrozen
+   agent.
+
+The freeze is soft by decision: in-flight turns finish and deliver.
+Webhook-triggered command work does not consult the gate and is out
+of scope for v1. Terminate stays host-level: no HTTP endpoint can
+kill the process, so a rogue-token caller cannot darken a fleet.
 
 ## Risks / Trade-offs
 

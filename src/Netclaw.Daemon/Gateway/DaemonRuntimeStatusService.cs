@@ -17,6 +17,7 @@ using Netclaw.Configuration.Feeds;
 using Netclaw.Daemon.Configuration;
 using Netclaw.Daemon.Mcp;
 using Netclaw.Daemon.Services;
+using Netclaw.Governance.AgentIntervention;
 using Netclaw.Tools;
 using static Netclaw.Actors.Reminders.ReminderProtocol;
 
@@ -34,6 +35,7 @@ internal sealed class DaemonRuntimeStatusService(
     NetclawPaths paths,
     IChatClientProvider chatClientProvider,
     ProviderRuntimeValidation providerValidation,
+    IAgentInterventionStateReader agentInterventionState,
     McpClientManager? mcpClientManager = null,
     SQLiteMemoryStore? sqliteMemoryStore = null,
     MemoryEmbedderHolder? memoryEmbedderHolder = null,
@@ -87,7 +89,13 @@ internal sealed class DaemonRuntimeStatusService(
             },
             Update = BuildUpdateStatus(),
             Memory = await BuildMemoryStatusAsync(cancellationToken),
-            Reminders = await BuildReminderHealthAsync(cancellationToken)
+            Reminders = await BuildReminderHealthAsync(cancellationToken),
+            Governance = new DaemonRuntimeStatus.Governance
+            {
+                AgentState = agentInterventionState.GetState() == AgentInterventionState.Suspended
+                    ? "suspended"
+                    : "active"
+            }
         };
     }
 

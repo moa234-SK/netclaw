@@ -62,7 +62,19 @@ public sealed class DaemonRestartCoordinator : IDaemonRestartCoordinator
     {
         if (!_ingressGate.TryClose(SessionIngressGate.RestartInProgressMessage))
         {
-            _logger.LogInformation("Coordinated restart already in progress; ignoring duplicate config reload request.");
+            if (_ingressGate.ClosedReason == SessionIngressGate.AgentSuspendedMessage)
+            {
+                // The operator froze the agent. A restart now would reopen
+                // nothing (the boot gate re-freezes) but would churn the
+                // process for no benefit — defer until resume.
+                _logger.LogInformation(
+                    "Agent is suspended by operator intervention; deferring the config reload restart until the agent is resumed.");
+            }
+            else
+            {
+                _logger.LogInformation("Coordinated restart already in progress; ignoring duplicate config reload request.");
+            }
+
             return;
         }
 

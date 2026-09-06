@@ -25,6 +25,12 @@ public static class GovernanceServiceCollectionExtensions
         services.AddSingleton<ISessionInterventionStateReader>(sp =>
             sp.GetRequiredService<SessionInterventionStore>());
         services.AddSingleton<SessionInterventionCoordinator>();
+        services.AddSingleton<AgentIntervention.AgentInterventionStore>();
+        services.AddSingleton<AgentIntervention.IAgentInterventionStateReader>(sp =>
+            sp.GetRequiredService<AgentIntervention.AgentInterventionStore>());
+        // AgentInterventionCoordinator is registered by the daemon host: its
+        // AGT agent id must equal the registration instance id, which only
+        // the host can resolve.
         return services;
     }
 }

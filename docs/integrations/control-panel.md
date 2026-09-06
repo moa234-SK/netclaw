@@ -1,7 +1,8 @@
 # Control Panel Integration (Direct Commands)
 
 How an external control panel discovers Netclaw agents, authenticates,
-and issues session intervention commands over a shared network.
+and issues intervention commands (session and agent level) over a
+shared network.
 
 Assumptions: the panel can reach each agent's HTTP API directly
 (same LAN, VPC, or tailnet). For NAT'd fleets, direct commands do not
@@ -52,7 +53,7 @@ the panel's authority fleet-wide.
 
 Tokens are per-agent. A token from agent A is rejected by agent B.
 
-## 3. Commands (v1: session interventions)
+## 3. Commands (v1: session interventions + agent freeze)
 
 All calls send `Authorization: Bearer <token>`. Session ids contain
 `/`; percent-encode them in the path (`slack%2FC123%2FT456`).
@@ -65,8 +66,21 @@ All calls send `Authorization: Bearer <token>`. Session ids contain
 | `POST {apiBaseUrl}/api/sessions/<id>/resume` | Clear the gate |
 | `GET {apiBaseUrl}/api/sessions?limit=&offset=` | Roster of recent sessions |
 | `GET {apiBaseUrl}/api/sessions/<id>/interventions` | Audit ledger for one session |
+| `POST {apiBaseUrl}/api/agent/suspend` | Freeze the whole agent: all new session ingress rejected, in-flight turns finish, process stays up |
+| `POST {apiBaseUrl}/api/agent/resume` | Thaw the agent |
+| `GET {apiBaseUrl}/api/agent/interventions` | Audit ledger for agent-level commands |
 
-Body for the four commands: `{ "reason": "..." }`.
+Body for the commands: `{ "reason": "..." }`.
+
+Agent state visibility: the status envelope carries
+`status.governance.agentState` (`active` / `suspended`), and a
+suspend or resume triggers an immediate full status send — no need to
+poll for the transition.
+
+Agent freeze semantics: the state is durable (a service-manager
+restart boots the agent back frozen), and terminating the agent
+process is **not** in the command surface — panels escalate to the
+host operator for that.
 
 Responses:
 
@@ -105,5 +119,6 @@ that URL (see the daemon exposure documentation for `ExposureMode`).
 | Heartbeats arrive, no `apiBaseUrl` | Operator did not advertise the URL — agent is read-only |
 | Commands time out | Network path or exposure misconfigured on the agent |
 | 409 on every command | Session is in a gated state — resume first |
+| Heartbeats keep flowing, all channels dark | The agent is suspended — check `agentState`, `POST /api/agent/resume` |
 
 Operator runbook: `docs/runbooks/session-intervention.md`.

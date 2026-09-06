@@ -49,12 +49,20 @@ adds no new credential.
 ### Requirement: Command surface
 
 The panel's v1 command surface SHALL be exactly: the four session
-intervention commands, the session list, and the per-session
-intervention ledger. The panel SHALL send the intervention commands as
+intervention commands, the session list, the per-session intervention
+ledger, the agent freeze commands, the agent intervention ledger, and
+the agent state in the runtime status. The panel SHALL send the
+session intervention commands as
 `POST {apiBaseUrl}/api/sessions/<sessionId>/stop|suspend|quarantine|resume`
 with a JSON body `{ "reason": string }`, read the session list from
-`GET {apiBaseUrl}/api/sessions`, and read the ledger from
-`GET {apiBaseUrl}/api/sessions/<sessionId>/interventions`.
+`GET {apiBaseUrl}/api/sessions`, read the session ledger from
+`GET {apiBaseUrl}/api/sessions/<sessionId>/interventions`, send the
+agent freeze commands as
+`POST {apiBaseUrl}/api/agent/suspend|resume` with the same body
+shape, read the agent ledger from
+`GET {apiBaseUrl}/api/agent/interventions`, and read the agent state
+from `governance.agentState` in the status envelope. Terminating the
+agent process SHALL stay outside the panel surface.
 
 #### Scenario: Stop command
 
@@ -62,6 +70,20 @@ with a JSON body `{ "reason": string }`, read the session list from
   reason "incident 42"
 - **THEN** the response reports the session state `stopped` and the
   ledger records the panel's device identity
+
+#### Scenario: Agent freeze command
+
+- **WHEN** the panel posts `/api/agent/suspend` with reason
+  "incident 42"
+- **THEN** the response reports the agent state `suspended`, new
+  session ingress is rejected, and the next status envelope reports
+  `agentState: suspended`
+
+#### Scenario: Frozen agent cannot be terminated remotely
+
+- **WHEN** the panel wants a suspended agent's process gone
+- **THEN** the panel must escalate to the host operator; no command
+  surface terminates the process
 
 #### Scenario: Conflict is surfaced to the panel
 

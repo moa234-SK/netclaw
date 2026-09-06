@@ -197,7 +197,8 @@ public sealed class SelfRegistrationService : BackgroundService
             string.Join(',', status.Connectors
                 .OrderBy(static c => c.Key, StringComparer.Ordinal)
                 .Select(static c => $"{c.Key}:{c.Status}")),
-            status.Model is { } model ? $"model-degraded:{model.Degraded}" : "model:none");
+            status.Model is { } model ? $"model-degraded:{model.Degraded}" : "model:none",
+            status.Governance is { } governance ? $"agent-state:{governance.AgentState}" : "agent-state:none");
 
     /// <summary>
     /// Strips the base URL, the full request URI, and the host from an
@@ -220,8 +221,10 @@ public sealed class SelfRegistrationService : BackgroundService
     /// The panel dedupes daemons by instance ID, so the ID must survive
     /// restarts. The machine name does that; a rare empty machine name falls
     /// back to a random ID persisted inside the state record.
+    /// Public so the daemon can use the same identity for agent-level
+    /// governance classification (AGT agent id = registration instance id).
     /// </summary>
-    private static string ResolveInstanceId(RegistrationStateStore stateStore)
+    public static string ResolveInstanceId(RegistrationStateStore stateStore)
     {
         var hostname = Environment.MachineName?.Trim().ToLowerInvariant();
         if (!string.IsNullOrEmpty(hostname))
