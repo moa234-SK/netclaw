@@ -32,7 +32,9 @@ internal static class LlmSessionTestExtensions
             sp.GetService<IReadOnlyList<IContextLayerProvider>>() ?? Array.Empty<IContextLayerProvider>(),
             sp.GetRequiredService<IWorkingContextSnapshotProvider>(),
             sp.GetRequiredService<TimeProvider>(),
-            sp.GetRequiredService<NetclawPaths>()));
+            sp.GetRequiredService<NetclawPaths>(),
+            sp.GetService<Netclaw.Actors.Protocol.ISessionInterventionStateReader>()
+                ?? new Netclaw.Actors.Protocol.ActiveSessionInterventionStateReader()));
 
         services.TryAddSingleton(sp => new SessionMemoryServices(
             sp.GetService<IMemoryExtractor>() ?? NullMemoryExtractor.Instance,

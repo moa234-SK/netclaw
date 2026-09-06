@@ -26,6 +26,17 @@ public sealed class RegistrationConfig
     public string? BaseUrl { get; set; }
 
     /// <summary>
+    /// Base URL of this daemon's HTTP API, advertised to the control panel
+    /// in the registration envelope so the panel can issue commands.
+    /// Explicit consent only: the daemon never derives this from its bind
+    /// address or exposure mode — advertising a command surface is an
+    /// authority decision. Must be an absolute HTTP or HTTPS URI when set.
+    /// Unset keeps the agent telemetry-only.
+    /// </summary>
+    [ConfigValue(Key = "Registration.ApiBaseUrl", PersistTo = ConfigPersistStore.NetclawJson)]
+    public string? ApiBaseUrl { get; set; }
+
+    /// <summary>
     /// Temporary switch so the operator can pause registration without
     /// deleting the link. Default: <c>true</c>.
     /// </summary>
@@ -77,6 +88,14 @@ public static class RegistrationConfigValidator
                 error = "Registration.BaseUrl must be an absolute HTTP or HTTPS URI.";
                 return false;
             }
+        }
+
+        if (!string.IsNullOrWhiteSpace(config.ApiBaseUrl)
+            && ( !Uri.TryCreate(config.ApiBaseUrl.Trim(), UriKind.Absolute, out var apiUri)
+                || apiUri.Scheme is not ("http" or "https")))
+        {
+            error = "Registration.ApiBaseUrl must be an absolute HTTP or HTTPS URI when set.";
+            return false;
         }
 
         if (config.HeartbeatIntervalSeconds is < MinimumHeartbeatIntervalSeconds

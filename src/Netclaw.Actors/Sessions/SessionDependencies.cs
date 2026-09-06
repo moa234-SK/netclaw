@@ -22,7 +22,8 @@ public sealed record SessionServices(
     IReadOnlyList<IContextLayerProvider> ContextLayers,
     IWorkingContextSnapshotProvider WorkingContextSnapshots,
     TimeProvider TimeProvider,
-    NetclawPaths Paths);
+    NetclawPaths Paths,
+    Protocol.ISessionInterventionStateReader InterventionStateReader);
 
 /// <summary>
 /// Tool execution infrastructure. Null when the session operates without tools.

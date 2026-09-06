@@ -192,6 +192,15 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
     private bool _passivationCompleted;
     private bool _passivationFinalStopScheduled;
 
+    // Operator intervention gate. The durable store behind
+    // _interventionStateReader is the authority; this cache is seeded at
+    // cold recovery and updated by intervention commands. A gated session
+    // rejects input; a stopped session passivates and refuses resurrection.
+    private readonly ISessionInterventionStateReader _interventionStateReader;
+    private SessionInterventionState _interventionState = SessionInterventionState.Active;
+    private bool _interventionStopPending;
+    private IActorRef? _interventionStopReplyTo;
+
     // Reap-on-passivation handshake: while a KillJobsForSession ask is in
     // flight, the final snapshot is deferred so it captures the reaped marks.
     // _jobReapEpoch is bumped per reap request so a late reply from a
@@ -252,6 +261,7 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         _memoryVectorIndexHolder = memory?.VectorIndexHolder;
         _memoryConfig = memory?.MemoryConfig ?? new MemoryConfig();
         _timeProvider = services.TimeProvider;
+        _interventionStateReader = services.InterventionStateReader;
         _sessionsBasePath = services.Paths.SessionsDirectory;
         _trustContextDeriver = tools?.TrustDeriver;
         PersistenceId = $"session-{entityId}";
@@ -311,6 +321,21 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         {
             _log.Info("Recovery complete (turns={TurnCount}, history={HistoryCount})",
                 _state.TurnCount, _state.History.Count);
+
+            // Operator intervention gate — the durable store is the
+            // authority. A stopped session must not resurrect: it rejects
+            // all input (the gate NACKs user messages, reminders, and
+            // approvals) and the idle passivation timer reaps it. The
+            // recovery path deliberately does not Context.Stop here so a
+            // stop command that materialized this actor can still be acked;
+            // either way no work runs while the gate says Stopped.
+            _interventionState = _interventionStateReader.GetInterventionState(_sessionId);
+            if (_interventionState != SessionInterventionState.Active)
+            {
+                _log.Info(
+                    "Recovered session is {State} by operator intervention; input stays gated until resume",
+                    _interventionState);
+            }
 
             // Always read fresh from disk — identity file edits take effect immediately
             SetSystemPrompt();
@@ -464,6 +489,7 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         Command<SpawnChildActorRequest>(msg => Sender.Tell(Context.ActorOf(msg.Props, msg.ActorName)));
         Command<DeliveryFailed>(HandleDeliveryFailedWhenReady);
         Command<PrepareForDaemonRestart>(_ => RequestRestartDrain());
+        CommandInterventionMessages();
 
         // Approval click for a tool batch that parked while the session was
         // idle (deferred passivation) or that survived cold recovery. The
@@ -485,6 +511,13 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
 
         Command<SendUserMessage>(cmd =>
         {
+            if (_interventionState != SessionInterventionState.Active)
+            {
+                _log.Info("Rejecting user message: session is {State} by operator intervention", _interventionState);
+                TryReplyNack(SessionInterventionMessages.Blocked(_interventionState, string.Empty));
+                return;
+            }
+
             if (_restartDrainRequested)
             {
                 _log.Info("Rejecting new user message while restart drain is pending");
@@ -606,6 +639,13 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
 
         CommandAsync<ToolInteractionTextResponse>(async msg =>
         {
+            if (_interventionState != SessionInterventionState.Active)
+            {
+                _log.Info("Rejecting text tool interaction response: session is {State} by operator intervention", _interventionState);
+                TryReplyNack(SessionInterventionMessages.Blocked(_interventionState, string.Empty));
+                return;
+            }
+
             if (_restartDrainRequested)
             {
                 _log.Info("Rejecting text tool interaction response while restart drain is in progress");
@@ -741,6 +781,7 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
             }, OutputFilter.ToolCalls);
         });
         Command<PrepareForDaemonRestart>(_ => RequestRestartDrain());
+        CommandInterventionMessages();
         CommandDistillationAckNoOp();
         CommandJobReapResolved();
     }
@@ -1142,6 +1183,13 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         // Buffer user messages during compaction (same as Processing)
         Command<SendUserMessage>(cmd =>
         {
+            if (_interventionState != SessionInterventionState.Active)
+            {
+                _log.Info("Rejecting user message: session is {State} by operator intervention", _interventionState);
+                TryReplyNack(SessionInterventionMessages.Blocked(_interventionState, string.Empty));
+                return;
+            }
+
             if (_restartDrainRequested)
             {
                 _log.Info("Rejecting new user message while restart drain is pending during compaction");
@@ -1184,6 +1232,7 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         Command<ProcessingWatchdogExpired>(HandleCompactionWatchdogExpired);
         Command<SpawnChildActorRequest>(msg => Sender.Tell(Context.ActorOf(msg.Props, msg.ActorName)));
         Command<PrepareForDaemonRestart>(_ => RequestRestartDrain());
+        CommandInterventionMessages();
 
         Command<CompactionTriggered>(HandleCompactionTriggered);
 
@@ -1386,6 +1435,26 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
 
     private void DrainBufferOrReady()
     {
+        if (_interventionStopPending)
+        {
+            _deferredApprovalResponse = null;
+            _resumeToolLoopAfterCompaction = false;
+            ClearBufferedMessagesForIntervention();
+            TransitionTo(SessionPhase.Ready);
+            TransitionTo(SessionPhase.Passivating);
+            return;
+        }
+
+        if (_interventionState != SessionInterventionState.Active)
+        {
+            // Suspended/quarantined: land in Ready without firing new work.
+            _deferredApprovalResponse = null;
+            _resumeToolLoopAfterCompaction = false;
+            ClearBufferedMessagesForIntervention();
+            TransitionTo(SessionPhase.Ready);
+            return;
+        }
+
         if (_restartDrainRequested)
         {
             _deferredApprovalResponse = null;
@@ -1510,9 +1579,17 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         CommandSessionContextMessages();
         CommandSnapshotMessages();
         Command<PrepareForDaemonRestart>(_ => RequestRestartDrain());
+        CommandInterventionMessages();
 
         Command<SendUserMessage>(cmd =>
         {
+            if (_interventionState != SessionInterventionState.Active)
+            {
+                _log.Info("Rejecting user message: session is {State} by operator intervention", _interventionState);
+                TryReplyNack(SessionInterventionMessages.Blocked(_interventionState, string.Empty));
+                return;
+            }
+
             if (_restartDrainRequested)
             {
                 _log.Info("Rejecting new user message while restart passivation is in progress");
@@ -1533,6 +1610,13 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         // batch from history, exactly as it would after a cold respawn.
         CommandAsync<ToolInteractionResponse>(async msg =>
         {
+            if (_interventionState != SessionInterventionState.Active)
+            {
+                _log.Info("Rejecting tool interaction response: session is {State} by operator intervention", _interventionState);
+                TryReplyNack(SessionInterventionMessages.Blocked(_interventionState, string.Empty));
+                return;
+            }
+
             if (_restartDrainRequested)
             {
                 _log.Info("Rejecting tool interaction response while restart passivation is in progress");
@@ -1548,6 +1632,13 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
 
         CommandAsync<ToolInteractionTextResponse>(async msg =>
         {
+            if (_interventionState != SessionInterventionState.Active)
+            {
+                _log.Info("Rejecting text tool interaction response: session is {State} by operator intervention", _interventionState);
+                TryReplyNack(SessionInterventionMessages.Blocked(_interventionState, string.Empty));
+                return;
+            }
+
             if (_restartDrainRequested)
             {
                 _log.Info("Rejecting text tool interaction response while restart passivation is in progress");
@@ -1668,6 +1759,8 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         _lifecycleObserver?.OnSessionDeactivated(_sessionId);
         _restartDrainReplyTo?.Tell(CommandAck.For(_sessionId));
         _restartDrainReplyTo = null;
+        _interventionStopReplyTo?.Tell(CommandAck.For(_sessionId));
+        _interventionStopReplyTo = null;
         Context.Stop(Self);
     }
 
@@ -1987,6 +2080,21 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         IReadOnlyDictionary<string, string>? sessionScratchDenialDirectories = null,
         IReadOnlyDictionary<string, AuthorizationAttemptId>? authorizationAttemptIds = null)
     {
+        // Quarantine gate: deny the whole batch before any dispatch work.
+        // This is the operator's inspection state — the session may reason,
+        // but no tool may touch the system while quarantined.
+        if (_interventionState == SessionInterventionState.Quarantined)
+        {
+            _log.Warning(
+                "Denying tool batch ({Count} call(s)): session is quarantined by operator intervention",
+                toolCalls.Count);
+            FailCurrentTurn(
+                "I am quarantined by the operator and cannot use tools in this state.",
+                new OperationCanceledException("Session quarantined by operator intervention."),
+                ErrorCategory.ToolFailure);
+            return;
+        }
+
         _activeToolBatch.Start(toolCalls);
 
         // Execute tools async — results come back as ToolExecutionCompleted
@@ -2152,6 +2260,22 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
 
     private void DrainBufferedMessagesOrBecomeReady()
     {
+        if (_interventionStopPending)
+        {
+            ClearBufferedMessagesForIntervention();
+            TransitionTo(SessionPhase.Ready);
+            TransitionTo(SessionPhase.Passivating);
+            return;
+        }
+
+        if (_interventionState != SessionInterventionState.Active)
+        {
+            // Suspended/quarantined: land in Ready without firing new work.
+            ClearBufferedMessagesForIntervention();
+            TransitionTo(SessionPhase.Ready);
+            return;
+        }
+
         if (_restartDrainRequested)
         {
             ClearBufferedMessagesForRestartDrain();
@@ -2231,6 +2355,19 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
 
     private void HandleIncomingUserMessage(SendUserMessage cmd)
     {
+        // Operator intervention gate: input rejection happens before any
+        // dedup, admission, or turn state changes so a gated session can
+        // never start work. This is the resurrection trap for user input
+        // and reminder re-entry; the recovery gate covers cold starts.
+        if (_interventionState != SessionInterventionState.Active)
+        {
+            _log.Info(
+                "Rejecting user message: session is {State} by operator intervention",
+                _interventionState);
+            TryReplyNack(SessionInterventionMessages.Blocked(_interventionState, string.Empty));
+            return;
+        }
+
         var reminderId = cmd.Source?.ReminderId;
         if (IsReminderDedupHit(reminderId, includeBuffered: true))
         {
@@ -4935,6 +5072,77 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
             TransitionTo(SessionPhase.Passivating);
     }
 
+    // ── Operator intervention ──
+
+    // Registered in every non-terminal phase so an intervention command can
+    // never dead-letter regardless of what the session is doing when it
+    // lands (same rationale as CommandJobReapResolved).
+    private void CommandInterventionMessages()
+    {
+        Command<StopSession>(HandleStopSession);
+        Command<SuspendSession>(msg =>
+            HandleGateSession(SessionInterventionState.Suspended, msg.Reason, msg.InitiatedBy));
+        Command<QuarantineSession>(msg =>
+            HandleGateSession(SessionInterventionState.Quarantined, msg.Reason, msg.InitiatedBy));
+        Command<ResumeSession>(HandleResumeSession);
+    }
+
+    private void HandleStopSession(StopSession msg)
+    {
+        var alreadyStopped = _interventionState == SessionInterventionState.Stopped;
+        _interventionState = SessionInterventionState.Stopped;
+
+        if (_interventionStopPending)
+        {
+            // A stop is already in flight (re-delivery, or the durable gate
+            // was written before this actor materialized). Ack so the caller
+            // does not retry; the in-flight stop path finishes the job.
+            TryReplyAck();
+            return;
+        }
+
+        _interventionStopPending = true;
+        _interventionStopReplyTo = Sender;
+
+        if (!alreadyStopped)
+            _log.Warning(
+                "Session stopped by operator intervention: {Reason} (initiated by {InitiatedBy})",
+                msg.Reason, msg.InitiatedBy);
+
+        // Abort any in-flight work. Cancellation flows through the existing
+        // failure handlers, which produce a clean failed-turn transcript;
+        // the drain points then route into passivation because
+        // _interventionStopPending is set.
+        CancelAndDisposeLlmCts();
+        CancelAndDisposeToolExecutionCts();
+
+        if (_phase.Current == SessionPhase.Ready)
+            TransitionTo(SessionPhase.Passivating);
+    }
+
+    private void HandleGateSession(SessionInterventionState target, string reason, string initiatedBy)
+    {
+        _interventionState = target;
+        _log.Warning(
+            "Session {State} by operator intervention: {Reason} (initiated by {InitiatedBy})",
+            target, reason, initiatedBy);
+
+        // Abort the in-flight turn; the actor stays resident and the gate
+        // rejects new input until an operator resumes the session.
+        CancelAndDisposeLlmCts();
+        CancelAndDisposeToolExecutionCts();
+        TryReplyAck();
+    }
+
+    private void HandleResumeSession(ResumeSession msg)
+    {
+        _interventionState = SessionInterventionState.Active;
+        _log.Info(
+            "Session resumed by operator intervention: {Reason} (initiated by {InitiatedBy})",
+            msg.Reason, msg.InitiatedBy);
+        TryReplyAck();
+    }
+
     private void ClearBufferedMessagesForRestartDrain()
     {
         if (_buffer.Count == 0)
@@ -4943,6 +5151,21 @@ public sealed class LlmSessionActor : ReceivePersistentActor, IWithTimers
         _log.Warning(
             "Dropping {BufferCount} buffered message(s) because coordinated restart drain is completing.",
             _buffer.Count);
+        _buffer.Clear();
+    }
+
+    private void ClearBufferedMessagesForIntervention()
+    {
+        if (_buffer.Count == 0)
+            return;
+
+        // Buffered senders were already acked (buffering acks on arrival);
+        // dropping is the same accepted trade as the restart drain. The
+        // durable gate is the operator's source of truth for why.
+        _log.Warning(
+            "Dropping {BufferCount} buffered message(s) because an operator intervention gated the session ({State}).",
+            _buffer.Count,
+            _interventionState);
         _buffer.Clear();
     }
 

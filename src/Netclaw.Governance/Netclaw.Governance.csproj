@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <PackageReference Include="AgentControlSpecification" />
+    <PackageReference Include="Microsoft.AgentGovernance" />
   </ItemGroup>
 
 </Project>

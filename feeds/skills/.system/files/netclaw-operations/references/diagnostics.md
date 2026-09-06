@@ -179,6 +179,35 @@ The `netclaw init` wizard presents a Feature Selection step for Team and
 Public postures, allowing operators to pre-configure which subsystems are
 active. Personal posture skips this step (all features enabled by default).
 
+## Session Intervention (Stop / Suspend / Quarantine)
+
+An operator can halt one misbehaving conversation without stopping the
+daemon. These are authenticated HTTP commands (Operator class — loopback
+or a paired device token), not agent tools. Session ids contain `/`;
+quote them in the URL.
+
+| URL (POST) | Effect |
+|------------|--------|
+| `/api/sessions/<sessionId>/stop` | Abort the in-flight turn, terminate the session actor; stays dead until resume |
+| `/api/sessions/<sessionId>/suspend` | Abort the turn; actor stays resident but rejects all input |
+| `/api/sessions/<sessionId>/quarantine` | Suspend plus every tool call denied (inspection state) |
+| `/api/sessions/<sessionId>/resume` | Clear the gate |
+| `/api/sessions/<sessionId>/interventions` (GET) | Audit history: who, what, when, why |
+
+Body: `{"reason": "..."}`. The gate is durable (survives daemon restarts);
+reminders and channel re-joins cannot resurrect a stopped session. When a
+user reports a session acting dangerously, tell them to ask the operator
+to quarantine it — do not attempt to fix a quarantined session from
+inside; its tools are disabled by design.
+
+Full operator procedure: `docs/runbooks/session-intervention.md` in the
+Netclaw repository.
+
+An external control panel can issue these same commands directly when
+the operator advertises the daemon's API URL via `Registration.ApiBaseUrl`
+in `netclaw.json` and pairs the panel as a device. Panel integration
+contract: `docs/integrations/control-panel.md` in the Netclaw repository.
+
 ## Self-Maintenance
 
 

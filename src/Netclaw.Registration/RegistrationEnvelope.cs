@@ -3,6 +3,7 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
+using System.Text.Json.Serialization;
 using Netclaw.Configuration;
 
 namespace Netclaw.Registration;
@@ -31,6 +32,16 @@ public sealed class RegistrationEnvelope : IWireType
     public required DateTimeOffset RegisteredAtUtc { get; init; }
 
     public required DaemonRuntimeStatus.Response Status { get; init; }
+
+    /// <summary>
+    /// Base URL of this daemon's HTTP API, for panel-issued commands.
+    /// Populated only when the operator sets
+    /// <c>Registration.ApiBaseUrl</c> (explicit consent); omitted from the
+    /// JSON entirely when unset, so the panel reads the agent as
+    /// telemetry-only.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ApiBaseUrl { get; init; }
 }
 
 /// <summary>

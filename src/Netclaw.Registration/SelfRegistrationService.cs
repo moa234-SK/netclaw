@@ -99,6 +99,9 @@ public sealed class SelfRegistrationService : BackgroundService
             InstanceId = _instanceId,
             RegisteredAtUtc = _timeProvider.GetUtcNow(),
             Status = status,
+            ApiBaseUrl = string.IsNullOrWhiteSpace(_config.ApiBaseUrl)
+                ? null
+                : _config.ApiBaseUrl.Trim(),
         };
 
         await PostAsync(

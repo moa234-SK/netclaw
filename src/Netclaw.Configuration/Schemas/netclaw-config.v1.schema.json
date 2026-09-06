@@ -648,6 +648,11 @@
           "format": "uri",
           "description": "Control panel base URL (e.g., https://panel.example.com). Must be an absolute HTTP or HTTPS URI when set. A reverse-proxy path prefix is allowed."
         },
+        "ApiBaseUrl": {
+          "type": ["string", "null"],
+          "format": "uri",
+          "description": "Base URL of this daemon's HTTP API, advertised to the control panel so it can issue commands. Explicit consent only — never derived from the bind address. Must be an absolute HTTP or HTTPS URI when set. Unset keeps the agent telemetry-only."
+        },
         "Enabled": {
           "type": "boolean",
           "default": true,

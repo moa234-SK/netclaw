@@ -3,7 +3,7 @@ name: netclaw-operations
 description: "REQUIRED when the user asks about scheduling, reminders, cron jobs, timers, background jobs, diagnostics, troubleshooting, MCP tools, daemon health, identity updates, or Netclaw capabilities and self-maintenance."
 metadata:
   author: netclaw
-  version: "2.66.3"
+  version: "2.67.1"
 ---
 
 # Netclaw Operations
@@ -33,6 +33,7 @@ a reference file — load the one matching the user's intent with
 | Manage inbound webhooks / attachments | `skill_read_resource('netclaw-operations', 'references/webhooks.md')` |
 | Add/switch LLM or search provider, OAuth login | `skill_read_resource('netclaw-operations', 'references/providers.md')` |
 | Diagnose problems, kill switches, self-update | `skill_read_resource('netclaw-operations', 'references/diagnostics.md')` |
+| Stop/suspend/quarantine a session (operator intervention) | `skill_read_resource('netclaw-operations', 'references/diagnostics.md')` → Session Intervention |
 | Rotate or repair secrets | `skill_read_resource('netclaw-operations', 'references/secrets.md')` |
 | Pair remote devices, manage access | `skill_read_resource('netclaw-operations', 'references/devices.md')` |
 | Kick the tires on Netclaw end-to-end locally | `skill_read_resource('netclaw-operations', 'references/demo-apphost.md')` |

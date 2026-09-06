@@ -166,11 +166,23 @@ internal sealed class RegistrationConfigViewModel : ReactiveViewModel
             {
                 var root = ConfigFileHelper.LoadJsonDict(_paths.NetclawConfigPath);
                 root["configVersion"] = EmbeddedSchemaLoader.CurrentSchemaVersion;
+
+                // This page edits three rows but owns the whole section —
+                // preserve values it does not expose (ApiBaseUrl is set by
+                // hand per the panel-command-channel contract) instead of
+                // dropping them on save.
+                var preservedApiBaseUrl = root.TryGetValue("Registration", out var existingSection)
+                    && existingSection is Dictionary<string, object?> sectionDict
+                    && sectionDict.TryGetValue("ApiBaseUrl", out var preserved)
+                    ? preserved
+                    : null;
+
                 root["Registration"] = new Dictionary<string, object?>
                 {
                     ["BaseUrl"] = candidate.BaseUrl,
                     ["Enabled"] = candidate.Enabled,
                     ["HeartbeatIntervalSeconds"] = candidate.HeartbeatIntervalSeconds,
+                    ["ApiBaseUrl"] = preservedApiBaseUrl,
                 };
 
                 ConfigFileHelper.WriteConfigFile(_paths.NetclawConfigPath, root);

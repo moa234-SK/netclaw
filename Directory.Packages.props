@@ -32,6 +32,9 @@
     <!-- ACS policy runtime (Microsoft Agent Governance Toolkit). Beta line:
          the only published line; native Rust core ships inside the nupkg. -->
     <PackageVersion Include="AgentControlSpecification" Version="0.3.1-beta.1" />
+    <!-- AGT runtime primitives (kill switch, lifecycle, audit). Pure managed,
+         in-proc; no sidecar or policy files. -->
+    <PackageVersion Include="Microsoft.AgentGovernance" Version="5.0.0" />
     <PackageVersion Include="Akka.Cluster.Sharding" Version="$(AkkaHostingVersion)" />
     <PackageVersion Include="Akka.Persistence" Version="$(AkkaHostingVersion)" />
     <PackageVersion Include="Akka.Persistence.Hosting" Version="$(AkkaHostingVersion)" />

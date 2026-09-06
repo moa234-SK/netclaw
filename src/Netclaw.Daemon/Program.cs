@@ -29,6 +29,7 @@ using Netclaw.Actors.Tools;
 using Netclaw.Channels;
 using Netclaw.Configuration;
 using Netclaw.Governance;
+using Netclaw.Governance.SessionIntervention;
 using Netclaw.Configuration.Http;
 using Netclaw.Providers;
 using Netclaw.Providers.OAuth;
@@ -321,6 +322,7 @@ static async Task RunDaemonAsync(
         .WithSummary("List the most recent sessions.")
         .WithTags("Sessions")
         .RequireAuthorization();
+    app.MapSessionInterventionEndpoints();
     app.MapGet("/api/stats", async ValueTask<Ok<DaemonStats.Response>> (DaemonStatsService statsService, int? days, CancellationToken ct) =>
         TypedResults.Ok(await statsService.GetStatsAsync(days, ct)))
         .WithName("GetStats")
@@ -628,6 +630,11 @@ static void ConfigureDaemonServices(
                 sp.GetRequiredService<AcsGovernance>(),
                 sp.GetRequiredService<ILogger<AcsToolInvocationGovernor>>())
             : NoOpToolInvocationGovernor.Instance);
+
+    // AGT runtime governance (kill switch, lifecycle, audit) plus session
+    // intervention. Always on by design: in-proc, zero-config, and the
+    // durable SQLite ledger — not AGT — is the authority.
+    services.AddAgentGovernance();
 
     // Reminder limits stay private. Netclaw sets the library acknowledgement
     // lease in WithReminderManager because an LLM attempt can take one hour.
@@ -1094,7 +1101,8 @@ static void ConfigureDaemonServices(
         sp.GetRequiredService<IReadOnlyList<IContextLayerProvider>>(),
         sp.GetRequiredService<IWorkingContextSnapshotProvider>(),
         sp.GetRequiredService<TimeProvider>(),
-        sp.GetRequiredService<NetclawPaths>()));
+        sp.GetRequiredService<NetclawPaths>(),
+        sp.GetRequiredService<Netclaw.Actors.Protocol.ISessionInterventionStateReader>()));
 
     services.AddSingleton(sp => new SessionToolServices(
         sp.GetRequiredService<IToolExecutor>(),
