@@ -96,6 +96,30 @@ Doctor checks include `exposure-mode`, which validates that the `Daemon`
 config section (if present) specifies a supported exposure mode and that
 the corresponding tunnel integration is reachable.
 
+Self-registration to an external control panel is configured in the
+`Registration` section of `netclaw.json` (`BaseUrl`, `Enabled`,
+`HeartbeatIntervalSeconds`). The daemon derives both endpoints from
+`BaseUrl`: `POST {base}/api/v1/agent/status` receives the full
+status envelope (`instanceId`, `registeredAtUtc`, `status`) at startup and
+again on health changes (overall, connector status, build version, or
+model-degraded transitions); `POST {base}/api/v1/agent/heartbeat`
+receives a minimal liveness payload (`instanceId`, `timestamp`) on every
+other tick (default 300 s, minimum 30 s). Container deployments can set
+the link from the environment instead:
+`NETCLAW_Registration__BaseUrl` (compose `environment` block).
+Environment values override the file; when the link comes from the
+environment, do not also edit it in `netclaw config` — the file value is
+shadowed at runtime. A null `BaseUrl` keeps the feature off with no
+outbound calls. A set-but-invalid `BaseUrl` fails daemon startup loudly —
+including a value that arrives from the environment. Doctor check
+`registration` reports: Error for an invalid `BaseUrl`, Warning when the
+last send failed (state file
+`~/.netclaw/runtime/registration-state.json`), and Pass when not
+configured or disabled. Edit the link with `netclaw config` →
+Registration. Do not send secrets to the panel — the status payload is
+the same JSON as `/api/health/status` and the link alone authorizes the
+daemon.
+
 Exposure diagnostics are fail-closed:
 - `reverse-proxy` requires at least one remote authentication path and rejects
   loopback final hops (`127.0.0.1`, `::1`, `localhost`) because loopback

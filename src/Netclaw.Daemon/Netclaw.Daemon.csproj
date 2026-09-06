@@ -68,6 +68,7 @@
         <ProjectReference Include="..\Netclaw.Channels.Mattermost\Netclaw.Channels.Mattermost.csproj"/>
         <ProjectReference Include="..\Netclaw.Channels.Slack\Netclaw.Channels.Slack.csproj"/>
         <ProjectReference Include="..\Netclaw.Providers\Netclaw.Providers.csproj"/>
+        <ProjectReference Include="..\Netclaw.Registration\Netclaw.Registration.csproj"/>
         <ProjectReference Include="..\Netclaw.Search\Netclaw.Search.csproj"/>
         <ProjectReference Include="..\Netclaw.Tools.Abstractions\Netclaw.Tools.Abstractions.csproj"/>
     </ItemGroup>

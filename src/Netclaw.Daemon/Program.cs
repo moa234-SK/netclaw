@@ -43,6 +43,7 @@ using Netclaw.Daemon.Gateway;
 using Netclaw.Daemon.Mcp;
 using Netclaw.Daemon.Providers;
 using Netclaw.Daemon.Security;
+using Netclaw.Registration;
 using Netclaw.Daemon.Services;
 using Netclaw.Daemon.Lifecycle;
 using Netclaw.Daemon.Reminders;
@@ -1005,6 +1006,21 @@ static void ConfigureDaemonServices(
     services.AddHttpClient<BinaryUpdateCheckService>(client =>
         client.Timeout = FeedConstants.BinaryFeedHttpTimeout).AddNetclawHeaders("update-check");
     services.AddHostedService<BinaryUpdateCheckService>();
+
+    // Self-registration — POSTs the runtime status envelope to the operator-configured
+    // control panel on startup and on health changes, plus a minimal heartbeat between
+    // them. An unset or disabled Registration section keeps the feature off (no outbound
+    // calls); a set-but-invalid BaseUrl fails startup loudly from AddSelfRegistration's
+    // validation (fail-closed posture).
+    var registrationConfig = configuration.GetSection("Registration")
+        .Get<RegistrationConfig>() ?? new RegistrationConfig();
+    if (registrationConfig.Enabled && RegistrationConfigValidator.IsConfigured(registrationConfig))
+    {
+        services.AddSelfRegistration(
+            registrationConfig,
+            paths,
+            sp => new DaemonStatusSnapshotProvider(sp.GetRequiredService<DaemonRuntimeStatusService>()));
+    }
 
     // System prompt (file-based, with first-run seed)
     // Seed minimal SOUL.md if neither new nor legacy personality file exists

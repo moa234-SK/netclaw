@@ -75,6 +75,7 @@ public sealed class ConfigDashboardViewModel : ReactiveViewModel
         new("Search", "Search backend and credentials.", "/search"),
         new("Browser Automation", "Canonical browser MCP profile settings.", "/browser-automation"),
         new("Telemetry & Alerting", "Telemetry and outbound webhook alerting.", "/telemetry-alerting"),
+        new("Registration", "Control panel self-registration link and heartbeat.", "/registration"),
         new("Security & Access", "Posture, enabled features, audience profiles, and exposure mode.", "/security"),
         new("Workspaces Directory", "Project discovery root for workspace-aware prompts.", "/workspaces"),
         new("Run Full Doctor", "Exit the dashboard and run `netclaw doctor`.", IsTerminal: true),
@@ -194,6 +195,7 @@ internal sealed class ConfigDashboardStatusReader
             "Search" => SearchSummary(config),
             "Browser Automation" => OnOff(BrowserEnabled(config)),
             "Telemetry & Alerting" => TelemetrySummary(config),
+            "Registration" => RegistrationSummary(config),
             "Security & Access" => SecuritySummary(config),
             "Workspaces Directory" => WorkspacesSummary(config),
             _ => string.Empty
@@ -319,6 +321,23 @@ internal sealed class ConfigDashboardStatusReader
             && value is string dir && !string.IsNullOrWhiteSpace(dir)
                 ? dir
                 : _paths.WorkspacesDirectory;
+
+    // Mirrors RegistrationConfig's off state: absent Enabled defaults to true, so only
+    // an explicit false reads as disabled.
+    private static string RegistrationSummary(Dictionary<string, object> config)
+    {
+        if (ConfigFileHelper.TryGetPathValue(config, "Registration.Enabled", out var enabledValue)
+            && enabledValue is false)
+            return "– disabled";
+
+        if (ConfigFileHelper.TryGetPathValue(config, "Registration.BaseUrl", out var urlValue)
+            && urlValue is string url
+            && !string.IsNullOrWhiteSpace(url)
+            && Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return $"✓ {uri.Authority}";
+
+        return "– not set";
+    }
 
     private static bool BoolAt(Dictionary<string, object> config, string path)
         => ConfigFileHelper.TryGetPathValue(config, path, out var value) && value is bool flag && flag;

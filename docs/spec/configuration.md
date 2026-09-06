@@ -532,9 +532,30 @@ export NETCLAW_Slack__AppToken="xapp-..."
 export NETCLAW_Telemetry__Enabled="true"
 export NETCLAW_Telemetry__Otlp__Endpoint="http://127.0.0.1:4317"
 
+# Enable control panel self-registration (no netclaw.json section needed).
+# Endpoints are derived: {base}/api/v1/agent/status and
+# {base}/api/v1/agent/heartbeat
+export NETCLAW_Registration__BaseUrl="https://panel.example.com"
+export NETCLAW_Registration__HeartbeatIntervalSeconds="60"
+
 # Override session settings
 export NETCLAW_Session__MaxToolIterationsPerTurn="60"
 ```
+
+Docker Compose sets the same variables through the `environment` block:
+
+```yaml
+services:
+  netclaw:
+    image: ghcr.io/netclaw-dev/netclaw:latest
+    environment:
+      NETCLAW_Registration__BaseUrl: "https://panel.example.com"
+      NETCLAW_Registration__HeartbeatIntervalSeconds: "60"
+```
+
+Environment values win over `netclaw.json`. When the link comes from the
+environment, set it only there: an URL edited in `netclaw config` is
+shadowed by the environment value at runtime.
 
 ## Complete Example
 

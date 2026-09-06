@@ -15,6 +15,7 @@ This directory contains product requirements for Netclaw.
 | `PRD-007-agent-personality-and-local-memory.md` | Agent Personality and Local Memory | 1 | New |
 | `PRD-008-scheduling-and-periodic-tasks.md` | Scheduling and Periodic Tasks | 1 | New |
 | `PRD-009-input-adapters-and-unified-input.md` | Input Adapters and Unified Input | 1 (partial), 2+ | New |
+| `PRD-010-self-registration.md` | Self-Registration to an External Control Panel | 1 | New |
 
 ## Revision History
 
@@ -66,3 +67,4 @@ This directory contains product requirements for Netclaw.
 | 007 | 001, 002 | 008 |
 | 008 | 001, 002, 007 | — |
 | 009 | 001, 002, 008 | — |
+| 010 | 001, 002, 004 | — |

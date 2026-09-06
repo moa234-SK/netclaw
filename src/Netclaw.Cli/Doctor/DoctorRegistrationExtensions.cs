@@ -40,6 +40,7 @@ public static class DoctorRegistrationExtensions
         services.AddSingleton<IDoctorCheck, ChatClientDoctorCheck>();
         services.AddSingleton<IDoctorCheck, ContextWindowDoctorCheck>();
         services.AddSingleton<IDoctorCheck, UpdateAvailableDoctorCheck>();
+        services.AddSingleton<IDoctorCheck, RegistrationDoctorCheck>();
         services.AddSingleton<IDoctorCheck, WebhookFormatDoctorCheck>();
         services.AddSingleton<IDoctorCheck, InboundWebhookRoutesDoctorCheck>();
         services.AddSingleton<IDoctorCheck, ExposureModeDoctorCheck>();

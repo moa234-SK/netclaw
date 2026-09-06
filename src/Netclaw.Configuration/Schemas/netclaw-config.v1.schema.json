@@ -639,6 +639,30 @@
       },
       "additionalProperties": false
     },
+    "Registration": {
+      "type": "object",
+      "description": "Self-registration to an external control panel. The daemon derives its endpoints from BaseUrl: {base}/api/v1/agent/status receives the full status envelope at startup and on health changes; {base}/api/v1/agent/heartbeat receives a minimal liveness payload on each heartbeat. A null or empty BaseUrl keeps the feature off (no outbound calls).",
+      "properties": {
+        "BaseUrl": {
+          "type": ["string", "null"],
+          "format": "uri",
+          "description": "Control panel base URL (e.g., https://panel.example.com). Must be an absolute HTTP or HTTPS URI when set. A reverse-proxy path prefix is allowed."
+        },
+        "Enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Temporary switch to pause registration without deleting the link."
+        },
+        "HeartbeatIntervalSeconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 86400,
+          "default": 300,
+          "description": "Seconds between registration heartbeat sends."
+        }
+      },
+      "additionalProperties": false
+    },
     "SubAgents": {
       "type": "object",
       "description": "Timeout configuration for subagent execution (seconds).",

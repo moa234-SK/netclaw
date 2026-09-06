@@ -37,6 +37,7 @@ using Netclaw.Cli.Webhooks;
 using Netclaw.Configuration;
 using Netclaw.Providers;
 using Netclaw.Providers.OAuth;
+using Netclaw.Registration;
 using Netclaw.Configuration.Secrets;
 using Termina;
 using Termina.Diagnostics;
@@ -1219,6 +1220,7 @@ static async Task RunConfigEditorAsync(string[] args)
         t.RegisterRoute<SearchConfigEditorPage, SearchConfigEditorViewModel>("/search", Termina.Pages.NavigationBehavior.PreserveState);
         t.RegisterRoute<BrowserAutomationConfigPage, BrowserAutomationConfigViewModel>("/browser-automation");
         t.RegisterRoute<TelemetryAlertingConfigPage, TelemetryAlertingConfigViewModel>("/telemetry-alerting");
+        t.RegisterRoute<RegistrationConfigPage, RegistrationConfigViewModel>("/registration");
         t.RegisterRoute<WorkspacesConfigPage, WorkspacesConfigViewModel>("/workspaces");
         t.RegisterRoute<SecurityAccessPage, SecurityAccessViewModel>("/security");
         t.RegisterRoute<ExposureModeConfigPage, ExposureModeConfigViewModel>("/exposure-mode");
@@ -2023,6 +2025,7 @@ static NetclawPaths ConfigureConfigServices(IServiceCollection services, IConfig
         .AddEnvironmentVariables("NETCLAW_");
 
     services.AddSingleton(DaemonConfig.BindFromConfiguration(configuration.GetSection("Daemon")));
+    services.AddSingleton(configuration.GetSection("Registration").Get<RegistrationConfig>() ?? new RegistrationConfig());
 
     // TimeProvider (virtualized for testing)
     services.AddSingleton(TimeProvider.System);
