@@ -168,6 +168,13 @@ static async Task RunDaemonAsync(
     // DaemonConfig.Host/Port can be read before binding the WebHost URL.
     var paths = ConfigureConfigServices(builder.Services, builder.Configuration, bootstrapPaths);
 
+    // Persistent daemon identity. The store mints an id on the first startup
+    // and persists it under the runtime directory; every later start reuses
+    // it. Registration envelopes, governance classification, and notification
+    // webhooks all consume this one id, so they agree on the daemon identity.
+    var daemonIdentity = new DaemonIdStore(paths, TimeProvider.System).GetOrCreate();
+    builder.Services.AddSingleton(daemonIdentity);
+
     // Bind listen address from DaemonConfig; falls back to 127.0.0.1:5199 if
     // the Daemon section is absent from netclaw.json.
     var daemonConfig = DaemonConfig.BindFromConfiguration(builder.Configuration.GetSection("Daemon"));
@@ -180,7 +187,8 @@ static async Task RunDaemonAsync(
         paths,
         daemonLogLevel,
         daemonConfig,
-        shellResolution);
+        shellResolution,
+        daemonIdentity);
 
     // Authentication — a PolicyScheme selector is the default scheme.
     // It routes to DeviceBearer when an Authorization: Bearer header is present,
@@ -460,7 +468,8 @@ static void ConfigureDaemonServices(
     NetclawPaths paths,
     LogLevel daemonLogLevel,
     DaemonConfig daemonConfig,
-    ShellEnvironmentResolution shellResolution)
+    ShellEnvironmentResolution shellResolution,
+    DaemonIdentity daemonIdentity)
 {
     var shellEnvironment = shellResolution.Environment;
     services.AddSingleton(shellEnvironment);
@@ -654,7 +663,7 @@ static void ConfigureDaemonServices(
     // Agent-level freeze coordinator. Its AGT agent id must equal the
     // registration instance id so governance classification and panel
     // dedupe agree on one daemon identity.
-    var agentGovernanceId = SelfRegistrationService.ResolveInstanceId(new RegistrationStateStore(paths));
+    var agentGovernanceId = daemonIdentity.DaemonId;
     services.AddSingleton(sp => new AgentInterventionCoordinator(
         sp.GetRequiredService<AgentInterventionStore>(),
         sp.GetRequiredService<AgentGovernanceRuntime>(),

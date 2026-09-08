@@ -37,6 +37,9 @@ public sealed class WebhookNotificationServiceTests : IAsyncDisposable
     private static readonly ServiceIdentity TestIdentity =
         new("test-agent", "test-ns", "test-host:4321", "9.9.9");
 
+    private static readonly DaemonIdentity TestDaemonIdentity =
+        new("netclaw-test000001", DateTimeOffset.UtcNow);
+
     private readonly List<WebhookNotificationService> _services = [];
 
     private WebhookNotificationService CreateService(
@@ -51,6 +54,7 @@ public sealed class WebhookNotificationServiceTests : IAsyncDisposable
             factory,
             timeProvider ?? TimeProvider.System,
             identity ?? TestIdentity,
+            TestDaemonIdentity,
             NullLogger<WebhookNotificationService>.Instance);
         _services.Add(service);
         return service;
@@ -183,6 +187,10 @@ public sealed class WebhookNotificationServiceTests : IAsyncDisposable
         Assert.True(root.TryGetProperty("hostname", out _));
         Assert.True(root.TryGetProperty("alertId", out _));
         Assert.True(root.TryGetProperty("timestamp", out _));
+
+        // The persistent daemon identity lets a receiver attribute the alert
+        // to the registered daemon even when several daemons share one host.
+        Assert.Equal("netclaw-test000001", root.GetProperty("daemonId").GetString());
 
         // Configured service identity flows into the generic payload's service block
         var serviceBlock = root.GetProperty("service");

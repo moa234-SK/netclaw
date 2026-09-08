@@ -197,6 +197,7 @@ public sealed class SlackBlockKitWebhookFormatterTests : IAsyncDisposable
             factory,
             TimeProvider.System,
             TestIdentity,
+            new DaemonIdentity("netclaw-test000001", DateTimeOffset.UtcNow),
             NullLogger<WebhookNotificationService>.Instance);
         _services.Add(service);
         return service;

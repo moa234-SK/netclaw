@@ -45,6 +45,7 @@ public sealed class WebhookNotificationService : BackgroundService, IOperational
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TimeProvider _timeProvider;
     private readonly ServiceIdentity _identity;
+    private readonly string _daemonId;
     private readonly ILogger<WebhookNotificationService> _logger;
 
     private readonly Channel<OperationalAlert> _channel;
@@ -55,12 +56,14 @@ public sealed class WebhookNotificationService : BackgroundService, IOperational
         IHttpClientFactory httpClientFactory,
         TimeProvider timeProvider,
         ServiceIdentity identity,
+        DaemonIdentity daemonIdentity,
         ILogger<WebhookNotificationService> logger)
     {
         _config = config;
         _httpClientFactory = httpClientFactory;
         _timeProvider = timeProvider;
         _identity = identity;
+        _daemonId = daemonIdentity.DaemonId;
         _logger = logger;
 
         _channel = Channel.CreateBounded<OperationalAlert>(new BoundedChannelOptions(ChannelCapacity)
@@ -243,6 +246,7 @@ public sealed class WebhookNotificationService : BackgroundService, IOperational
         Timestamp = alert.Timestamp,
         Source = "netclaw",
         Hostname = Hostname,
+        DaemonId = _daemonId,
         Service = new ServicePayload
         {
             Name = _identity.Name,
@@ -264,7 +268,11 @@ public sealed class WebhookNotificationService : BackgroundService, IOperational
     }
 
     /// <summary>
-    /// Wire-format payload for webhook POST body.
+    /// Wire-format payload for webhook POST body. <see cref="DaemonId"/> is
+    /// the persistent daemon identity — the same id the registration
+    /// envelope carries as <c>instanceId</c> — so a receiver can attribute
+    /// the alert to the registered daemon even when several daemons share
+    /// one host.
     /// </summary>
     private sealed class WebhookPayload
     {
@@ -275,6 +283,7 @@ public sealed class WebhookNotificationService : BackgroundService, IOperational
         public DateTimeOffset Timestamp { get; init; }
         public string Source { get; init; } = "";
         public string Hostname { get; init; } = "";
+        public string DaemonId { get; init; } = "";
         public ServicePayload Service { get; init; } = new();
         public Dictionary<string, string>? Context { get; init; }
     }

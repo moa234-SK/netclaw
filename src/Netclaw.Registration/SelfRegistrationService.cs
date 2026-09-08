@@ -58,6 +58,7 @@ public sealed class SelfRegistrationService : BackgroundService
         IStatusSnapshotProvider statusProvider,
         IRegistrationPairingProvider pairingProvider,
         RegistrationStateStore stateStore,
+        DaemonIdentity daemonIdentity,
         TimeProvider timeProvider)
     {
         _httpClient = httpClient;
@@ -67,7 +68,7 @@ public sealed class SelfRegistrationService : BackgroundService
         _pairingProvider = pairingProvider;
         _stateStore = stateStore;
         _timeProvider = timeProvider;
-        _instanceId = ResolveInstanceId(stateStore);
+        _instanceId = daemonIdentity.DaemonId;
     }
 
     /// <summary>Exposed for tests and for logging identity at startup.</summary>
@@ -247,24 +248,5 @@ public sealed class SelfRegistrationService : BackgroundService
         message = message.Replace(requestUri.Authority, "[host]", StringComparison.OrdinalIgnoreCase);
 
         return message.Length > 400 ? message[..400] : message;
-    }
-
-    /// <summary>
-    /// The panel dedupes daemons by instance ID, so the ID must survive
-    /// restarts. The machine name does that; a rare empty machine name falls
-    /// back to a random ID persisted inside the state record.
-    /// Public so the daemon can use the same identity for agent-level
-    /// governance classification (AGT agent id = registration instance id).
-    /// </summary>
-    public static string ResolveInstanceId(RegistrationStateStore stateStore)
-    {
-        var hostname = Environment.MachineName?.Trim().ToLowerInvariant();
-        if (!string.IsNullOrEmpty(hostname))
-            return hostname;
-
-        if (stateStore.TryRead()?.InstanceId is { Length: > 0 } persisted)
-            return persisted;
-
-        return $"netclaw-{Guid.NewGuid().ToString("N")[..12]}";
     }
 }
