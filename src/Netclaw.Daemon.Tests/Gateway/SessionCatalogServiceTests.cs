@@ -11,6 +11,7 @@ using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Telemetry;
 using Netclaw.Configuration;
 using Netclaw.Daemon.Gateway;
+using Netclaw.Governance.SessionIntervention;
 using Xunit;
 using static Netclaw.Actors.Sessions.SessionProtocol;
 
@@ -474,6 +475,75 @@ public sealed class SessionCatalogServiceTests : IDisposable
         Assert.Equal("active", entry.Status);
         Assert.Equal(beforeResume, entry.LastActivity);
     }
+
+    [Fact]
+    public void ListRecent_ReflectsSuspendedControlState()
+    {
+        var paths = CreatePaths();
+        var catalog = CreateService(paths);
+        var store = CreateInterventionStore(paths);
+        var sessionId = new SessionId("signalr/gated");
+
+        catalog.OnSessionActivated(sessionId, ChannelType.SignalR);
+        store.Apply(sessionId, SessionInterventionCommand.Suspend, SessionInterventionState.Suspended, "ops", "tester");
+
+        var entry = catalog.ListRecent().Single();
+        Assert.Equal("suspended", entry.Status);
+    }
+
+    [Fact]
+    public void ListRecent_ReflectsQuarantinedControlState()
+    {
+        var paths = CreatePaths();
+        var catalog = CreateService(paths);
+        var store = CreateInterventionStore(paths);
+        var sessionId = new SessionId("signalr/gated");
+
+        catalog.OnSessionActivated(sessionId, ChannelType.SignalR);
+        store.Apply(sessionId, SessionInterventionCommand.Quarantine, SessionInterventionState.Quarantined, "ops", "tester");
+
+        var entry = catalog.ListRecent().Single();
+        Assert.Equal("quarantined", entry.Status);
+    }
+
+    [Fact]
+    public void ListRecent_ReflectsStoppedControlState_EvenWhenRuntimeRowStaysActive()
+    {
+        var paths = CreatePaths();
+        var catalog = CreateService(paths);
+        var store = CreateInterventionStore(paths);
+        var sessionId = new SessionId("signalr/gated");
+
+        catalog.OnSessionActivated(sessionId, ChannelType.SignalR);
+        store.Apply(sessionId, SessionInterventionCommand.Stop, SessionInterventionState.Stopped, "ops", "tester");
+
+        // The actor passivation that flips runtime status to 'inactive' may not
+        // have landed yet — the durable gate must win regardless.
+        var entry = catalog.ListRecent().Single();
+        Assert.Equal("stopped", entry.Status);
+    }
+
+    [Fact]
+    public void ListRecent_LiftedGateDoesNotFakeLiveness()
+    {
+        var paths = CreatePaths();
+        var catalog = CreateService(paths);
+        var store = CreateInterventionStore(paths);
+        var sessionId = new SessionId("signalr/gated");
+
+        catalog.OnSessionActivated(sessionId, ChannelType.SignalR);
+        catalog.OnSessionDeactivated(sessionId);
+        store.Apply(sessionId, SessionInterventionCommand.Resume, SessionInterventionState.Active, "ops", "tester");
+
+        // Resume clears the gate but the session has not re-materialized —
+        // the runtime 'inactive' status must stand instead of reporting a
+        // liveness the session does not have.
+        var entry = catalog.ListRecent().Single();
+        Assert.Equal("inactive", entry.Status);
+    }
+
+    private static SessionInterventionStore CreateInterventionStore(NetclawPaths paths)
+        => new(paths, TimeProvider.System, NullLogger<SessionInterventionStore>.Instance);
 
     private sealed class FakeMetrics : ISessionMetrics
     {

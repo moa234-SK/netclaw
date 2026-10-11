@@ -9,6 +9,7 @@ using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Telemetry;
 using Netclaw.Configuration;
+using Netclaw.Governance.SessionIntervention;
 using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Daemon.Gateway;
@@ -248,13 +249,30 @@ public sealed class SessionCatalogService : ISessionLifecycleObserver
 
             EnsureSchemaUpToDate(conn, _logger);
 
+            // The control-state join below reads session_interventions; on a
+            // fresh database the governance store may not have created it yet.
+            // Idempotent CREATE IF NOT EXISTS — same DDL the store itself uses.
+            SessionInterventionStore.EnsureSchema(conn);
+
             using var cmd = conn.CreateCommand();
+            // The operator control state (suspended / stopped / quarantined)
+            // lives in session_interventions, keyed by the un-prefixed session
+            // id, while sessions carries only the runtime status ('active' |
+            // 'inactive'). A restrictive gate overrides the runtime status so
+            // gated sessions are reported accurately; a lifted gate ('active')
+            // does NOT fake liveness — the runtime status stands until the
+            // session actually re-materializes.
             cmd.CommandText =
                 """
-                SELECT persistence_id, channel, title, description, status, turn_count,
-                       created_at, last_activity, log_path, last_input_tokens
-                FROM sessions
-                ORDER BY last_activity DESC
+                SELECT s.persistence_id, s.channel, s.title, s.description,
+                       CASE WHEN si.state IN ('suspended', 'stopped', 'quarantined')
+                            THEN si.state
+                            ELSE s.status END AS status,
+                       s.turn_count, s.created_at, s.last_activity, s.log_path, s.last_input_tokens
+                FROM sessions s
+                LEFT JOIN session_interventions si
+                    ON si.session_id = substr(s.persistence_id, length('session-') + 1)
+                ORDER BY s.last_activity DESC
                 LIMIT $limit
                 OFFSET $offset
                 """;

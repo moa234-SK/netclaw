@@ -223,7 +223,7 @@ public sealed class SessionInterventionStore : ISessionInterventionStateReader
             $"Unknown intervention command '{text}' in the ledger.")
     };
 
-    private void EnsureSchema(SqliteConnection conn)
+    public static void EnsureSchema(SqliteConnection conn)
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText =
