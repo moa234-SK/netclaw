@@ -53,6 +53,14 @@ public sealed class NetclawPaths
     public string CacheDirectory => Path.Combine(BasePath, "cache");
     public string RestartManifestPath => Path.Combine(CacheDirectory, "restart-manifest.json");
 
+    /// <summary>
+    /// Persisted self-update progress, written by <c>AgentUpgradeService</c> at each
+    /// phase transition and reconciled by <c>UpgradeRecoveryService</c> on the next
+    /// boot (the update restarts the process, so the successor decides the outcome
+    /// by comparing its own version against the recorded target).
+    /// </summary>
+    public string UpgradeStatePath => Path.Combine(CacheDirectory, "upgrade-state.json");
+
     // ── Memory ──
     public string MemorySqliteDbPath => SqliteDbPath;
 

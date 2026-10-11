@@ -90,6 +90,11 @@ using var crashMonitor = DaemonCrashMonitor.Register(
 
 try
 {
+    // Self-update successor handoff: when this process was spawned by an
+    // upgrading predecessor (detached restart mode), wait for it to exit
+    // before contending for the singleton lock file below.
+    await UpdateSuccessorHandoff.WaitForPredecessorExitAsync();
+
     // Acquire an exclusive lock file before anything else. This is the OS-level
     // singleton guard — a second netclawd instance will fail to open the file
     // and exit immediately. The lock survives soft restarts (same process) and
@@ -333,6 +338,7 @@ static async Task RunDaemonAsync(
         .RequireAuthorization();
     app.MapSessionInterventionEndpoints();
     app.MapAgentInterventionEndpoints();
+    app.MapAgentUpgradeEndpoints();
     app.MapGet("/api/stats", async ValueTask<Ok<DaemonStats.Response>> (DaemonStatsService statsService, int? days, CancellationToken ct) =>
         TypedResults.Ok(await statsService.GetStatsAsync(days, ct)))
         .WithName("GetStats")
@@ -1049,6 +1055,18 @@ static void ConfigureDaemonServices(
         client.Timeout = FeedConstants.BinaryFeedHttpTimeout).AddNetclawHeaders("update-check");
     services.AddHostedService<BinaryUpdateCheckService>();
 
+    // Panel-triggered self-update — POST /api/agent/upgrade downloads, verifies,
+    // and swaps the binaries in-process, then restarts onto the new image
+    // (systemd relaunch or a spawned successor). Progress is published to the
+    // AgentUpgradeState hub (GET /api/agent/upgrade + the status API's Update
+    // section) and persisted so UpgradeRecoveryService reconciles the outcome
+    // after the restart.
+    services.AddSingleton<AgentUpgradeState>();
+    services.AddSingleton<UpgradeStateStore>();
+    services.AddHttpClient<AgentUpgradeService>(client =>
+        client.Timeout = FeedConstants.BinaryFeedHttpTimeout).AddNetclawHeaders("self-update");
+    services.AddHostedService<UpgradeRecoveryService>();
+
     // Self-registration — POSTs the runtime status envelope to the operator-configured
     // control panel on startup and on health changes, plus a minimal heartbeat between
     // them. An unset or disabled Registration section keeps the feature off (no outbound
@@ -1063,6 +1081,35 @@ static void ConfigureDaemonServices(
             paths,
             sp => new DaemonStatusSnapshotProvider(sp.GetRequiredService<DaemonRuntimeStatusService>()),
             sp => new DaemonPairingCodeProvider(sp.GetRequiredService<PairingCodeService>()));
+    }
+
+    // Panel policy sync — periodically pulls the panel-composed ACS rego set
+    // for this daemon from the same panel configured under Registration.BaseUrl,
+    // validates it against the manifest + OPA before persisting, applies it
+    // atomically under the manifest's policy directory, and hot-reloads the
+    // governance runtime. Rejected sets keep the last-good policy; the error
+    // is replayed to the panel on the next poll. A disabled PolicySync section
+    // keeps the feature off (no outbound calls); enabling it without a
+    // Registration.BaseUrl fails startup loudly.
+    var policySyncConfig = configuration.GetSection("PolicySync")
+        .Get<PolicySyncConfig>() ?? new PolicySyncConfig();
+    if (policySyncConfig.Enabled)
+    {
+        if (string.IsNullOrWhiteSpace(registrationConfig.BaseUrl))
+        {
+            throw new InvalidOperationException(
+                "PolicySync is enabled but Registration.BaseUrl is not set. Policy sync uses the "
+                + "registration panel URL; set Registration.BaseUrl or disable PolicySync.");
+        }
+
+        services.AddSingleton(policySyncConfig);
+        services.AddSingleton(registrationConfig);
+        services.AddSingleton(new PolicySyncStateStore(paths));
+        services.AddSingleton<AcsPolicyApplier>();
+        services.AddHttpClient<PolicySyncService>(client =>
+                client.Timeout = TimeSpan.FromSeconds(Math.Clamp(policySyncConfig.TimeoutSeconds, 1, 300)))
+            .AddNetclawHeaders("policy-sync");
+        services.AddHostedService<PolicySyncService>();
     }
 
     // System prompt (file-based, with first-run seed)

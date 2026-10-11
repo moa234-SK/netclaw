@@ -801,6 +801,32 @@
       },
       "additionalProperties": false
     },
+    "PolicySync": {
+      "type": "object",
+      "description": "Panel-managed ACS policy sync. The daemon polls the control panel (Registration.BaseUrl) for a composed Rego policy set, validates it against the manifest and OPA before persisting, applies it atomically under the manifest's policy directory, and hot-reloads the governance runtime. Disabled by default.",
+      "properties": {
+        "Enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, the daemon polls the panel for policy changes. Requires Registration.BaseUrl to be set."
+        },
+        "IntervalMinutes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1440,
+          "default": 5,
+          "description": "How often (in minutes) to poll the panel. 0 syncs only at daemon startup."
+        },
+        "TimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300,
+          "default": 30,
+          "description": "HTTP timeout in seconds for panel requests."
+        }
+      },
+      "additionalProperties": false
+    },
     "Daemon": {
       "type": "object",
       "description": "Daemon network and exposure configuration.",

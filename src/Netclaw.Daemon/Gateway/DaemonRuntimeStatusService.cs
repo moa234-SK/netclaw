@@ -40,7 +40,8 @@ internal sealed class DaemonRuntimeStatusService(
     SQLiteMemoryStore? sqliteMemoryStore = null,
     MemoryEmbedderHolder? memoryEmbedderHolder = null,
     MemoryConfig? memoryConfig = null,
-    IRequiredActor<ReminderManagerActorKey>? reminderManagerActor = null)
+    IRequiredActor<ReminderManagerActorKey>? reminderManagerActor = null,
+    Services.AgentUpgradeState? upgradeState = null)
 {
     public async Task<DaemonRuntimeStatus.Response> GetStatusAsync(CancellationToken cancellationToken = default)
     {
@@ -249,6 +250,35 @@ internal sealed class DaemonRuntimeStatusService(
 
     private DaemonRuntimeStatus.Update BuildUpdateStatus()
     {
+        // An in-flight or just-finished self-update overrides the periodic
+        // check's view: the manifest cache lags the swap by up to 24h.
+        var upgrade = upgradeState?.Current;
+        if (upgrade is { IsActive: true })
+        {
+            return new DaemonRuntimeStatus.Update
+            {
+                Available = true,
+                SelfUpdateDisabled = daemonConfig.DisableSelfUpdate,
+                State = "upgrading",
+                CurrentVersion = upgrade.CurrentVersion ?? BuildInfo.FullVersion,
+                LatestVersion = upgrade.TargetVersion,
+                ErrorDetail = null,
+            };
+        }
+
+        if (upgrade is { State: AgentUpgradeStates.Failed })
+        {
+            return new DaemonRuntimeStatus.Update
+            {
+                Available = false,
+                SelfUpdateDisabled = daemonConfig.DisableSelfUpdate,
+                State = "update-failed",
+                CurrentVersion = upgrade.CurrentVersion ?? BuildInfo.FullVersion,
+                LatestVersion = upgrade.TargetVersion,
+                ErrorDetail = upgrade.Error,
+            };
+        }
+
         var result = UpdateCheckService.GetLastResult();
         if (result is null)
         {

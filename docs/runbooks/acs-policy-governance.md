@@ -138,9 +138,36 @@ Every refusal writes the reason to the daemon log. Run `netclaw doctor` to
 re-check without starting the daemon; the `ACS Policy Governance` check
 reports the manifest, OPA path, and OPA version.
 
+## Panel policy sync (hot reload)
+
+With `PolicySync:Enabled` (and `Registration.BaseUrl` set), the daemon polls the
+panel for a composed Rego set — by default every 5 minutes
+(`PolicySync:IntervalMinutes`, `0` = startup only) — and applies changed sets
+without a restart:
+
+1. The daemon `POST`s `api/v1/agent/policies/check` with its instance id, the
+   version hash it has applied, and any error from the last attempt.
+2. The panel responds with the current version hash and, when it differs, the
+   full file set for the manifest's `policy` directory.
+3. The daemon stages the files, validates the combined set (staged files plus
+   any operator `.rego` modules elsewhere under the manifest directory)
+   against the manifest and OPA, then swaps the `policy` directory atomically
+   (staging → live, old → backup) and rebuilds + hot-swaps the ACS runtime.
+4. Failures keep the previously applied policy: a rejected set is reported
+   back to the panel on the next poll (`runtime/policy-sync-state.json` holds
+   the applied version and last error). The next tick retries once the panel
+   serves a new version.
+
+The panel owns the `policy` directory once sync is enabled — operator-authored
+`.rego` files there are replaced by the panel-composed set. An empty set is
+rejected while `Governance:Enabled` is true (an empty `policy` directory would
+refuse the next daemon start); assign at least one policy in the panel or
+disable governance first.
+
 ## Limitations
 
-- Policy changes need a daemon restart; there is no hot reload.
+- Without `PolicySync`, policy changes still need a daemon restart; hot reload
+  exists only through panel policy sync.
 - Only `pre_tool_call` is evaluated. Input, output, and model calls are not
   mediated.
 - `escalate` and `transform` fail closed (see Verdicts).

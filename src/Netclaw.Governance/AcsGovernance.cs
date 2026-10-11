@@ -33,7 +33,7 @@ public sealed class AcsGovernance : IDisposable
         string? opaVersion)
     {
         Enabled = enabled;
-        Control = control;
+        _control = control;
         _sink = sink;
         ManifestPath = manifestPath;
         OpaPath = opaPath;
@@ -47,19 +47,25 @@ public sealed class AcsGovernance : IDisposable
     /// </summary>
     public bool Enabled { get; }
 
-    /// <summary>The ACS runtime, or null when <see cref="Enabled"/> is false.</summary>
-    public AgentControl? Control { get; }
+    private AgentControl? _control;
+    private OtelMetricsTelemetrySink? _sink;
 
-    private readonly OtelMetricsTelemetrySink? _sink;
+    // The displaced generation's telemetry sink, retained for one reload so
+    // in-flight evaluations on the replaced runtime can finish writing; its
+    // disposal happens on the next swap (or shutdown).
+    private OtelMetricsTelemetrySink? _retiredSink;
+
+    /// <summary>The ACS runtime, or null when <see cref="Enabled"/> is false. Swapped atomically on hot reload.</summary>
+    public AgentControl? Control => Volatile.Read(ref _control);
 
     /// <summary>The resolved manifest path, or null when disabled.</summary>
-    public string? ManifestPath { get; }
+    public string? ManifestPath { get; private set; }
 
     /// <summary>The resolved OPA binary path, or null when disabled.</summary>
-    public string? OpaPath { get; }
+    public string? OpaPath { get; private set; }
 
     /// <summary>The first line of <c>opa version</c>, or null when disabled or unreported.</summary>
-    public string? OpaVersion { get; }
+    public string? OpaVersion { get; private set; }
 
     private bool _disposed;
 
@@ -71,11 +77,45 @@ public sealed class AcsGovernance : IDisposable
     internal static AcsGovernance CreateEnabledForTesting(AgentControl control, string? manifestPath = null)
         => new(enabled: true, control, sink: null, manifestPath, opaPath: null, opaVersion: null);
 
+    /// <summary>
+    /// Hot-reload seam for panel policy sync: swaps in the runtime built by
+    /// <see cref="Build"/> from a freshly applied policy set. Only valid
+    /// between two enabled instances — the enabled/disabled toggle stays a
+    /// startup decision. The replacement's control and sink are adopted and
+    /// its shell becomes inert (disposing it afterwards is a no-op). The
+    /// displaced runtime is retained for one generation so in-flight
+    /// evaluations on it finish undisturbed; its sink is disposed on the
+    /// next swap or at shutdown.
+    /// </summary>
+    internal bool TryAdopt(AcsGovernance replacement)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+
+        if (!Enabled || !replacement.Enabled || replacement._control is null)
+            return false;
+
+        var displacedSink = _sink;
+        Volatile.Write(ref _control, replacement._control);
+        _sink = replacement._sink;
+        ManifestPath = replacement.ManifestPath;
+        OpaPath = replacement.OpaPath;
+        OpaVersion = replacement.OpaVersion;
+
+        replacement._control = null;
+        replacement._sink = null;
+
+        _retiredSink?.Dispose();
+        _retiredSink = displacedSink;
+
+        return true;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         _sink?.Dispose();
+        _retiredSink?.Dispose();
     }
 
     /// <summary>
@@ -249,7 +289,7 @@ public sealed class AcsGovernance : IDisposable
         }
     }
 
-    private static Dictionary<string, string> CollectRegoModules(string manifestDirectory)
+    internal static Dictionary<string, string> CollectRegoModules(string manifestDirectory)
     {
         var modules = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var file in Directory.EnumerateFiles(

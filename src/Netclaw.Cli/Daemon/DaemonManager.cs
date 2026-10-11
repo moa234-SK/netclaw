@@ -495,6 +495,15 @@ public sealed partial class DaemonManager
             {
                 CleanupPidFile();
             }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                // The PID exists but cannot be queried (e.g. it was recycled by
+                // an elevated process or one owned by another user) — it cannot
+                // be our daemon, which runs as this user. The stale file is
+                // cleaned and the lock-file probe below still guards against a
+                // second start if a daemon is genuinely running.
+                CleanupPidFile();
+            }
         }
 
         // Tier 2: Lock file probe (fast, OS-backed — covers PID file loss)

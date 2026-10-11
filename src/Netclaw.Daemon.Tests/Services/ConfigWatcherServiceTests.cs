@@ -170,5 +170,8 @@ public sealed class ConfigWatcherServiceTests : IDisposable
 
             return Task.CompletedTask;
         }
+
+        public Task<bool> RequestUpdateExitAsync(CancellationToken cancellationToken, Func<Task>? onDrained = null)
+            => throw new NotSupportedException("Config reload never triggers an update exit.");
     }
 }

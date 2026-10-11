@@ -136,6 +136,69 @@ public sealed class DaemonRestartCoordinatorTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task RequestUpdateExitAsync_runs_hook_drains_and_stops_host_without_soft_restart()
+    {
+        var (coordinator, _) = CreateCoordinator([]);
+        var hookCalled = false;
+
+        var accepted = await coordinator.RequestUpdateExitAsync(
+            CancellationToken.None,
+            () => { hookCalled = true; return Task.CompletedTask; });
+
+        Assert.True(accepted);
+        Assert.True(hookCalled);
+        Assert.True(_appLifetime.StopRequested);
+        // The process must EXIT onto the new binary — the do/while loop must
+        // not iterate (that would keep serving from the old image).
+        Assert.False(_restartSignal.RestartRequested);
+        Assert.Null(await new RestartManifestStore(_paths).ReadAsync(CancellationToken.None));
+        Assert.Equal(SessionIngressGate.RestartInProgressMessage, _ingressGate.ClosedReason);
+    }
+
+    [Fact]
+    public async Task RequestUpdateExitAsync_returns_false_when_another_restart_owns_the_gate()
+    {
+        var (coordinator, _) = CreateCoordinator([]);
+        Assert.True(_ingressGate.TryClose(SessionIngressGate.RestartInProgressMessage));
+
+        var accepted = await coordinator.RequestUpdateExitAsync(CancellationToken.None);
+
+        Assert.False(accepted);
+        Assert.False(_appLifetime.StopRequested);
+        Assert.False(_restartSignal.RestartRequested);
+    }
+
+    [Fact]
+    public async Task RequestUpdateExitAsync_proceeds_when_agent_is_suspended()
+    {
+        var (coordinator, _) = CreateCoordinator([]);
+        Assert.True(_ingressGate.TryClose(SessionIngressGate.AgentSuspendedMessage));
+
+        var accepted = await coordinator.RequestUpdateExitAsync(CancellationToken.None);
+
+        Assert.True(accepted);
+        Assert.True(_appLifetime.StopRequested);
+        Assert.False(_restartSignal.RestartRequested);
+        // The operator's suspend must survive the upgrade — never reopened.
+        Assert.Equal(SessionIngressGate.AgentSuspendedMessage, _ingressGate.ClosedReason);
+    }
+
+    [Fact]
+    public async Task RequestUpdateExitAsync_reopens_self_closed_gate_when_hook_fails()
+    {
+        var (coordinator, _) = CreateCoordinator([]);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => coordinator.RequestUpdateExitAsync(
+                CancellationToken.None,
+                () => throw new InvalidOperationException("successor spawn failed")));
+
+        Assert.False(_appLifetime.StopRequested);
+        Assert.False(_restartSignal.RestartRequested);
+        Assert.Null(_ingressGate.ClosedReason);
+    }
+
+    [Fact]
     public async Task SessionDrainHelper_reports_deadline_timeouts()
     {
         var time = new FakeTimeProvider();

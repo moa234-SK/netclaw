@@ -3,12 +3,11 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
-using System.IO.Compression;
-using System.Security.Cryptography;
 using Netclaw.Cli.Config;
 using Netclaw.Cli.Daemon;
 using Netclaw.Configuration;
 using Netclaw.Configuration.Feeds;
+using Netclaw.Configuration.Update;
 
 namespace Netclaw.Cli.Update;
 
@@ -203,34 +202,26 @@ internal static class UpdateCommand
     private static async Task<int> PerformUpdateAsync(
         UpdateCheckResult result, NetclawPaths paths, HttpClient httpClient)
     {
-        var installDir = GetInstallDirectory();
+        static void Warn(string message) => Console.Error.WriteLine(message);
+
+        var installDir = SelfUpdateInstaller.GetInstallDirectory();
         var tempDir = Path.Combine(Path.GetTempPath(), $"netclaw-update-{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
 
         try
         {
-            // Download and verify each asset
-            var extractedPaths = new Dictionary<string, string>();
-            foreach (var asset in result.MatchingAssets)
+            // Download, verify, and extract each asset
+            IReadOnlyDictionary<string, string> extractedPaths;
+            try
             {
-                Console.Write($"Downloading {asset.Component}...");
-                var archivePath = Path.Combine(tempDir, Path.GetFileName(new Uri(asset.Url).AbsolutePath));
-
-                if (!await DownloadAndVerifyAsync(httpClient, asset, archivePath))
-                    return 1;
-
-                Console.WriteLine(" verified.");
-
-                // Extract
-                var extractDir = Path.Combine(tempDir, asset.Component);
-                Directory.CreateDirectory(extractDir);
-
-                if (archivePath.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
-                    await ExtractTarGzAsync(archivePath, extractDir);
-                else if (archivePath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
-                    ZipFile.ExtractToDirectory(archivePath, extractDir);
-
-                extractedPaths[asset.Component] = extractDir;
+                extractedPaths = await SelfUpdateInstaller.DownloadAndExtractAsync(
+                    result, tempDir, httpClient,
+                    log: message => Console.WriteLine(message));
+            }
+            catch (SelfUpdateException ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+                return 1;
             }
 
             // Check if daemon is running (we'll need to restart it)
@@ -256,49 +247,15 @@ internal static class UpdateCommand
 
             // Replace binaries
             Console.Write("Installing...");
-            Directory.CreateDirectory(installDir);
-
-            foreach (var (component, extractDir) in extractedPaths)
+            try
             {
-                var binaryName = OperatingSystem.IsWindows()
-                    ? $"{component}.exe"
-                    : component;
-
-                var sourcePath = FindBinaryInExtracted(extractDir, binaryName);
-                if (sourcePath is null)
-                {
-                    Console.WriteLine($"\n  Could not find {binaryName} in downloaded archive.");
-                    return 1;
-                }
-
-                var targetPath = Path.Combine(installDir, binaryName);
-                var backupPath = targetPath + ".backup";
-
-                try
-                {
-                    // Swap with automatic rollback: a failed swap restores the
-                    // previous binary so the install directory is never left
-                    // without an executable (which would brick the CLI).
-                    SwapBinaryIntoPlace(sourcePath, targetPath, backupPath);
-                }
-                catch (Exception ex)
-                {
-                    var targetRestored = File.Exists(targetPath);
-                    Console.WriteLine($"\n  Failed to replace {binaryName}: {ex.Message}");
-                    if (targetRestored)
-                    {
-                        Console.WriteLine("  The previous binary was restored. The daemon is stopped; start it with 'netclaw daemon start'.");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"  The install directory is missing {binaryName}. Restore it from {binaryName}.backup, then start the daemon with 'netclaw daemon start'.");
-                    }
-                    return 1;
-                }
-
-                // Set executable permission on Unix
-                if (!OperatingSystem.IsWindows())
-                    SetExecutable(targetPath);
+                SelfUpdateInstaller.SwapBinaries(extractedPaths, installDir, Warn);
+            }
+            catch (SelfUpdateException ex)
+            {
+                Console.WriteLine($"\n  {ex.Message}");
+                Console.WriteLine("  The daemon is stopped; start it with 'netclaw daemon start'.");
+                return 1;
             }
 
             Console.WriteLine(" done.");
@@ -323,19 +280,8 @@ internal static class UpdateCommand
             // DeleteFile on a running image fails with
             // UnauthorizedAccessException. Leave it — the install step deletes
             // stale backups before moving the new binary on the next update.
-            // A leftover backup must never turn a successful update into a
-            // fatal error, so any other delete failure only warns.
-            var runningBackupPath = Environment.ProcessPath is { } processPath
-                ? processPath + ".backup"
-                : null;
-            foreach (var (component, _) in extractedPaths)
-            {
-                var binaryName = OperatingSystem.IsWindows()
-                    ? $"{component}.exe"
-                    : component;
-                var backupPath = Path.Combine(installDir, binaryName + ".backup");
-                CleanupBackupFile(backupPath, runningBackupPath, OperatingSystem.IsWindows());
-            }
+            SelfUpdateInstaller.CleanupBackupFiles(
+                extractedPaths, installDir, Environment.ProcessPath, Warn);
 
             Console.WriteLine($"\nUpdated to v{result.LatestVersion}.");
             return 0;
@@ -442,192 +388,6 @@ internal static class UpdateCommand
             => manager.StopAsync(reason, cancellationToken);
 
         public DaemonResult Start() => manager.Start();
-    }
-
-    private static async Task<bool> DownloadAndVerifyAsync(
-        HttpClient httpClient, BinaryAsset asset, string archivePath)
-    {
-        try
-        {
-            using var response = await httpClient.GetAsync(asset.Url, HttpCompletionOption.ResponseHeadersRead);
-            response.EnsureSuccessStatusCode();
-
-            await using var stream = await response.Content.ReadAsStreamAsync();
-            await using var fileStream = File.Create(archivePath);
-            await stream.CopyToAsync(fileStream);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($" download failed: {ex.Message}");
-            return false;
-        }
-
-        // Verify SHA-256
-        var hash = await ComputeFileSha256Async(archivePath);
-        if (!string.Equals(hash, asset.Sha256, StringComparison.OrdinalIgnoreCase))
-        {
-            Console.WriteLine($" checksum mismatch (expected {asset.Sha256}, got {hash})");
-            return false;
-        }
-
-        return true;
-    }
-
-    private static async Task<string> ComputeFileSha256Async(string filePath)
-    {
-        await using var stream = File.OpenRead(filePath);
-        var hash = await SHA256.HashDataAsync(stream);
-        return Convert.ToHexStringLower(hash);
-    }
-
-    private static async Task ExtractTarGzAsync(string archivePath, string extractDir)
-    {
-        // Use tar command — available on all supported platforms (Linux, Windows 10+)
-        var psi = new System.Diagnostics.ProcessStartInfo
-        {
-            FileName = "tar",
-            Arguments = $"xzf \"{archivePath}\" -C \"{extractDir}\"",
-            UseShellExecute = false,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
-
-        using var proc = System.Diagnostics.Process.Start(psi)!;
-        await proc.WaitForExitAsync();
-
-        if (proc.ExitCode != 0)
-        {
-            var stderr = await proc.StandardError.ReadToEndAsync();
-            throw new InvalidOperationException($"tar extraction failed: {stderr}");
-        }
-    }
-
-    private static string? FindBinaryInExtracted(string extractDir, string binaryName)
-    {
-        // Binary may be directly in the extract dir or in a subdirectory
-        var direct = Path.Combine(extractDir, binaryName);
-        if (File.Exists(direct))
-            return direct;
-
-        // Search one level deep
-        foreach (var dir in Directory.GetDirectories(extractDir))
-        {
-            var candidate = Path.Combine(dir, binaryName);
-            if (File.Exists(candidate))
-                return candidate;
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Replaces <paramref name="targetPath"/> with
-    /// <paramref name="sourcePath"/>, preserving the previous binary at
-    /// <paramref name="backupPath"/>. On failure the previous binary is
-    /// restored to <paramref name="targetPath"/> so a failed swap never
-    /// leaves the install directory without an executable.
-    /// </summary>
-    /// <param name="sourcePath">The new binary to install.</param>
-    /// <param name="targetPath">The installed binary to replace.</param>
-    /// <param name="backupPath">Where the previous binary is preserved.</param>
-    internal static void SwapBinaryIntoPlace(string sourcePath, string targetPath, string backupPath)
-    {
-        var movedOldToBackup = false;
-        try
-        {
-            if (File.Exists(targetPath))
-            {
-                if (File.Exists(backupPath))
-                    File.Delete(backupPath);
-                File.Move(targetPath, backupPath);
-                movedOldToBackup = true;
-            }
-
-            File.Move(sourcePath, targetPath);
-        }
-        catch
-        {
-            // Roll the previous binary back so a failed swap leaves a
-            // working binary in place instead of a missing executable.
-            if (movedOldToBackup && !File.Exists(targetPath) && File.Exists(backupPath))
-            {
-                try { File.Move(backupPath, targetPath); }
-                catch (Exception rollbackEx)
-                {
-                    // Best-effort rollback; the original swap failure is
-                    // rethrown below and reported to the user.
-                    Console.Error.WriteLine($"warn: failed to restore {targetPath} from {backupPath}: {rollbackEx.Message}");
-                }
-            }
-            throw;
-        }
-    }
-
-    /// <summary>
-    /// Deletes a leftover <c>.backup</c> file after a successful update.
-    /// On Windows the backup of the currently running image cannot be
-    /// deleted — the process still executes from that file, so DeleteFile
-    /// fails with <see cref="UnauthorizedAccessException"/>. Such backups are
-    /// removed by the install step on the next update, before it renames the
-    /// new binary. Any other delete failure only warns; a leftover backup must
-    /// never turn a successful update into a fatal error.
-    /// </summary>
-    /// <param name="backupPath">The backup file to delete.</param>
-    /// <param name="runningBackupPath">
-    /// The backup path of the currently running process
-    /// (<c>Environment.ProcessPath + ".backup"</c>), or <c>null</c> if unknown.
-    /// </param>
-    /// <param name="isWindows">True when running on Windows.</param>
-    internal static void CleanupBackupFile(string backupPath, string? runningBackupPath, bool isWindows)
-    {
-        if (isWindows
-            && runningBackupPath is not null
-            && string.Equals(backupPath, runningBackupPath, StringComparison.OrdinalIgnoreCase))
-        {
-            // Running image — cannot be deleted on Windows.
-            return;
-        }
-
-        try
-        {
-            if (File.Exists(backupPath))
-                File.Delete(backupPath);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"warn: could not remove backup {backupPath}: {ex.Message}");
-        }
-    }
-
-    private static string GetInstallDirectory()
-    {
-        // Use the directory containing the current CLI binary
-        var processPath = Environment.ProcessPath;
-        if (processPath is not null)
-            return Path.GetDirectoryName(processPath)!;
-
-        // Fallback to ~/.netclaw/bin/
-        return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".netclaw", "bin");
-    }
-
-    private static void SetExecutable(string path)
-    {
-        try
-        {
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "chmod",
-                Arguments = $"+x \"{path}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            })?.WaitForExit();
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"warn: chmod +x failed for {path}: {ex.Message}");
-        }
     }
 
     /// <summary>

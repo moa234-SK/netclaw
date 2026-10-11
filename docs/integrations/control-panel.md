@@ -140,7 +140,43 @@ Every accepted command appends to the agent's durable intervention
 ledger with the caller's device identity, command, reason, and
 timestamp. Panels cannot erase ledger entries.
 
-## 4. Agent-side configuration summary
+## 4. Policy sync (agent pulls its Rego policy set)
+
+With `PolicySync:Enabled`, the daemon pulls the ACS policy set the panel
+composed for it. There is no separate URL — sync uses `Registration.BaseUrl`.
+
+```json
+{
+  "Registration": {
+    "BaseUrl": "https://panel.corp.local"
+  },
+  "PolicySync": {
+    "Enabled": true,
+    "IntervalMinutes": 5
+  }
+}
+```
+
+Contract (agent → panel):
+
+- `POST {Registration.BaseUrl}/api/v1/agent/policies/check`
+  - Request: `{ "instanceId", "appliedVersion?", "lastError?" }` — the version
+    hash currently applied and the error from the last failed apply, if any.
+  - Response: `{ "version", "changed", "files?" }` — `files`
+    (`[{ "name", "content" }]`, flat `.rego` names) is present only when
+    `changed` is true.
+  - Non-2xx: the agent keeps its on-disk policy and retries on the next poll.
+  - 409 (composition conflict on the panel): the agent records the error,
+    keeps the old policy, and replays the error on every subsequent poll
+    until the panel resolves the assignment.
+
+On a changed set the agent validates (manifest + OPA + artifact validation)
+before persisting, swaps its `acs/policy/` directory atomically, and
+hot-reloads the governance runtime — no restart. The panel owns `acs/policy/`
+once sync is enabled. The panel tracks per-agent state from the check itself:
+applied version, last check time, and the last error (surfaced in its UI).
+
+## 5. Agent-side configuration summary
 
 ```json
 {
@@ -160,7 +196,7 @@ single-use pairing code in the envelope. The daemon's HTTP API must be
 reachable at that URL (see the daemon exposure documentation for
 `ExposureMode`).
 
-## 5. Failure modes
+## 6. Failure modes
 
 | Symptom | Meaning |
 |---|---|
@@ -171,5 +207,7 @@ reachable at that URL (see the daemon exposure documentation for
 | Commands time out | Network path or exposure misconfigured on the agent |
 | 409 on every command | Session is in a gated state — resume first |
 | Heartbeats keep flowing, all channels dark | The agent is suspended — check `agentState`, `POST /api/agent/resume` |
+| Policy check 404 | Agent not registered in the panel — wait for/trigger a status send |
+| Policy stuck "outdated" in panel | Agent rejected the set — panel shows the replayed error; fix the policy or assignment |
 
 Operator runbook: `docs/runbooks/session-intervention.md`.

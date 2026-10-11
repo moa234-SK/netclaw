@@ -134,7 +134,9 @@ public static class DaemonRuntimeStatus
         public bool SelfUpdateDisabled { get; init; }
 
         /// <summary>
-        /// Update availability state: "up-to-date", "update-available", or "unknown" (check failed or not yet run).
+        /// Update availability state: "up-to-date", "update-available", "unknown"
+        /// (check failed or not yet run), "upgrading" (panel-triggered self-update
+        /// in flight), or "update-failed" (self-update failed — see <see cref="ErrorDetail"/>).
         /// </summary>
         public string State { get; init; } = "unknown";
 

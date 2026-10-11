@@ -16,6 +16,19 @@ namespace Netclaw.Daemon.Services;
 public interface IDaemonRestartCoordinator
 {
     Task RequestConfigRestartAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Drains sessions and stops the host so the process exits onto freshly
+    /// swapped binaries (self-update restart). Unlike the config restart this
+    /// does not iterate the in-process restart loop — the new image must be
+    /// launched by the supervisor (systemd Restart=always) or by the successor
+    /// spawned via <paramref name="onDrained"/>.
+    /// </summary>
+    /// <returns>
+    /// False when another coordinated restart owns the ingress gate and the
+    /// exit could not be scheduled; true once shutdown has been initiated.
+    /// </returns>
+    Task<bool> RequestUpdateExitAsync(CancellationToken cancellationToken, Func<Task>? onDrained = null);
 }
 
 /// <summary>
@@ -114,6 +127,84 @@ public sealed class DaemonRestartCoordinator : IDaemonRestartCoordinator
         catch
         {
             _ingressGate.Reopen();
+            throw;
+        }
+    }
+
+    public async Task<bool> RequestUpdateExitAsync(
+        CancellationToken cancellationToken,
+        Func<Task>? onDrained = null)
+    {
+        var weClosedGate = _ingressGate.TryClose(SessionIngressGate.RestartInProgressMessage);
+
+        if (!weClosedGate)
+        {
+            if (_ingressGate.ClosedReason == SessionIngressGate.AgentSuspendedMessage)
+            {
+                // A suspended agent can still be upgraded: the gate is already
+                // closed and the boot gate re-freezes the successor on startup,
+                // so exiting now does not reopen any ingress.
+                _logger.LogInformation(
+                    "Agent is suspended by operator intervention; proceeding with the self-update restart (the daemon comes back frozen).");
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "A coordinated restart is already in progress; the self-update restart could not be scheduled.");
+                return false;
+            }
+        }
+
+        try
+        {
+            var sessionManager = await _sessionManagerProvider.GetAsync(cancellationToken);
+
+            using var deadlineCts = new CancellationTokenSource(_restartDrainTimeout, _timeProvider);
+            using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                deadlineCts.Token);
+
+            var drainResult = await SessionDrainHelper.DrainAsync(
+                sessionManager,
+                "self-update",
+                _logger,
+                drainCts.Token,
+                cancellationToken);
+
+            var manifest = new RestartManifest
+            {
+                Reason = "self-update",
+                RequestedAt = _timeProvider.GetUtcNow(),
+                SessionIds = [.. drainResult.AllSessionIds.Select(static id => id.Value)],
+                TimedOutSessionIds = [.. drainResult.TimedOutSessionIds.Select(static id => id.Value)]
+            };
+
+            if (manifest.SessionIds.Count == 0)
+                await _manifestStore.DeleteAsync();
+            else
+                await _manifestStore.WriteAsync(manifest, cancellationToken);
+
+            _lifecycleNotifier.NotifyShutdown("self-update", drainResult.ToNotificationContext());
+
+            // Last chance for the caller to act while this process is still the
+            // sole holder of the lock file — the detached restart mode spawns
+            // its successor here.
+            if (onDrained is not null)
+                await onDrained();
+
+            // Deliberately no _restartSignal.RequestRestart(): the do/while loop
+            // must not iterate (it would keep serving from the old image). The
+            // process exits and systemd (Restart=always) or the spawned
+            // successor relaunches the new binary.
+            _appLifetime.StopApplication();
+            return true;
+        }
+        catch
+        {
+            // Only reopen a gate this method closed — reopening an
+            // operator-suspended gate would unfreeze the agent.
+            if (weClosedGate)
+                _ingressGate.Reopen();
             throw;
         }
     }
