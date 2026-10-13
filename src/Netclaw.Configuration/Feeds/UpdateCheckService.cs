@@ -64,7 +64,7 @@ public enum ManifestFetchStatus
 /// <summary>
 /// Checks the binary feed manifest for available updates.
 /// Shared between CLI (update command + startup check) and daemon (startup notification).
-/// Modeled after <see cref="SystemSkillSyncService"/> manifest fetch pattern.
+/// Uses the same bounded HTTP request pattern as the skill feed clients.
 /// Results are cached for 1 hour to avoid hammering the CDN.
 /// </summary>
 public static class UpdateCheckService
@@ -141,6 +141,15 @@ public static class UpdateCheckService
 
         // Start both requests in parallel — halves network time for the CLI's 3s timeout
         var sigTask = httpClient.GetAsync(FeedConstants.BinaryManifestSignatureUrl, cts.Token);
+
+        // The manifest failure below returns before sigTask is awaited. Observe its fault so a
+        // host with no route to the release server does not raise UnobservedTaskException,
+        // which the daemon records as a crash.
+        _ = sigTask.ContinueWith(
+            static task => _ = task.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
         // Read raw bytes for signature verification — avoids encoding round-trip
         // (ReadAsStringAsync → UTF8.GetBytes can alter bytes if the response charset

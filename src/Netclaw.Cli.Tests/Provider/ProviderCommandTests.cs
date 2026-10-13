@@ -8,6 +8,7 @@ using Netclaw.Cli.Config;
 using Netclaw.Cli.Provider;
 using Netclaw.Configuration;
 using Netclaw.Configuration.Secrets;
+using Netclaw.Providers;
 using Netclaw.Providers.OAuth;
 using Netclaw.Providers.SelfHosted;
 using Netclaw.Tests.Utilities;
@@ -109,6 +110,167 @@ public sealed class ProviderCommandTests : IDisposable
         // Verify provider loader decrypts back to usable plaintext
         var loaded = ProviderCommand.LoadProviders(_paths);
         Assert.Equal("sk-or-test-123", loaded["my-openrouter"].ApiKey?.Value);
+    }
+
+    [Fact]
+    public async Task Add_OpenAiCompatibleWithApiKey_PersistsBearerKeyWithoutRequiringAuthMethod()
+    {
+        // The endpoint is credential-optional, so no AuthMethod is written — but the
+        // key must still land in secrets.json and round-trip to the runtime, which
+        // sends it as a Bearer header whenever it is present.
+        var exitCode = await ProviderCommand.RunAsync(
+            ["provider", "add", "my-vllm", "openai-compatible",
+                "--endpoint", "http://my-gpu-server:8000/v1", "--api-key", "sk-gateway-test-123"],
+            _paths, output: _output);
+
+        Assert.Equal(0, exitCode);
+
+        var config = ReadConfigFile(_paths.NetclawConfigPath);
+        var entry = config.RootElement.GetProperty("Providers").GetProperty("my-vllm");
+        Assert.Equal("openai-compatible", entry.GetProperty("Type").GetString());
+        Assert.Equal("http://my-gpu-server:8000/v1", entry.GetProperty("Endpoint").GetString());
+
+        // A supplied key is recorded descriptively so `provider list` reports it.
+        Assert.Equal("ApiKey", entry.GetProperty("AuthMethod").GetString());
+
+        var secrets = ReadConfigFile(_paths.SecretsPath);
+        var encrypted = secrets.RootElement
+            .GetProperty("Providers").GetProperty("my-vllm")
+            .GetProperty("ApiKey").GetString();
+        Assert.StartsWith("ENC:", encrypted);
+
+        var loaded = ProviderCommand.LoadProviders(_paths);
+        Assert.Equal("sk-gateway-test-123", loaded["my-vllm"].ApiKey?.Value);
+    }
+
+    [Fact]
+    public async Task Add_OpenAiCompatibleWithoutApiKey_StaysUnauthenticated()
+    {
+        // Regression guard: the credential-free path must keep working after the
+        // descriptor started offering an optional Bearer key.
+        var exitCode = await ProviderCommand.RunAsync(
+            ["provider", "add", "my-llamacpp", "openai-compatible",
+                "--endpoint", "http://my-gpu-server:8080"],
+            _paths, output: _output);
+
+        Assert.Equal(0, exitCode);
+
+        var loaded = ProviderCommand.LoadProviders(_paths);
+        Assert.True(loaded["my-llamacpp"].ApiKey.IsNullOrEmpty());
+        Assert.Equal(AuthMethod.None, loaded["my-llamacpp"].AuthMethod);
+    }
+
+    [Fact]
+    public async Task Add_CredentialOptionalProviderWithAuthApiKeyButNoKey_FailsLoudly()
+    {
+        // --auth api-key is an explicit request for key auth. Writing a
+        // credential-free entry would report success while the gateway answers 401.
+        WriteConfig(new Dictionary<string, object>
+        {
+            ["configVersion"] = 1,
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["existing"] = new Dictionary<string, object> { ["Type"] = "ollama" }
+            }
+        });
+        WriteSecrets(new Dictionary<string, object>
+        {
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["existing"] = new Dictionary<string, object> { ["ApiKey"] = "existing-secret" }
+            }
+        });
+        var configBefore = File.ReadAllText(_paths.NetclawConfigPath);
+        var secretsBefore = File.ReadAllText(_paths.SecretsPath);
+
+        var exitCode = await ProviderCommand.RunAsync(
+            ["provider", "add", "my-vllm", "openai-compatible",
+                "--endpoint", "http://my-gpu-server:8000/v1", "--auth", "api-key"],
+            _paths, output: _output);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("requires --api-key", _output.ToString());
+        Assert.False(File.Exists(_paths.NetclawConfigPath)
+            && ReadConfigFile(_paths.NetclawConfigPath).RootElement
+                .TryGetProperty("Providers", out var providers)
+            && providers.TryGetProperty("my-vllm", out _));
+        Assert.Equal(configBefore, File.ReadAllText(_paths.NetclawConfigPath));
+        Assert.Equal(secretsBefore, File.ReadAllText(_paths.SecretsPath));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task Add_WithBlankApiKey_LeavesConfigAndSecretsUnchanged(string apiKey)
+    {
+        WriteConfig(new Dictionary<string, object>
+        {
+            ["configVersion"] = 1,
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["existing"] = new Dictionary<string, object> { ["Type"] = "ollama" }
+            }
+        });
+        WriteSecrets(new Dictionary<string, object>
+        {
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["existing"] = new Dictionary<string, object> { ["ApiKey"] = "existing-secret" }
+            }
+        });
+        var configBefore = File.ReadAllText(_paths.NetclawConfigPath);
+        var secretsBefore = File.ReadAllText(_paths.SecretsPath);
+
+        var exitCode = await ProviderCommand.RunAsync(
+            ["provider", "add", "my-vllm", "openai-compatible", "--api-key", apiKey],
+            _paths, output: _output);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("cannot be empty or whitespace", _output.ToString());
+        Assert.Equal(configBefore, File.ReadAllText(_paths.NetclawConfigPath));
+        Assert.Equal(secretsBefore, File.ReadAllText(_paths.SecretsPath));
+    }
+
+    [Fact]
+    public async Task Add_EndpointOnlyProviderWithApiKey_ReturnsErrorBeforePersistence()
+    {
+        WriteConfig(new Dictionary<string, object> { ["configVersion"] = 1 });
+        WriteSecrets(new Dictionary<string, object> { ["Providers"] = new Dictionary<string, object>() });
+        var configBefore = File.ReadAllText(_paths.NetclawConfigPath);
+        var secretsBefore = File.ReadAllText(_paths.SecretsPath);
+
+        var exitCode = await ProviderCommand.RunAsync(
+            ["provider", "add", "local", "ollama", "--api-key", "unexpected-key"],
+            _paths, output: _output);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("does not support API key auth", _output.ToString());
+        Assert.Equal(configBefore, File.ReadAllText(_paths.NetclawConfigPath));
+        Assert.Equal(secretsBefore, File.ReadAllText(_paths.SecretsPath));
+    }
+
+    [Fact]
+    public void OpenAiCompatibleDescriptor_OffersOptionalApiKeyAndStaysCredentialOptional()
+    {
+        var descriptor = ProviderCommand.CreateDefaultRegistry().Get("openai-compatible");
+
+        Assert.IsType<Netclaw.Providers.OptionalApiKeyAuth>(descriptor.Auth);
+        Assert.True(descriptor.Auth.IsCredentialOptional());
+        Assert.True(descriptor.Auth.OffersOptionalApiKey());
+        Assert.Equal(
+            [AuthMethod.None, AuthMethod.ApiKey],
+            descriptor.Auth.SupportedAuthMethods);
+    }
+
+    [Fact]
+    public void OllamaDescriptor_RemainsEndpointOnlyWithoutOptionalKey()
+    {
+        // Ollama has no gateway story: it must not grow a key prompt.
+        var descriptor = ProviderCommand.CreateDefaultRegistry().Get("ollama");
+
+        Assert.IsType<Netclaw.Providers.EndpointOnlyAuth>(descriptor.Auth);
+        Assert.True(descriptor.Auth.IsCredentialOptional());
+        Assert.False(descriptor.Auth.OffersOptionalApiKey());
     }
 
     [Fact]
@@ -400,6 +562,155 @@ public sealed class ProviderCommandTests : IDisposable
         Assert.Contains("Main", output);
     }
 
+    private void WriteNamedModels(string mainProvider, string? fallbackProvider = null, string? compactionProvider = null)
+    {
+        var providers = new Dictionary<string, object>();
+        foreach (var name in new[] { mainProvider, fallbackProvider, compactionProvider, "spare" })
+        {
+            if (name is not null)
+                providers[name] = new Dictionary<string, object> { ["Type"] = "ollama", ["Endpoint"] = "http://localhost:11434" };
+        }
+
+        var definitions = new Dictionary<string, object>
+        {
+            ["main-model"] = new Dictionary<string, object> { ["Provider"] = mainProvider, ["ModelId"] = "qwen3:30b" }
+        };
+        var roles = new Dictionary<string, object> { ["Main"] = "main-model" };
+        if (fallbackProvider is not null)
+        {
+            definitions["fallback-model"] = new Dictionary<string, object> { ["Provider"] = fallbackProvider, ["ModelId"] = "qwen3:8b" };
+            roles["Fallback"] = "fallback-model";
+        }
+
+        if (compactionProvider is not null)
+        {
+            definitions["compaction-model"] = new Dictionary<string, object> { ["Provider"] = compactionProvider, ["ModelId"] = "qwen3:4b" };
+            roles["Compaction"] = "compaction-model";
+        }
+
+        WriteConfig(new Dictionary<string, object>
+        {
+            ["configVersion"] = 1,
+            ["Providers"] = providers,
+            ["Models"] = new Dictionary<string, object> { ["Definitions"] = definitions, ["Roles"] = roles }
+        });
+    }
+
+    [Fact]
+    public async Task Remove_ProviderBoundToMainByNamedRoles_ReturnsError()
+    {
+        WriteNamedModels("my-ollama");
+
+        var exitCode = await ProviderCommand.RunAsync(["provider", "remove", "my-ollama"], _paths, output: _output);
+
+        Assert.Equal(1, exitCode);
+        var output = _output.ToString();
+        Assert.Contains("Cannot remove provider 'my-ollama' — referenced by model role(s): Main", output);
+        Assert.Contains("Run `netclaw model set` to reassign these roles first", output);
+        Assert.True(ProviderCommand.LoadProviders(_paths).ContainsKey("my-ollama"));
+    }
+
+    [Fact]
+    public async Task Remove_ProviderBoundOnlyToFallbackAndCompactionByNamedRoles_ReturnsError()
+    {
+        WriteNamedModels("main-host", fallbackProvider: "fallback-host", compactionProvider: "compaction-host");
+
+        Assert.Equal(1, await ProviderCommand.RunAsync(["provider", "remove", "fallback-host"], _paths, output: _output));
+        Assert.Equal(1, await ProviderCommand.RunAsync(["provider", "remove", "compaction-host"], _paths, output: _output));
+
+        var output = _output.ToString();
+        Assert.Contains("referenced by model role(s): Fallback", output);
+        Assert.Contains("referenced by model role(s): Compaction", output);
+    }
+
+    [Fact]
+    public async Task Remove_ProviderUnusedByNamedRoles_Succeeds()
+    {
+        WriteNamedModels("my-ollama");
+
+        var exitCode = await ProviderCommand.RunAsync(["provider", "remove", "spare"], _paths, output: _output);
+
+        Assert.Equal(0, exitCode);
+        Assert.False(ProviderCommand.LoadProviders(_paths).ContainsKey("spare"));
+        Assert.True(ProviderCommand.LoadProviders(_paths).ContainsKey("my-ollama"));
+    }
+
+    [Fact]
+    public void TryGetReferencingModelRoleEntries_NamedRoles_ReturnsRoleAndDefinitionModelId()
+    {
+        WriteNamedModels("my-ollama", fallbackProvider: "other");
+
+        Assert.True(ProviderCommand.TryGetReferencingModelRoleEntries("my-ollama", _paths, out var entries, out var error));
+
+        Assert.Null(error);
+        Assert.Equal([("Main", "qwen3:30b")], entries);
+    }
+
+    [Fact]
+    public void TryGetReferencingModelRoleEntries_MatchesProviderNameCaseInsensitively()
+    {
+        WriteNamedModels("my-ollama");
+
+        Assert.True(ProviderCommand.TryGetReferencingModelRoleEntries("MY-Ollama", _paths, out var entries, out _));
+
+        Assert.Equal([("Main", "qwen3:30b")], entries);
+    }
+
+    [Fact]
+    public async Task Remove_UnresolvableModelsSection_RefusesWithConfigurationError()
+    {
+        // A Models section mixing both shapes cannot be resolved, so the guard cannot prove the
+        // provider is unused. It must refuse rather than guess.
+        WriteConfig(new Dictionary<string, object>
+        {
+            ["configVersion"] = 1,
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["my-ollama"] = new Dictionary<string, object> { ["Type"] = "ollama" }
+            },
+            ["Models"] = new Dictionary<string, object>
+            {
+                ["Main"] = new Dictionary<string, object> { ["Provider"] = "my-ollama", ["ModelId"] = "m" },
+                ["Roles"] = new Dictionary<string, object> { ["Main"] = "x" }
+            }
+        });
+
+        var exitCode = await ProviderCommand.RunAsync(["provider", "remove", "my-ollama"], _paths, output: _output);
+
+        Assert.Equal(1, exitCode);
+        var output = _output.ToString();
+        Assert.Contains("Cannot remove provider 'my-ollama': the Models section in netclaw.json cannot be resolved", output);
+        Assert.Contains("mixes legacy inline roles", output);
+        Assert.Contains("`netclaw model set main <provider> <model-id>` repairs it", output);
+        Assert.Contains("edit the Models section in netclaw.json by hand", output);
+        Assert.True(ProviderCommand.LoadProviders(_paths).ContainsKey("my-ollama"));
+    }
+
+    [Fact]
+    public async Task Remove_UnknownProvider_IsNotFoundBeforeTheModelRoleGuard()
+    {
+        // Models has no Main, so the resolver's default Main (local-ollama) applies. A provider that
+        // was never configured must report "not found", not "referenced by Main".
+        WriteConfig(new Dictionary<string, object>
+        {
+            ["configVersion"] = 1,
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["other"] = new Dictionary<string, object> { ["Type"] = "ollama" }
+            },
+            ["Models"] = new Dictionary<string, object>
+            {
+                ["Fallback"] = new Dictionary<string, object> { ["Provider"] = "other", ["ModelId"] = "m" }
+            }
+        });
+
+        var exitCode = await ProviderCommand.RunAsync(["provider", "remove", "local-ollama"], _paths, output: _output);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("Provider 'local-ollama' not found.", _output.ToString());
+        Assert.DoesNotContain("referenced by", _output.ToString());
+    }
+
     [Fact]
     public async Task Remove_NotFound_ReturnsError()
     {
@@ -445,6 +756,110 @@ public sealed class ProviderCommandTests : IDisposable
         Assert.True(providers.ContainsKey("my-anthropic"));
         Assert.Equal("anthropic", providers["my-anthropic"].Type);
         Assert.Equal("sk-ant-test", providers["my-anthropic"].ApiKey?.Value);
+    }
+
+    [Theory]
+    [InlineData(AuthMethod.ApiKey, null)]
+    [InlineData(AuthMethod.ApiKey, "   ")]
+    [InlineData(AuthMethod.None, "unexpected-key")]
+    public void WriteProvider_RejectsInconsistentApiKeyStateBeforePersistence(
+        AuthMethod authMethod,
+        string? apiKey)
+    {
+        WriteConfig(new Dictionary<string, object> { ["configVersion"] = 1 });
+        WriteSecrets(new Dictionary<string, object> { ["Providers"] = new Dictionary<string, object>() });
+        var configBefore = File.ReadAllText(_paths.NetclawConfigPath);
+        var secretsBefore = File.ReadAllText(_paths.SecretsPath);
+
+        Assert.Throws<ArgumentException>(() => ProviderCredentialWriter.WriteProvider(
+            _paths,
+            "my-vllm",
+            "openai-compatible",
+            authMethod,
+            endpoint: "https://gateway.example.test/v1",
+            oauthResult: null,
+            apiKey));
+
+        Assert.Equal(configBefore, File.ReadAllText(_paths.NetclawConfigPath));
+        Assert.Equal(secretsBefore, File.ReadAllText(_paths.SecretsPath));
+    }
+
+    [Fact]
+    public void WriteProvider_AuthenticationChangesRemoveStaleSecrets()
+    {
+        var protector = new NullSecretsProtector();
+        ProviderCredentialWriter.WriteProvider(
+            _paths,
+            "local",
+            "openai-compatible",
+            AuthMethod.ApiKey,
+            endpoint: "https://gateway.example.test/v1",
+            oauthResult: null,
+            apiKey: "old-api-key",
+            protector: protector);
+
+        ProviderCredentialWriter.WriteProvider(
+            _paths,
+            "local",
+            "openai",
+            AuthMethod.OAuthDevice,
+            endpoint: "https://api.openai.com",
+            oauthResult: new OAuthDeviceFlowResult(
+                new SensitiveString("oauth-token"),
+                null,
+                null,
+                null),
+            apiKey: null,
+            protector: protector);
+
+        using (var oauthSecrets = ReadConfigFile(_paths.SecretsPath))
+        {
+            var provider = oauthSecrets.RootElement.GetProperty("Providers").GetProperty("local");
+            Assert.False(provider.TryGetProperty("ApiKey", out _));
+            Assert.Equal("oauth-token", provider.GetProperty("OAuthAccessToken").GetString());
+        }
+
+        ProviderCredentialWriter.WriteProvider(
+            _paths,
+            "local",
+            "ollama",
+            AuthMethod.None,
+            endpoint: "http://localhost:11434",
+            oauthResult: null,
+            apiKey: null,
+            protector: protector);
+
+        using var noneSecrets = ReadConfigFile(_paths.SecretsPath);
+        Assert.False(noneSecrets.RootElement.GetProperty("Providers").TryGetProperty("local", out _));
+    }
+
+    [Fact]
+    public void LoadProviders_LegacyOpenAiCompatibleApiKey_SelectsApiKeyAuth()
+    {
+        WriteConfig(new Dictionary<string, object>
+        {
+            ["configVersion"] = 1,
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["local"] = new Dictionary<string, object>
+                {
+                    ["Type"] = "openai-compatible",
+                    ["Endpoint"] = "https://gateway.example.test/v1"
+                }
+            }
+        });
+        WriteSecrets(new Dictionary<string, object>
+        {
+            ["Providers"] = new Dictionary<string, object>
+            {
+                ["local"] = new Dictionary<string, object> { ["ApiKey"] = "legacy-key" }
+            }
+        });
+
+        var providers = ProviderCommand.LoadProviders(_paths);
+
+        Assert.Equal(AuthMethod.ApiKey, providers["local"].AuthMethod);
+        Assert.Equal("legacy-key", providers["local"].ApiKey?.Value);
     }
 
     [Fact]
@@ -610,7 +1025,7 @@ public sealed class ProviderCommandTests : IDisposable
     }
 
     [Fact]
-    public void GetReferencingModelRoleEntries_ReturnsRoleAndModelId()
+    public void TryGetReferencingModelRoleEntries_LegacyInlineRoles_ReturnsRoleAndModelId()
     {
         WriteConfig(new Dictionary<string, object>
         {
@@ -630,7 +1045,7 @@ public sealed class ProviderCommandTests : IDisposable
             }
         });
 
-        var entries = ProviderCommand.GetReferencingModelRoleEntries("my-vllm", _paths);
+        Assert.True(ProviderCommand.TryGetReferencingModelRoleEntries("my-vllm", _paths, out var entries, out _));
 
         Assert.Single(entries);
         Assert.Equal("Main", entries[0].Role);

@@ -24,8 +24,9 @@ internal static class ToolChoiceGuidance
         Choose directories in this order:
         1. For declared-project work, omit WorkingDirectory; the shell uses project_dir.
         2. For one call in a named child directory, set typed WorkingDirectory.
-        3. Use session_dir for disposable writable work outside a project; do not substitute platform temporary storage.
+        3. Use temp_dir for disposable files. Standard temporary APIs already use this directory.
         4. Use an inline directory change only when the task requests that behavior.
+        5. After one-call directory advice, set WorkingDirectory to project_dir to keep requested inline directory behavior.
         """;
 
     public const string ShellCompositionOrder = """

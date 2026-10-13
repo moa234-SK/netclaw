@@ -11,6 +11,12 @@ using Netclaw.Configuration.Feeds;
 
 namespace Netclaw.Daemon.Services;
 
+internal readonly record struct SkillPruneResult(int RemovedCount, int FailedCount)
+{
+    public static SkillPruneResult None => new(0, 0);
+    public bool Changed => RemovedCount > 0;
+}
+
 internal static class SkillSyncHelpers
 {
     // A directory is a skill iff it owns a SKILL.md — the same rule SkillScanner uses.
@@ -28,6 +34,65 @@ internal static class SkillSyncHelpers
     {
         var hash = SHA256.HashData(content);
         return Convert.ToHexStringLower(hash);
+    }
+
+    /// <summary>Returns the SHA-256 of each file that the sync installs, keyed by its relative path.</summary>
+    internal static Dictionary<string, string> HashInstalledFiles(IReadOnlyList<DownloadedSkillFile> files)
+        => files.ToDictionary(
+            static file => file.RelativePath,
+            static file => ComputeSha256(file.Content),
+            StringComparer.Ordinal);
+
+    /// <summary>
+    /// Returns true when the skill directory holds exactly the recorded files,
+    /// with the recorded content.
+    /// </summary>
+    /// <remarks>
+    /// The agent can write to a feed skill folder (owner decision, 2026-10-05).
+    /// A changed, added, or removed file, a link, or a file that Netclaw cannot
+    /// read gives false. The caller then installs the published version again.
+    /// </remarks>
+    internal static bool InstalledFilesMatch(string skillDirectory, IReadOnlyDictionary<string, string> recorded)
+    {
+        try
+        {
+            if (!Directory.Exists(skillDirectory)
+                || File.GetAttributes(skillDirectory).HasFlag(FileAttributes.ReparsePoint))
+            {
+                return false;
+            }
+
+            var options = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                AttributesToSkip = 0,
+                IgnoreInaccessible = false,
+            };
+            var fileCount = 0;
+            foreach (var entry in Directory.EnumerateFileSystemEntries(skillDirectory, "*", options))
+            {
+                var attributes = File.GetAttributes(entry);
+                if (attributes.HasFlag(FileAttributes.ReparsePoint))
+                    return false;
+                if (attributes.HasFlag(FileAttributes.Directory))
+                    continue;
+
+                var relativePath = Path.GetRelativePath(skillDirectory, entry).Replace(Path.DirectorySeparatorChar, '/');
+                if (!recorded.TryGetValue(relativePath, out var expected)
+                    || !string.Equals(expected, ComputeSha256(File.ReadAllBytes(entry)), StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                fileCount++;
+            }
+
+            return fileCount == recorded.Count;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     internal static string? ValidateResourcePath(string path)
@@ -114,8 +179,8 @@ internal static class SkillSyncHelpers
     /// <param name="serverSkillNames">Skill names present in the freshly fetched, non-empty server index.</param>
     /// <param name="syncState">Sync state to prune in place.</param>
     /// <param name="logger">Logger for prune diagnostics.</param>
-    /// <returns><c>true</c> if any sync-state entry or on-disk directory was removed.</returns>
-    internal static bool PruneRemovedSkills(
+    /// <returns>The unique logical removal and disk failure counts.</returns>
+    internal static SkillPruneResult PruneRemovedSkills(
         string feedDir,
         IReadOnlyCollection<string> serverSkillNames,
         SkillSyncState syncState,
@@ -125,29 +190,24 @@ internal static class SkillSyncHelpers
         // early-returns on an empty index; this makes the destructive operation
         // safe even if a future caller forgets to.
         if (serverSkillNames.Count == 0)
-            return false;
+            return SkillPruneResult.None;
 
         var present = new HashSet<string>(serverSkillNames, StringComparer.Ordinal);
-        var changed = false;
+        var removedNames = new HashSet<string>(
+            syncState.Skills.Keys.Where(name => !present.Contains(name)),
+            StringComparer.Ordinal);
+        var failedCount = 0;
 
         // Drop sync-state entries the server no longer advertises. This is the
         // load-bearing half: clearing the entry is what lets the forward sync
         // re-download the skill if it ever reappears — otherwise a same-version
         // re-add would be skipped while its files are gone.
-        var staleStateKeys = syncState.Skills.Keys
-            .Where(name => !present.Contains(name))
-            .ToList();
-        foreach (var name in staleStateKeys)
-        {
+        foreach (var name in removedNames)
             syncState.Skills.Remove(name);
-            changed = true;
-        }
 
         // Delete on-disk skill directories the server no longer advertises. Only
         // touch real skill directories (those that own a SKILL.md) so a stray
-        // non-skill directory under the feed root is never recursively deleted;
-        // dot-prefixed bookkeeping (.staging, .sync-state.json) has no root
-        // SKILL.md and is skipped for the same reason.
+        // non-skill directory under the feed root is never recursively deleted.
         if (Directory.Exists(feedDir))
         {
             foreach (var dir in Directory.GetDirectories(feedDir))
@@ -155,6 +215,15 @@ internal static class SkillSyncHelpers
                 var dirName = Path.GetFileName(dir);
                 if (string.IsNullOrEmpty(dirName) || dirName.StartsWith('.') || present.Contains(dirName))
                     continue;
+
+                if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0)
+                {
+                    failedCount++;
+                    logger.LogWarning(
+                        "Skipped reparse-point skill directory '{SkillName}' in {FeedDir}",
+                        dirName, feedDir);
+                    continue;
+                }
 
                 if (!File.Exists(Path.Combine(dir, SkillFileName)))
                     continue;
@@ -165,10 +234,11 @@ internal static class SkillSyncHelpers
                     logger.LogInformation(
                         "Pruned removed skill '{SkillName}' from feed directory {FeedDir}",
                         dirName, feedDir);
-                    changed = true;
+                    removedNames.Add(dirName);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
+                    failedCount++;
                     logger.LogWarning(ex,
                         "Failed to prune removed skill '{SkillName}' from {FeedDir} — leaving in place",
                         dirName, feedDir);
@@ -176,7 +246,7 @@ internal static class SkillSyncHelpers
             }
         }
 
-        return changed;
+        return new SkillPruneResult(removedNames.Count, failedCount);
     }
 
     internal static bool PruneRemovedSubAgents(

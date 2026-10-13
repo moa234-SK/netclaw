@@ -56,7 +56,7 @@ public sealed class OpenAiCompatibleCapabilityResolver : IModelCapabilityResolve
         try
         {
             using var modelsRequest = new HttpRequestMessage(HttpMethod.Get, _endpoint.ModelsPath);
-            ApplyAuth(modelsRequest);
+            OpenAiCompatibleHttp.ApplyBearerAuth(modelsRequest, _endpoint.ApiKey);
 
             using var modelsResponse = await _httpClient.SendAsync(modelsRequest, ct);
             modelsResponse.EnsureSuccessStatusCode();
@@ -66,7 +66,7 @@ public sealed class OpenAiCompatibleCapabilityResolver : IModelCapabilityResolve
             string? propsJson = null;
             using (var propsRequest = new HttpRequestMessage(HttpMethod.Get, "/props"))
             {
-                ApplyAuth(propsRequest);
+                OpenAiCompatibleHttp.ApplyBearerAuth(propsRequest, _endpoint.ApiKey);
                 using var propsResponse = await _httpClient.SendAsync(propsRequest, ct);
                 if (propsResponse.IsSuccessStatusCode)
                     propsJson = await propsResponse.Content.ReadAsStringAsync(ct);

@@ -18,14 +18,29 @@ public sealed class ShellCommandPolicyTests
     [InlineData("netclaw daemon stop")]
     [InlineData("netclaw daemon kill")]
     [InlineData("systemctl stop netclaw")]
-    [InlineData("kill -9 12345")]
+    [InlineData("kill -9 $(cat ~/.netclaw/daemon.pid)")]
     [InlineData("killall netclaw")]
     [InlineData("pkill -f netclaw")]
+    [InlineData("pkill netclawd")]
+    [InlineData("pkill -f \"netclaw daemon\"")]
     public void Denies_self_destructive_commands(string command)
     {
         var decision = _policy.Evaluate(command);
         Assert.False(decision.Allowed);
         Assert.Equal(DenyCategory.SelfDestructive, decision.DenyCategory);
+    }
+
+    // Owner decision D2: a kill that does not name the Netclaw daemon is an
+    // ordinary command. The hard-deny list does not block it, so the approval
+    // gate asks for it, and a grant can cover it.
+    [Theory]
+    [InlineData("kill -9 12345")]
+    [InlineData("kill \"$pid\"")]
+    [InlineData("pkill -f 'http.server 8899'")]
+    [InlineData("killall jekyll")]
+    public void Kill_without_the_daemon_name_is_not_hard_denied(string command)
+    {
+        Assert.True(_policy.Evaluate(command).Allowed);
     }
 
     // ── Privilege escalation ──
@@ -157,11 +172,37 @@ public sealed class ShellCommandPolicyTests
         Assert.Equal(DenyCategory.SelfDestructive, decision.DenyCategory);
     }
 
+    [Fact]
+    public void Native_power_shell_unknown_command_argument_region_keeps_child_hard_deny_command()
+    {
+        var decision = PowerShellPolicy().Evaluate(
+            "Invoke-Custom { netclaw daemon stop }",
+            @"C:\work");
+
+        Assert.False(decision.Allowed);
+        Assert.Equal(DenyCategory.SelfDestructive, decision.DenyCategory);
+    }
+
+    [Theory]
+    [InlineData("Get-ChildItem | ForEach-Object { netclaw daemon stop; $item++ }")]
+    [InlineData("Invoke-Custom { netclaw daemon stop; $item++ }")]
+    public void Native_power_shell_mutation_region_keeps_child_hard_deny_command(
+        string command)
+    {
+        var decision = PowerShellPolicy().Evaluate(command, @"C:\work");
+
+        Assert.False(decision.Allowed);
+        Assert.Equal(DenyCategory.SelfDestructive, decision.DenyCategory);
+    }
+
     [Theory]
     [InlineData("Start-Process pwsh -Verb RunAs")]
     [InlineData("Start-Process pwsh -Ve RunAs")]
     [InlineData("Start-Process pwsh -V 'RunAs'")]
     [InlineData("Start-Process pwsh -Verb:\"RunAs\"")]
+    [InlineData("Start-Process pwsh -Verb R`unAs")]
+    [InlineData("Start-Process pwsh -Verb:R`unAs")]
+    [InlineData("powershell.exe -Command 'Start-Process pwsh -Verb R`unAs'")]
     [InlineData("saps pwsh -Verb RunAs")]
     public void Native_power_shell_denies_elevation_parameter_forms(string command)
     {
@@ -181,6 +222,18 @@ public sealed class ShellCommandPolicyTests
             @"C:\work");
 
         Assert.True(decision.Allowed);
+    }
+
+    [Theory]
+    [InlineData(@"Remove-Item C:\ -Recurse:'$false' -Force")]
+    [InlineData(@"Remove-Item C:\ -Recurse:`$false -Force")]
+    public void Native_power_shell_only_trusts_an_authored_boolean_false_switch(
+        string command)
+    {
+        var decision = PowerShellPolicy().Evaluate(command, @"C:\work");
+
+        Assert.False(decision.Allowed);
+        Assert.Equal(DenyCategory.SystemDestructive, decision.DenyCategory);
     }
 
     [Theory]
@@ -219,7 +272,7 @@ public sealed class ShellCommandPolicyTests
 
     [Theory]
     [InlineData("Netclaw Daemon Stop")]
-    [InlineData("KILL -9 123")]
+    [InlineData("KILL -9 $(PGREP NETCLAWD)")]
     [InlineData("rm -r -f /")]
     [InlineData("rm --recursive --force /")]
     public void Denies_case_insensitive_and_flag_variants(string command)

@@ -31,7 +31,7 @@ public sealed class OpenAiCompatibleProviderPlugin : ProviderPluginBase<OpenAiCo
 
         var endpoint = OpenAiCompatibleEndpoint.FromBaseUrl(
             entry.Endpoint ?? DefaultEndpoint,
-            entry.ApiKey?.Value);
+            entry.AuthMethod is AuthMethod.ApiKey ? entry.ApiKey?.Value : null);
 
         return new OpenAiCompatibleChatClient(
             CreateLlmHttpClient(endpoint.BaseUri),

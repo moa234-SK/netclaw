@@ -1,3 +1,7 @@
+> Post-merge note: this change originally named the auth shape
+> `EndpointOrApiKeyAuth`. The merge with upstream `dev` adopted upstream's
+> `OptionalApiKeyAuth` (#2148) as the surviving name; the text below uses it.
+
 ## Context
 
 The `openai-compatible` provider type (`OpenAiCompatibleDescriptor`,
@@ -44,7 +48,7 @@ interactive surface, and the declared contract misdescribes the runtime.
 
 ### D1: One new auth shape, not an extended `EndpointOnlyAuth`
 
-Add `EndpointOrApiKeyAuth : IProviderAuth` with
+Add `OptionalApiKeyAuth : IProviderAuth` with
 `SupportedAuthMethods = [AuthMethod.None, AuthMethod.ApiKey]`.
 
 Rationale: the TUI switches on concrete auth types

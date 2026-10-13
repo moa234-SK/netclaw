@@ -3,9 +3,9 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
-using System.Collections.Frozen;
 using Netclaw.Configuration;
 using Netclaw.Media;
+using Netclaw.Tools.Authorization.Consent;
 
 namespace Netclaw.Tools;
 
@@ -32,9 +32,13 @@ internal enum ToolInvocationOutcomeCategory
 internal enum ToolRemediationCode
 {
     SetWorkingDirectory,
-    UseSessionScratch,
+    UseManagedTemporaryDirectory,
     ProvideUniqueOldString,
-    UseNativeTool
+    UseNativeTool,
+    BreakToolCycle,
+    UseShellWorkingDirectory,
+    RewriteShellCommandWords,
+    ShortenShellCommand
 }
 
 internal enum ToolFileActivityKind
@@ -60,57 +64,61 @@ internal sealed record ToolFileActivity
     public ToolFileActivityKind Kind { get; }
 }
 
-internal sealed record ToolInvocationReceipt
+internal abstract class ToolInvocationReceipt
 {
-    public ToolInvocationReceipt(
-        ToolInvocationOutcomeCategory category,
-        IReadOnlyList<ToolFileActivity>? fileActivity = null,
-        ToolRemediationCode? remediationCode = null,
-        string? declaredProjectDirectory = null)
-    {
-        if (!Enum.IsDefined(category))
-            throw new ArgumentOutOfRangeException(nameof(category));
-
-        var activity = fileActivity?.ToArray() ?? [];
-        if (category != ToolInvocationOutcomeCategory.Success
-            && (activity.Length > 0 || declaredProjectDirectory is not null))
-        {
-            throw new ArgumentException("Only successful outcomes may report working-context activity.");
-        }
-
-        if (category != ToolInvocationOutcomeCategory.RecoverableCorrection
-            && remediationCode is not null)
-        {
-            throw new ArgumentException("Only a recoverable correction may report remediation.", nameof(remediationCode));
-        }
-
-        if (category == ToolInvocationOutcomeCategory.RecoverableCorrection
-            && remediationCode is null)
-        {
-            throw new ArgumentException("A recoverable correction requires remediation.", nameof(remediationCode));
-        }
-
-        if (remediationCode is { } code && !Enum.IsDefined(code))
-            throw new ArgumentOutOfRangeException(nameof(remediationCode));
-
-        if (declaredProjectDirectory is not null
-            && !IsCanonicalAbsolutePath(declaredProjectDirectory))
-        {
-            throw new ArgumentException(
-                "Declared project directory requires a canonical absolute path.",
-                nameof(declaredProjectDirectory));
-        }
-
-        Category = category;
-        FileActivity = Array.AsReadOnly(activity);
-        RemediationCode = remediationCode;
-        DeclaredProjectDirectory = declaredProjectDirectory;
-    }
+    private ToolInvocationReceipt(ToolInvocationOutcomeCategory category) => Category = category;
 
     public ToolInvocationOutcomeCategory Category { get; }
-    public IReadOnlyList<ToolFileActivity> FileActivity { get; }
-    public ToolRemediationCode? RemediationCode { get; }
-    public string? DeclaredProjectDirectory { get; }
+
+    internal sealed class Succeeded : ToolInvocationReceipt
+    {
+        public Succeeded(IReadOnlyList<ToolFileActivity> fileActivity, string? declaredProjectDirectory)
+            : base(ToolInvocationOutcomeCategory.Success)
+        {
+            if (declaredProjectDirectory is not null && !IsCanonicalAbsolutePath(declaredProjectDirectory))
+                throw new ArgumentException("Declared project directory requires a canonical absolute path.", nameof(declaredProjectDirectory));
+            FileActivity = Array.AsReadOnly(fileActivity.ToArray());
+            DeclaredProjectDirectory = declaredProjectDirectory;
+        }
+
+        public IReadOnlyList<ToolFileActivity> FileActivity { get; }
+        public string? DeclaredProjectDirectory { get; }
+    }
+
+    internal sealed class Correction : ToolInvocationReceipt
+    {
+        public Correction(ToolRemediationCode remediationCode) : base(ToolInvocationOutcomeCategory.RecoverableCorrection)
+        {
+            if (!Enum.IsDefined(remediationCode))
+                throw new ArgumentOutOfRangeException(nameof(remediationCode));
+            RemediationCode = remediationCode;
+        }
+
+        public ToolRemediationCode RemediationCode { get; }
+    }
+
+    internal sealed class OtherOutcome : ToolInvocationReceipt
+    {
+        public OtherOutcome(ToolInvocationOutcomeCategory category) : base(category)
+        {
+            if (!Enum.IsDefined(category))
+                throw new ArgumentOutOfRangeException(nameof(category));
+            if (category is ToolInvocationOutcomeCategory.Success or ToolInvocationOutcomeCategory.RecoverableCorrection)
+                throw new ArgumentException("This outcome requires its dedicated receipt case.", nameof(category));
+        }
+    }
+
+    /// <summary>
+    /// The call was refused by authorization (policy, hard deny, a consent that nobody can give, or a path
+    /// rule). It is <see cref="ToolInvocationOutcomeCategory.AccessDenied"/>, kept apart from an operating
+    /// system refusal such as a file permission error, which is an ordinary tool failure.
+    /// </summary>
+    internal sealed class AuthorizationDenied : ToolInvocationReceipt
+    {
+        public AuthorizationDenied() : base(ToolInvocationOutcomeCategory.AccessDenied)
+        {
+        }
+    }
 
     internal static bool IsCanonicalAbsolutePath(string path)
     {
@@ -299,17 +307,26 @@ public abstract record ToolSessionScope
 
     public sealed record Bound : ToolSessionScope
     {
-        public Bound(string sessionId, string? sessionDirectory)
+        /// <summary>Creates a session scope with one complete resolved storage layout.</summary>
+        /// <param name="sessionId">The session identifier.</param>
+        /// <param name="storage">The resolved storage layout.</param>
+        public Bound(string sessionId, SessionStoragePaths storage)
         {
             if (string.IsNullOrWhiteSpace(sessionId))
                 throw new ArgumentException("Session id is required for a bound tool run.", nameof(sessionId));
 
             SessionId = sessionId;
-            SessionDirectory = sessionDirectory;
+            Storage = storage ?? throw new ArgumentNullException(nameof(storage));
         }
 
+        /// <summary>Gets the session identifier.</summary>
         public string SessionId { get; }
-        public string? SessionDirectory { get; }
+
+        /// <summary>Gets the complete resolved storage layout.</summary>
+        public SessionStoragePaths Storage { get; }
+
+        /// <summary>Gets the session workspace from <see cref="Storage"/>.</summary>
+        public string SessionDirectory => Storage.SessionDirectory.Value;
     }
 }
 
@@ -399,15 +416,37 @@ public sealed class ToolExecutionOutputs
 }
 
 /// <summary>
+/// Identifies the managed directory and the platform temporary root for one correction.
+/// </summary>
+internal readonly record struct ManagedTemporaryCorrectionTarget
+{
+    /// <summary>Creates one correction target from the suggested and original directories.</summary>
+    /// <param name="managedTemporaryDirectory">The replacement directory that Netclaw suggested.</param>
+    /// <param name="platformTemporaryRoot">The original platform temporary root.</param>
+    internal ManagedTemporaryCorrectionTarget(
+        string managedTemporaryDirectory,
+        string platformTemporaryRoot)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(managedTemporaryDirectory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(platformTemporaryRoot);
+
+        ManagedTemporaryDirectory = managedTemporaryDirectory;
+        PlatformTemporaryRoot = platformTemporaryRoot;
+    }
+
+    /// <summary>Gets the replacement directory that Netclaw suggested.</summary>
+    internal string ManagedTemporaryDirectory { get; }
+
+    /// <summary>Gets the original platform temporary root.</summary>
+    internal string PlatformTemporaryRoot { get; }
+}
+
+/// <summary>
 /// Mutable authorization state for one invocation attempt. The dispatcher and
 /// policy pipeline own this object; tools receive no setters for approval state.
 /// </summary>
 public sealed class ToolApprovalAttempt
 {
-    private static readonly IReadOnlySet<string> EmptyPatterns =
-        Array.Empty<string>().ToFrozenSet(StringComparer.OrdinalIgnoreCase);
-    private IReadOnlySet<string>? _oneTimeApprovedPatterns;
-
     public ToolApprovalAttempt()
     {
         AuthorizationAttemptId = AuthorizationAttemptId.New();
@@ -416,36 +455,24 @@ public sealed class ToolApprovalAttempt
     internal AuthorizationAttemptId AuthorizationAttemptId { get; private set; }
 
     public string? Cwd { get; private set; }
-    public string? OneTimeApprovedToolName { get; private set; }
-    public IReadOnlySet<string> OneTimeApprovedPatterns => _oneTimeApprovedPatterns ?? EmptyPatterns;
-    public string? AppliedDecision { get; private set; }
-    public string? AppliedPattern { get; private set; }
+
+    /// <summary>The "Once" answer that this attempt may use, or null.</summary>
+    public OneTimeConsent? OneTimeConsent { get; private set; }
+
+    internal ManagedTemporaryCorrectionTarget? ManagedTemporaryRetry { get; private set; }
 
     public void SetCwd(string? cwd) => Cwd = cwd;
 
-    public void SeedOneTimeApproval(string toolName, IEnumerable<string> patterns)
+    public void SeedOneTimeConsent(OneTimeConsent consent)
     {
-        OneTimeApprovedToolName = toolName;
-        _oneTimeApprovedPatterns = patterns.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+        ArgumentNullException.ThrowIfNull(consent);
+        OneTimeConsent = consent;
     }
 
-    public void ClearOneTimeApproval()
-    {
-        OneTimeApprovedToolName = null;
-        _oneTimeApprovedPatterns = null;
-    }
+    public void ClearOneTimeConsent() => OneTimeConsent = null;
 
-    public void ApplyDecision(string decision, string? pattern)
-    {
-        AppliedDecision = decision;
-        AppliedPattern = pattern;
-    }
-
-    public void ClearAppliedDecision()
-    {
-        AppliedDecision = null;
-        AppliedPattern = null;
-    }
+    internal void MarkManagedTemporaryRetry(ManagedTemporaryCorrectionTarget retry)
+        => ManagedTemporaryRetry = retry;
 
     internal void RestoreAuthorizationAttemptId(AuthorizationAttemptId authorizationAttemptId)
     {
@@ -489,7 +516,7 @@ public sealed class ToolInvocationContext
         if (runScope.Session is ToolSessionScope.Bound bound)
         {
             SessionId = bound.SessionId;
-            SessionDirectory = bound.SessionDirectory;
+            SessionStorage = bound.Storage;
         }
     }
 
@@ -561,10 +588,12 @@ public sealed class ToolInvocationContext
     public string? SessionId { get; }
 
     /// <summary>
-    /// Session-scoped temp directory for tools that write files to disk.
-    /// Created lazily on first access.
+    /// Session workspace used as the default base for relative tool paths.
     /// </summary>
-    public string? SessionDirectory { get; }
+    public string? SessionDirectory => SessionStorage?.SessionDirectory.Value;
+
+    /// <summary>Gets the complete resolved storage layout for a bound session.</summary>
+    public SessionStoragePaths? SessionStorage { get; }
 
     /// <summary>
     /// The session <i>content</i> inline budget
@@ -613,8 +642,8 @@ public sealed class ToolInvocationContext
     /// <c>WorkingDirectory</c> argument when the agent provided one;</item>
     /// <item><see cref="ProjectDirectory"/> — the session's declared project
     /// root, populated from <c>WorkingContext.ProjectDirectory</c>;</item>
-    /// <item><see cref="SessionDirectory"/> — the per-session scratch
-    /// directory under <c>~/.netclaw/sessions/&lt;id&gt;/</c>;</item>
+    /// <item><see cref="SessionDirectory"/> — the session workspace and
+    /// relative-path fallback;</item>
     /// <item><see cref="InheritedCwd"/> — a sub-agent's snapshot of the
     /// parent's resolved cwd, used when the child has no
     /// <see cref="ProjectDirectory"/> or <see cref="SessionDirectory"/> of
@@ -623,8 +652,8 @@ public sealed class ToolInvocationContext
     /// Returns <c>null</c> only when none of the four is available, which is
     /// the contract for tools that are not directory-anchored. Shell tools
     /// SHALL never inherit the daemon process's cwd — that defeats the
-    /// approval policy's safe-space invariant because the daemon's cwd is
-    /// unrelated to what the agent is "working on."
+    /// approval policy's path-containment invariant because the daemon's cwd
+    /// is unrelated to what the agent is "working on."
     /// </summary>
     public string? ResolveShellCwd(string? explicitArg)
     {
@@ -713,6 +742,7 @@ public sealed class ToolExecutionContext
     public string? ChannelType => Invocation.ChannelType;
     public string? SessionId => Invocation.SessionId;
     public string? SessionDirectory => Invocation.SessionDirectory;
+    public SessionStoragePaths? SessionStorage => Invocation.SessionStorage;
     public int MaxInlineToolResultChars => Invocation.MaxInlineToolResultChars;
     public string? ProjectDirectory => Invocation.ProjectDirectory;
     public ModelModality ModelInputModalities => Invocation.ModelInputModalities;
@@ -727,27 +757,15 @@ public sealed class ToolExecutionContext
     public string? ResolveShellCwd(string? explicitArg)
         => Invocation.ResolveShellCwd(explicitArg);
 
-    internal string? OneTimeApprovedToolName
-    {
-        get => Approval.OneTimeApprovedToolName;
-        set
-        {
-            if (value is null)
-                Approval.ClearOneTimeApproval();
-            else
-                Approval.SeedOneTimeApproval(value, Approval.OneTimeApprovedPatterns);
-        }
-    }
+    /// <summary>
+    /// The tool of the seeded "Once" answer, or null. A frozen contract test
+    /// (<c>ApprovalRehydrationTests</c>) reads it.
+    /// </summary>
+    internal string? OneTimeApprovedToolName => Approval.OneTimeConsent?.ToolName;
 
-    internal string? AppliedApprovalDecision => Approval.AppliedDecision;
-    internal string? AppliedApprovalPattern => Approval.AppliedPattern;
-    internal IReadOnlySet<string> OneTimeApprovedPatterns => Approval.OneTimeApprovedPatterns;
     internal string? Cwd
     {
         get => Approval.Cwd;
         set => Approval.SetCwd(value);
     }
-
-    internal void SetOneTimeApprovedPatterns(IEnumerable<string> patterns)
-        => Approval.SeedOneTimeApproval(Approval.OneTimeApprovedToolName ?? string.Empty, patterns);
 }

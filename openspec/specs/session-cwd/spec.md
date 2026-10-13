@@ -1,19 +1,36 @@
 ## Purpose
 
 Define how a session tracks its project directory and how the agent
-declares it via `set_working_directory`. The project directory is the
-load-bearing input to the approval gate's safe-space root set: declaring
-it expands the trust boundary for shell invocations under that tree.
+declares it via `set_working_directory`. A valid declaration adds the project
+directory to the trusted roots that reviewed-safe policy uses.
+
+Use the [Netclaw engineering glossary](../../../docs/spec/GLOSSARY.md) for cross-cutting terms used in this specification.
+
 ## Requirements
 
 ### Requirement: Relative first-party filesystem paths use session-owned bases
 
-First-party filesystem tools SHALL resolve a relative path against the declared
-project directory when one exists. Otherwise, they SHALL use the immutable
-session directory. If neither base exists, they SHALL return an
-`invalid_context` correction. They SHALL NOT use the daemon process current
-directory. The canonical path SHALL pass existing scope and protected-path
-policies.
+`session-cwd` SHALL select the declared project directory when that base is
+available. Otherwise, it SHALL select the immutable session directory. If
+neither base is available, it SHALL return an `invalid_context` correction. It
+SHALL NOT use the daemon process current directory.
+
+`session-cwd` SHALL pass the selected base and authored path to the filesystem
+authorization contract that `netclaw-tools` owns. It SHALL NOT make another
+path-safety decision. It SHALL NOT retry another base after the path access
+decision denies the request.
+
+Resolution examples and counterexamples:
+
+| Authored path and context | Selected path | Result |
+|---|---|---|
+| `src/App.cs`, project `/workspace/project` | `/workspace/project/src/App.cs` | Apply normal read or write policy. |
+| `notes.md`, no project, session `/session/current` | `/session/current/notes.md` | Apply normal session policy. |
+| `notes.md`, stale unavailable project, valid session | `/session/current/notes.md` | Fall back before authorization begins. |
+| `notes.md`, project has a link ancestor | project | Path access denies it; do not try the session base. |
+| `../../outside.txt`, valid project | project | Path access decides on the canonical path; do not try the session base after denial. |
+| `notes.md`, no project or session | none | `invalid_context`; do not use the daemon current directory. |
+| `/absolute/report.md` | `/absolute/report.md` | Do not select a relative base; apply normal policy directly. |
 
 #### Scenario: Relative read uses declared project
 
@@ -22,7 +39,7 @@ policies.
 - **THEN** it authorizes and reads `/workspace/project/src/App.cs`
 - **AND** it does not use the daemon current directory
 
-#### Scenario: Relative write falls back to session scratch
+#### Scenario: Relative write falls back to the session directory
 
 - **GIVEN** no declared project and session directory `/session/current`
 - **WHEN** `file_write` receives `notes/result.md`
@@ -33,8 +50,16 @@ policies.
 
 - **GIVEN** project directory `/workspace/project`
 - **WHEN** a file tool receives `../../outside.txt`
-- **THEN** it canonicalizes the result before policy evaluation
-- **AND** it denies the call when the path is outside authorized roots
+- **THEN** `session-cwd` passes the selected base and authored path to `netclaw-tools`
+- **AND** the path access decision denies a path outside the trusted roots
+
+#### Scenario: Ancestor link rejects the relative base
+
+- **GIVEN** a trusted root contains a link ancestor for the declared project
+- **WHEN** a file tool receives a relative path
+- **THEN** the `netclaw-tools` path access decision returns `access_denied`
+- **AND** it performs no file access through the link
+- **AND** `session-cwd` does not try the session directory
 
 #### Scenario: Missing base returns correction
 
@@ -45,9 +70,27 @@ policies.
 
 ### Requirement: Failed filesystem operations do not change project context
 
-A denied or failed `set_working_directory` or filesystem call SHALL NOT change
-the project directory or recent-file context. Only a validated successful
-project declaration SHALL replace the project and reload its instructions.
+A denied or failed `set_working_directory` or filesystem call SHALL NOT change the project directory or recent-file context. Only a validated successful `set_working_directory` receipt SHALL replace the project and reload its instructions. Another tool receipt SHALL NOT declare project scope.
+
+Project-effect example:
+
+```text
+current project = /workspace/old
+
+set_working_directory("/workspace/new")
+  -> Success + DeclaredProjectDirectory("/workspace/new")
+  -> project becomes /workspace/new
+  -> project instructions reload
+
+file_read("README.md")
+  -> Success + Read("/workspace/new/README.md")
+  -> RecentFiles changes
+  -> project remains /workspace/new
+
+hypothetical file_read receipt carrying DeclaredProjectDirectory("/outside")
+  -> actor rejects the project effect
+  -> project remains /workspace/new
+```
 
 #### Scenario: Denied declaration leaves prior project intact
 
@@ -55,15 +98,23 @@ project declaration SHALL replace the project and reload its instructions.
 - **WHEN** `set_working_directory` is denied for `/workspace/new`
 - **THEN** the project directory remains `/workspace/old`
 - **AND** project instructions are not loaded from the denied path
+
+#### Scenario: Unrelated receipt cannot replace project
+
+- **GIVEN** a successful file tool receipt contains a project directory
+- **WHEN** the actor applies the receipt
+- **THEN** the actor rejects the project effect
+- **AND** it does not reload project instructions
+
 ### Requirement: Session-scoped project directory
 
 Each session SHALL maintain a mutable `ProjectDirectory` in `WorkingContext`
 that tracks which project the session is working on. This is the root
 directory of the project (where `AGENTS.md` or `.netclaw/AGENTS.md` lives).
-The project directory SHALL be independent of the immutable session directory
-(`~/.netclaw/sessions/{id}/`) used for state isolation. The project directory
-SHALL be persisted in `SessionSnapshot` via `WorkingContext` and survive
-compaction, actor recovery, and daemon restart.
+The project directory SHALL be independent of the immutable session directory.
+The session directory provides the default relative-path base. The project
+directory SHALL persist in `SessionSnapshot` through `WorkingContext`. It SHALL
+survive compaction, actor recovery, and daemon restart.
 
 #### Scenario: New session has no project directory
 
@@ -97,72 +148,63 @@ compaction, actor recovery, and daemon restart.
 
 ### Requirement: set_working_directory tool
 
-The system SHALL provide a `set_working_directory` tool that sets the
-session's project directory to a specified path AND expands the
-approval gate's safe-space root set for Personal and Team audiences.
-The tool SHALL validate that the target path is a real directory,
-resolve it to an absolute path, and validate it against the audience
-trust profile's read-allowed roots. The tool SHALL be profile-managed
-so that audiences without directory navigation privileges (Public,
-Team by default) cannot use it. The working-directory declaration is
-deliberately NOT granted interactive Personal shell-equivalent reach
-(netclaw-dev/netclaw#1724): it SHALL be clamped to the autonomous zone
-(session directory, project directory, and configured global read
-roots) in every audience and mode, because declaring a working
-directory widens the shell safe-verb auto-approve zone and loads
-project identity files into the system prompt.
+The system SHALL provide a `set_working_directory` tool that declares the
+session's project directory. The tool SHALL validate that the target is a real
+directory, resolve its canonical path, and request the shared
+`DeclareProjectScope` path access decision. That operation SHALL use read-file
+authority while remaining distinct from an ordinary read.
 
-The tool description visible to the model SHALL frame the tool as
-"declare your project root and expand your trusted scope so shell
-commands inside that tree run without per-command approval" rather
-than as a `cd`-style cwd change. Calling this tool is the load-bearing
-gesture by which the agent signals what it is working on; the agent's
-approval friction depends on doing so when the work is project-scoped.
+The audience profile `AllowedTools` SHALL control whether the tool is exposed.
+Every audience and mode SHALL limit project declarations to the session
+directory, current project directory, and configured read roots. User approval
+and the default interactive Personal `All` file profile SHALL NOT widen those
+declaration roots.
+
+A successful declaration SHALL update project scope, add the directory to the
+trusted roots used by reviewed-safe shell policy, and load project identity
+files into the system prompt. The model-visible description SHALL present the
+tool as project declaration, not as a shell `cd` command.
 
 #### Scenario: set_working_directory updates project directory
 
 - **GIVEN** a session with no project directory set
-- **AND** the audience trust profile allows reads under `/home/user`
+- **AND** the audience trust profile allows declarations under `/home/user`
 - **WHEN** the agent invokes `set_working_directory` with
   path `/home/user/workspaces/akadonic`
 - **THEN** the session project directory is set to
   `/home/user/workspaces/akadonic`
 - **AND** the project's identity file is loaded on the next LLM call
-- **AND** subsequent shell calls with cwd inside that directory may
-  participate in the safe-verb auto-allow short-circuit
+- **AND** subsequent shell calls inside that directory may receive reviewed-safe
+  coverage
 
-#### Scenario: set_working_directory rejected outside allowed roots
+#### Scenario: set_working_directory rejected outside trusted roots
 
-- **GIVEN** a session with audience profile allowing reads only under
-  `/home/user`
+- **GIVEN** a session whose project declarations are limited to `/home/user`
 - **WHEN** the agent invokes `set_working_directory` with path `/etc/nginx`
 - **THEN** the project directory remains unchanged
-- **AND** the tool returns an error indicating the path is outside allowed
-  roots
+- **AND** the tool reports that the path is outside trusted roots
 
 #### Scenario: set_working_directory rejected for nonexistent directory
 
-- **GIVEN** a session with audience profile allowing reads under `/home/user`
+- **GIVEN** a session with read authority under `/home/user`
 - **WHEN** the agent invokes `set_working_directory` with
   path `/home/user/nonexistent`
 - **THEN** the project directory remains unchanged
-- **AND** the tool returns an error indicating the directory does not exist
+- **AND** the tool reports that the directory does not exist
 
-#### Scenario: Personal audience clamps to the autonomous zone
+#### Scenario: Personal audience limits project declaration to trusted roots
 
-- **GIVEN** a session with personal audience (`ToolFilesystemMode.All`)
-- **AND** the target directory is outside the autonomous zone
-  (session directory, project directory, and configured global read roots)
-- **WHEN** the agent invokes `set_working_directory` with that valid directory
-- **THEN** the project directory is NOT updated
-- **AND** the tool returns an error indicating the target is outside the
-  session, project, or configured autonomous roots
-- **AND** `file_read` / `file_list` / `attach_file` on the same path still
-  resolve (interactive Personal shell-equivalent reach, netclaw-dev/netclaw#1724)
+- **GIVEN** a default Personal file profile with broad interactive read access
+- **AND** a valid target outside the session, current project, and configured
+  read roots
+- **WHEN** the agent invokes `set_working_directory` with that target
+- **THEN** the project directory is not updated
+- **AND** the declaration is denied even though an ordinary interactive
+  Personal read of the same path may be allowed
 
 #### Scenario: set_working_directory not exposed to public audience
 
-- **GIVEN** a session with public audience
+- **GIVEN** a Public session
 - **WHEN** the tool exposure list is computed
 - **THEN** `set_working_directory` is not included
 
@@ -174,22 +216,21 @@ approval friction depends on doing so when the work is project-scoped.
 - **THEN** the project directory changes to `/home/user/workspaces/other-project`
 - **AND** the next LLM call loads identity files from the new project
 - **AND** the old project's identity files are no longer injected
-- **AND** the approval safe-space root for shell invocations switches
-  to the new project directory
+- **AND** the reviewed-safe trusted root switches to the new project directory
 
-### Requirement: Shell tool cwd defaults to declared safe spaces
+### Requirement: Shell tool cwd selection is explicit and deterministic
 
 `ShellTool` SHALL resolve the working directory for every invocation
 in this priority order: explicit `WorkingDirectory` argument when
 provided, else `WorkingContext.ProjectDirectory` when set, else
-`session_dir` (the per-session directory under
-`~/.netclaw/sessions/<session-id>/`). `ShellTool` SHALL NOT fall
+`session_dir` (`<session-envelope>/workspace` for a version-2 session).
+`ShellTool` SHALL NOT fall
 through to `ProcessStartInfo`'s default behavior of inheriting the
 daemon process's cwd.
 
-This guarantees every shell invocation has a known cwd parented under a
-declared safe space (or an explicit override), which is the precondition
-the approval policy depends on.
+This rule gives each shell invocation a known cwd below a declared trusted
+root, unless the call supplies an explicit override. The approval policy uses
+the applicable path access decision for that cwd.
 
 #### Scenario: Cwd defaults to project_dir when set
 
@@ -204,7 +245,7 @@ the approval policy depends on.
 - **GIVEN** a session with `WorkingContext.ProjectDirectory` null
 - **WHEN** the agent invokes `shell_execute` with command `pwd` and
   no `WorkingDirectory`
-- **THEN** the command runs with cwd `~/.netclaw/sessions/<session-id>/`
+- **THEN** the command runs with cwd `<session-envelope>/workspace`
 
 #### Scenario: Explicit WorkingDirectory overrides default
 
@@ -213,7 +254,7 @@ the approval policy depends on.
 - **WHEN** the agent invokes `shell_execute` with command `pwd` and
   `WorkingDirectory` `/tmp/`
 - **THEN** the command runs with cwd `/tmp/`
-- **AND** the approval gate evaluates safe-space membership against `/tmp/`
+- **AND** the approval gate requests a path access decision for `/tmp/`
 
 #### Scenario: Cwd never inherits daemon process cwd
 
@@ -224,13 +265,24 @@ the approval policy depends on.
 - **THEN** the command does NOT run with cwd `/var/lib/netclawd/`
 - **AND** the resolved cwd is `session_dir`
 
-### Requirement: Shell tool failure-path hint for cwd outside safe spaces
+### Requirement: Shell tool failure-path hint for cwd outside trusted roots
 
-`ShellTool` SHALL include a one-line remediation hint in the tool result returned to the model when a call is denied because its cwd is outside both `session_dir` and `project_dir` and a safe correction is available.
+`ShellTool` SHALL include a one-line remediation hint in the model result when
+a call is denied because its cwd is outside trusted roots. The remediation
+presenter SHALL add the hint only when an applicable remediation is available.
 
-For a non-temp cwd, the hint SHALL suggest `set_working_directory <path>` only when that tool is exposed and the same filesystem policy used by `set_working_directory` accepts the exact path without substitution. For a Personal cwd equal to the captured platform temporary root, the hint SHALL instead identify the exact session directory as private scratch and SHALL NOT suggest declaring the platform temporary root. Team and Public shell calls retain their existing earlier denial boundary, and Public results SHALL retain existing path redaction.
+For a non-temp cwd, the hint SHALL suggest `set_working_directory <path>` only
+when that tool is exposed. The same path access decision used by that tool
+SHALL accept the exact path without substitution. For a Personal cwd at the
+captured platform temporary root, the hint SHALL identify the managed
+temporary directory. It SHALL NOT suggest a project declaration for the
+platform temporary root. Team and Public calls retain their earlier denial
+boundary. Public results retain existing path redaction.
 
-The hint SHALL NOT be emitted for hard-deny-list refusals, `ToolPathPolicy` denials, an unavailable session scratch path, or a foreign non-temp cwd that `set_working_directory` would reject.
+The hint SHALL NOT appear for hard-deny-list refusals or protected-path
+denials. It SHALL NOT appear when the managed temporary directory is
+unavailable. It SHALL NOT appear when `set_working_directory` would reject a
+non-temp cwd.
 
 #### Scenario: Denial in declarable foreign tree includes set_working_directory hint
 
@@ -240,12 +292,14 @@ The hint SHALL NOT be emitted for hard-deny-list refusals, `ToolPathPolicy` deni
 - **AND** the user denies the resulting prompt
 - **THEN** the tool result includes a hint pointing at `set_working_directory ~/repos/bar/`
 
-#### Scenario: Denied platform-temp retry retains scratch recommendation
+#### Scenario: Denied platform-temp retry retains managed-temp recommendation
 
-- **GIVEN** an agent received the session-scratch correction for the platform temporary root
+- **GIVEN** an agent received the managed-temp remediation for the platform
+  temporary root
 - **AND** it repeated the original call unchanged to request ordinary approval
 - **WHEN** the user denies that approval
-- **THEN** the tool result identifies the exact session directory as private scratch
+- **THEN** the remediation presenter identifies the exact managed temporary
+  directory
 - **AND** it does not suggest `set_working_directory` for the platform temporary root
 
 #### Scenario: Undeclarable foreign tree has no project declaration hint
@@ -263,40 +317,9 @@ The hint SHALL NOT be emitted for hard-deny-list refusals, `ToolPathPolicy` deni
 #### Scenario: Hint is not emitted when remediation tools are unavailable
 
 - **GIVEN** a Public session where `set_working_directory` is not exposed
-- **AND** no private session-scratch correction is available
-- **WHEN** a shell call is denied for cwd-outside-safe-space
+- **AND** no private managed-temp remediation is available
+- **WHEN** a shell call is denied because its cwd is outside trusted roots
 - **THEN** the result does NOT include a working-directory remediation hint
-
-### Requirement: set_working_directory expands the approval safe space
-
-Setting `WorkingContext.ProjectDirectory` SHALL expand the approval gate's
-safe-space root set for Personal and Team audiences: subsequent shell
-invocations whose cwd resolves under the new project directory SHALL
-participate in the safe-verb auto-allow short-circuit (subject to the
-safe-verbs list and symlink-segment guard). For Public audience,
-`set_working_directory` SHALL NOT be available and the safe space SHALL
-remain `session_dir` only.
-
-This requirement formalizes the dependency between session_cwd and
-tool-approval-gates: the act of declaring the project root is the act
-of opening the approval trust boundary.
-
-#### Scenario: Setting project_dir relaxes future approval prompts
-
-- **GIVEN** a Personal session with `project_dir` initially null
-- **AND** the agent has previously been denied `grep` calls in
-  `~/repos/foo/`
-- **WHEN** the agent calls `set_working_directory ~/repos/foo/`
-- **AND** the agent retries `grep -r "x" .` with cwd `~/repos/foo/`
-- **THEN** the approval gate short-circuits (safe verb in safe space)
-- **AND** no prompt is rendered
-
-#### Scenario: Public audience does not get safe-space expansion
-
-- **GIVEN** a Public session
-- **WHEN** the tool exposure list is computed
-- **THEN** `set_working_directory` is not included
-- **AND** the only safe space remains `session_dir`
 
 ### Requirement: Working context block includes project directory
 
@@ -350,6 +373,22 @@ For Team and Personal turns whose `WorkingContext.ProjectDirectory` is declared 
 - **WHEN** Git working context is rendered
 - **THEN** no remote credentials or complete remote URL appears in model-visible context or logs
 
+#### Scenario: Contradictory Git head metadata is unavailable
+
+- **GIVEN** Git reports a detached head with upstream metadata, a detached unborn head, or divergence without an upstream
+- **WHEN** the inspector parses that status
+- **THEN** the inspector returns the existing unavailable outcome with a bounded reason
+- **AND** the model receives no contradictory branch or tracking state
+
+
+#### Scenario: Invalid public Git snapshot does not interrupt a turn
+
+- **GIVEN** a caller constructs or deserializes a Git snapshot with contradictory head fields
+- **WHEN** the context renderer processes the snapshot
+- **THEN** it emits the existing unavailable status with a reason
+- **AND** it emits no branch or commit details and does not modify the snapshot
+- **AND** the session can continue its turn
+
 ### Requirement: Project-directory declarations reject control characters
 
 The `set_working_directory` tool SHALL reject a path that contains NUL, CR, or
@@ -364,85 +403,489 @@ echoing the authored path.
 - **AND** the project scope remains unchanged
 - **AND** project instructions are not loaded from that path
 
-### Requirement: Subagent context announces private session scratch
+#### Scenario: Invalid public Git snapshot does not interrupt a turn
 
-Before the first model call, the system SHALL include the exact bound `session_dir` in Personal and Team subagent working context and SHALL identify it as private scratch for disposable artifacts. The guidance SHALL preserve an explicitly required platform temporary path. Public subagent context SHALL NOT include the private session path.
+- **GIVEN** a caller constructs or deserializes a Git snapshot with contradictory head fields
+- **WHEN** the context renderer processes the snapshot
+- **THEN** it emits the existing unavailable status with a reason
+- **AND** it emits no branch or commit details and does not modify the snapshot
+- **AND** the session can continue its turn
 
-The context SHALL be derived from the child run's existing bound session scope. It SHALL NOT add a public protocol field, persist the path as agent identity, create a second scratch directory, or change shell authorization.
+### Requirement: Existing session context announces managed paths
 
-#### Scenario: Personal child receives exact scratch path
+The system SHALL preserve the existing `[session]` context block and its
+`session_dir` entry. It SHALL extend that same block with the applicable
+`temp_dir`, `artifact_dir`, `worktree_dir`, and `log_path` entries for Personal
+and Team parent and child runs. It SHALL NOT add a second context block or
+repeat these paths in per-turn guidance.
 
-- **GIVEN** a Personal subagent has bound session directory `/home/user/.netclaw/sessions/example`
+The system SHALL state the distinct purpose of each path. Public context SHALL
+retain its existing private-path policy. The guidance SHALL preserve an
+explicitly required platform temporary path.
+
+The context SHALL derive from the existing parent or child run scope. It SHALL
+NOT add a public protocol field, persist a path as agent identity, or change
+shell authorization.
+
+For a parent with a version-2 storage binding, `session_dir` SHALL mean
+`<session-envelope>/workspace`. For a child, `temp_dir` and `artifact_dir`
+SHALL be siblings below `<session-envelope>/subagents/<run-id>`. The context
+SHALL NOT use `session_dir` as a synonym for the complete storage envelope.
+It SHALL describe `session_dir` as the working directory and relative-path
+fallback. It SHALL describe `temp_dir` as disposable run-local storage. Current
+runtime prompts and tool schemas SHALL NOT call either path “session scratch.”
+
+#### Scenario: Example - Personal child receives distinct managed paths
+
+- **GIVEN** a Personal child has a bound session and run scope
 - **WHEN** Netclaw assembles its initial model context
-- **THEN** the context contains `session_dir: /home/user/.netclaw/sessions/example`
-- **AND** it identifies `session_dir` as the location for disposable artifacts
-- **AND** it does not imply that the directory grants shell authority
+- **THEN** the context contains its exact session, temporary, and artifact
+  directories
+- **AND** it contains the session's exact worktree directory
+- **AND** it contains the exact log path for that child run
+- **AND** it describes `temp_dir` as disposable working storage
+- **AND** it describes `artifact_dir` as the location for outputs that the
+  parent or user must keep
+- **AND** it does not imply that path knowledge grants shell authority
 
-#### Scenario: Team child receives exact scratch path
+#### Scenario: Example - Personal parent extends the existing session block
 
-- **GIVEN** a Team subagent has a valid bound session directory
+- **GIVEN** a Personal parent already receives `[session]` with `session_dir`
+- **WHEN** Netclaw assembles its first model context for the new layout
+- **THEN** the same block also contains `temp_dir`, `artifact_dir`,
+  `worktree_dir`, and `log_path`
+- **AND** no second session block contains duplicate path guidance
+
+#### Scenario: Team child receives distinct managed paths
+
+- **GIVEN** a Team child has a valid bound run scope
 - **WHEN** Netclaw assembles its initial model context
-- **THEN** the context contains that exact directory as private scratch
+- **THEN** the context contains that run's exact managed paths
+- **AND** it identifies the current run's `log_path`
 - **AND** existing Team tool and shell policy remains unchanged
 
-#### Scenario: Public child retains path redaction
+#### Scenario: Counterexample - Public child cannot receive private paths
 
-- **GIVEN** a Public subagent has an internal bound session directory
+- **GIVEN** a Public child has internal managed paths
 - **WHEN** Netclaw assembles its initial model context
-- **THEN** the context does not contain that directory
-- **AND** no scratch guidance discloses another private filesystem path
+- **THEN** the context does not contain those paths
+- **AND** no replacement guidance discloses another private filesystem path
 
-#### Scenario: Explicit platform temporary requirement is preserved
+#### Scenario: Counterexample - implementation cannot replace context assembly
 
-- **GIVEN** a Personal or Team subagent receives scratch guidance
-- **WHEN** its task explicitly requires `/tmp` or the native Windows temporary directory
+- **GIVEN** the current parent and child context assemblers already emit
+  `session_dir`
+- **WHEN** the implementation adds the new path entries
+- **THEN** it extends those existing assembly seams
+- **AND** it does not create another prompt provider or context protocol
+
+#### Scenario: Counterexample - explicit platform temporary intent is preserved
+
+- **GIVEN** a Personal or Team child receives managed-path guidance
+- **WHEN** its task explicitly requires the platform temporary directory
 - **THEN** the guidance tells the child to preserve that requirement
 - **AND** Netclaw does not rewrite the path or grant authority to it
 
-#### Scenario: Project declaration does not replace session scratch
+#### Scenario: Project declaration does not replace managed paths
 
-- **GIVEN** a child has received its initial session scratch context
+- **GIVEN** a child has received its initial managed-path context
 - **WHEN** it later calls `set_working_directory` successfully
-- **THEN** its project scope and project instructions update through the existing contract
-- **AND** its bound `session_dir` remains unchanged
+- **THEN** its project scope and project instructions update through the
+  existing contract
+- **AND** its bound session, temporary, and artifact paths remain unchanged
 
-### Requirement: Session directory is the private shell scratch location
+#### Scenario: Example - file schemas name the relative-path fallback correctly
 
-The system SHALL identify the existing per-session directory as the private scratch location for disposable shell artifacts. Personal and Team model-visible working-context and correction text SHALL provide its absolute path when the agent needs an alternative to the platform temporary root. Public contexts SHALL retain existing path redaction and SHALL NOT receive the private absolute session path. The system SHALL NOT create a second scratch directory, silently substitute the path, or imply that session-directory cleanup occurs as part of this behavior.
+- **GIVEN** a workspace file tool accepts a relative path
+- **WHEN** its model-visible schema describes path resolution
+- **THEN** it says that the current project is tried before the session
+  directory
+- **AND** it does not describe the session directory as disposable scratch
 
-#### Scenario: Shell without project scope defaults to session scratch
+#### Scenario: Counterexample - disposable guidance cannot point to session_dir
+
+- **GIVEN** the model needs a location for disposable run-local output
+- **WHEN** Netclaw renders managed-path guidance
+- **THEN** the guidance points to `temp_dir`
+- **AND** it does not tell the model to use `session_dir` as scratch
+
+### Requirement: Managed temporary directory is the private temporary location
+
+The system SHALL provide a separate managed temporary directory for each
+parent and child run. A version-2 parent SHALL use
+`<session-envelope>/tmp/parent`. A child SHALL use
+`<session-envelope>/subagents/<run-id>/tmp`. The system SHALL identify this
+directory as the preferred location for disposable files. It SHALL use the
+session directory, not the complete envelope, as the shell working-directory
+fallback when no project or explicit working directory exists.
+
+Personal and Team working context and correction text SHALL provide the
+absolute managed temporary path when the agent needs an alternative to the
+platform temporary root. Public context SHALL retain existing private-path
+redaction. The system SHALL NOT silently substitute a path or imply that
+temporary-directory cleanup occurs as part of this behavior.
+
+#### Scenario: Example - no-project shell separates cwd and temp
 
 - **GIVEN** a session has no declared project directory
-- **AND** its session directory is `/home/user/.netclaw/sessions/example`
-- **WHEN** the agent invokes `shell_execute` without an explicit working directory
-- **THEN** the shell working directory is `/home/user/.netclaw/sessions/example`
-- **AND** the working context identifies that directory as session scratch
+- **WHEN** the agent invokes `shell_execute` without an explicit working
+  directory
+- **THEN** the shell working directory is the bound session directory at
+  `<session-envelope>/workspace`
+- **AND** temporary APIs in the process resolve to the managed temporary
+  directory
 
-#### Scenario: Scratch recommendation uses the existing session directory
+#### Scenario: Counterexample - complete envelope is not the fallback cwd
 
-- **GIVEN** a correction recommends private scratch
+- **GIVEN** a version-2 session has raw logs and child runs in its envelope
+- **WHEN** the agent invokes `shell_execute` without a project or explicit cwd
+- **THEN** the shell does not start at `<session-envelope>`
+- **AND** a recursive search of `.` does not include those sibling areas
+
+#### Scenario: Parent and child temporary directories do not collide
+
+- **GIVEN** a parent and two child runs belong to one session
+- **WHEN** Netclaw resolves their managed temporary directories
+- **THEN** each run receives a different directory
+- **AND** every directory remains below the same session envelope
+
+#### Scenario: Example - correction names the managed temporary directory
+
+- **GIVEN** a correction recommends private temporary storage
 - **WHEN** the correction is rendered for the agent
-- **THEN** it names the exact existing session directory
-- **AND** it does not name a newly created `scratch` child directory
+- **THEN** it names the exact managed temporary directory for that run
+- **AND** it does not name the complete session envelope as disposable storage
 
-#### Scenario: Public context does not receive private scratch path
+#### Scenario: Counterexample - Public context cannot receive managed paths
 
-- **GIVEN** a Public parent agent or subagent
-- **WHEN** it evaluates a platform-temp shell call
-- **THEN** it does not receive the private session-directory path
+- **GIVEN** a Public parent or child agent
+- **WHEN** it evaluates a platform-temp operation
+- **THEN** it does not receive a private managed path
 - **AND** existing Public path-redaction behavior remains
 
-#### Scenario: Personal and Team headless context nudges scratch use
+#### Scenario: Counterexample - session end does not imply cleanup
 
-- **GIVEN** a Personal or Team headless session
-- **WHEN** its working context is assembled
-- **THEN** the context identifies the exact session directory as private scratch for disposable artifacts
-- **AND** it states that an explicitly required platform-temp path must be preserved
-- **AND** it does not imply that approval prompts or automatic cleanup exist
-
-#### Scenario: No cleanup is implied
-
-- **GIVEN** an agent writes a disposable artifact under the session directory
+- **GIVEN** an agent writes a disposable file under its managed temporary
+  directory
 - **WHEN** the current session ends
-- **THEN** this capability does not delete or schedule deletion of that artifact
-- **AND** retention remains unchanged until a separate cleanup capability is specified
+- **THEN** this capability does not delete or schedule deletion of that file
+- **AND** retention remains unchanged until a separate cleanup capability is
+  specified
+
+### Requirement: Every run receives the standard temporary environment
+
+Before the system starts a shell or another child process, it SHALL create and
+validate the run's managed temporary directory. It SHALL set `TMPDIR`, `TMP`,
+and `TEMP` to that exact directory in the child process environment. It SHALL
+set all three variables on POSIX and Windows. It SHALL NOT change the daemon's
+global process environment.
+
+The system SHALL capture the host platform temporary root before it injects
+the managed values. Policy that identifies an explicitly authored unmanaged
+temporary path SHALL use that captured host value. It SHALL NOT assume a fixed
+Windows temporary path.
+
+#### Scenario: Example - POSIX child process uses managed temp
+
+- **GIVEN** a POSIX parent or child run has a managed temporary directory
+- **WHEN** Netclaw starts a shell process
+- **THEN** `TMPDIR`, `TMP`, and `TEMP` all equal that directory
+- **AND** a standard temporary-path API returns a path below it
+
+#### Scenario: Example - Windows child process uses managed temp
+
+- **GIVEN** a Windows parent or child run has a managed temporary directory
+- **WHEN** Netclaw starts a shell process
+- **THEN** `TMPDIR`, `TMP`, and `TEMP` all equal that directory
+- **AND** the native or .NET temporary-path API returns a path below it
+
+#### Scenario: Sibling runs keep isolated environments
+
+- **GIVEN** two child runs execute concurrently
+- **WHEN** each reads its temporary environment
+- **THEN** each sees only its own managed temporary path
+- **AND** the daemon environment remains unchanged
+
+#### Scenario: Counterexample - failed preparation cannot use host temp
+
+- **GIVEN** the managed temporary directory cannot be created or validated
+- **WHEN** Netclaw prepares a shell or child process
+- **THEN** process creation fails before user code runs
+- **AND** Netclaw does not fall back to the host platform temporary root
+
+#### Scenario: Example - old background job record remains readable
+
+- **GIVEN** a persisted background job definition predates the
+  `ManagedTemporaryDirectory` property
+- **WHEN** the current daemon loads that JSON after restart
+- **THEN** it preserves the job's terminal history
+- **AND** a pending or running job follows the existing restart contract and
+  becomes `Lost`
+- **AND** the owning session receives the existing lost-job notification
+- **AND** the daemon does not resume the job with the host temporary root
+
+### Requirement: Bash launcher sets HOME and PWD and removes CDPATH
+
+When the system starts a Bash shell process, it SHALL set these variables in
+the child process environment only:
+
+- `TMPDIR`, `TMP`, and `TEMP`: the run's managed temporary directory, as the
+  requirement "Every run receives the standard temporary environment" states.
+- `HOME`: the daemon user profile directory. The daemon SHALL read this value
+  one time, when it creates the shell environment at startup. The value SHALL
+  stay the same for the life of the daemon process.
+- `PWD`: the exact working directory of the shell process.
+
+The system SHALL remove `CDPATH` from the Bash child environment. If the user
+profile directory is not an absolute path, the system SHALL NOT set `HOME`. The
+child process then keeps the `HOME` value of the daemon process. A PowerShell
+process SHALL NOT receive the `HOME` or `PWD` value from this requirement.
+
+The launcher and the shell approval parser SHALL read the temporary and `HOME`
+values from one shared variable list. The parser SHALL use the same working
+directory value that the launcher writes to `PWD`. The two values SHALL NOT be
+computed separately.
+
+#### Scenario: Example - Bash process receives the launch variables
+
+- **GIVEN** a POSIX run with a managed temporary directory and a working
+  directory
+- **AND** the daemon user profile is an absolute path
+- **WHEN** Netclaw starts a Bash shell process for the run
+- **THEN** `TMPDIR`, `TMP`, and `TEMP` equal the managed temporary directory
+- **AND** `HOME` equals the user profile that the daemon read at startup
+- **AND** `PWD` equals the working directory
+- **AND** `CDPATH` is not set
+
+#### Scenario: Example - relative cd follows the working directory through a link
+
+- **GIVEN** the working directory path contains a symbolic link
+- **WHEN** the shell process runs `cd sub` and then `cd ../..`
+- **THEN** each `cd` goes to the directory that the approval parser resolved
+  lexically from the working directory
+
+#### Scenario: Counterexample - home that is not absolute gives no HOME value
+
+- **GIVEN** the daemon user profile is not an absolute path
+- **WHEN** Netclaw starts a Bash shell process
+- **THEN** Netclaw does not set `HOME` on the child process
+- **AND** the approval parser has no `HOME` launch value
+
+### Requirement: Approval parser trusts a launch variable only while it is unchanged
+
+The shell approval parser SHALL use a launch value only when the selected shell
+host has a proven no-startup initial state. For Bash, this state requires a
+probed GNU Bash 5.2 or 5.3 at `/bin/bash`, started with only `-c`. The parser
+SHALL resolve `$TMPDIR`, `$TMP`, `$TEMP`, and `$HOME` to the launch values in
+that state. It SHALL resolve a relative `cd` from the working directory, because
+the launcher removes `CDPATH`.
+
+A command that resolves to a launch value SHALL receive the same approval
+decision as the same command with the literal path. A stored grant for the
+literal directory SHALL apply.
+
+The parser SHALL treat a launch value as unknown after any statement that can
+change it. Examples are an assignment, `export`, a prefix assignment, `unset`,
+`read`, and `source`. The parser SHALL also treat `CDPATH` as unknown after the
+source sets it. The parser SHALL NOT use launch values for source that another
+process reads, for example the child of a `bash -lc` wrapper. An unknown value
+SHALL stay unresolved. The parser SHALL NOT replace it with the launch value or
+with another default.
+
+#### Scenario: Example - $HOME gets the decision of the literal path
+
+- **GIVEN** a Bash host with a proven no-startup initial state
+- **AND** the launch `HOME` value is `/home/alice`
+- **WHEN** the agent submits `cat "$HOME/x"`
+- **THEN** the approval decision equals the decision for `cat /home/alice/x`
+- **AND** a stored `cat` grant that covers `/home/alice` allows the command
+
+#### Scenario: Example - $TMPDIR gets the decision of the literal path
+
+- **GIVEN** a Bash host with a proven no-startup initial state
+- **WHEN** the agent submits `cat "$TMPDIR/notes.txt"`
+- **THEN** the approval decision equals the decision for the literal path below
+  the managed temporary directory
+
+#### Scenario: Counterexample - changed HOME is not trusted
+
+- **GIVEN** a Bash host with a proven no-startup initial state
+- **WHEN** the agent submits `export HOME=/etc; cat "$HOME/x"`
+- **THEN** the parser does not resolve `$HOME` to the launch value
+- **AND** the command does not receive an allow decision from the launch value
+
+#### Scenario: Counterexample - changed CDPATH keeps a relative cd unresolved
+
+- **GIVEN** a Bash host with a proven no-startup initial state
+- **AND** stored grants allow `cd` and `cat` in the project directory
+- **WHEN** the agent submits `CDPATH=/etc; cd sub && cat notes.txt`
+- **THEN** the relative `cd` stays unresolved
+- **AND** the command is not allowed
+
+#### Scenario: Counterexample - wrapped shell does not use launch values
+
+- **GIVEN** a Bash host with a proven no-startup initial state
+- **WHEN** the agent submits `bash -lc 'cat "$TMPDIR/notes.txt"'`
+- **THEN** the parser does not resolve the inner `$TMPDIR` to the launch value
+- **AND** the command is not allowed
+
+#### Scenario: Counterexample - unproved Bash host does not use launch values
+
+- **GIVEN** a Bash host without a proven no-startup initial state
+- **WHEN** the agent submits `cat "$TMPDIR/notes.txt"`
+- **THEN** the parser does not resolve `$TMPDIR` to the launch value
+- **AND** the command is not allowed
+
+### Requirement: Worktrees have a separate session-owned area
+
+The system SHALL distinguish managed worktrees from ordinary temporary files.
+It SHALL expose `<session-envelope>/worktrees` as `worktree_dir` in the existing
+session context and SHALL NOT place that directory below a run's managed
+temporary directory. Agents SHALL use existing shell and project-scope tools
+to create and adopt worktrees. This capability SHALL NOT define automatic
+worktree cleanup or a worktree-specific tool.
+
+#### Scenario: Example - worktree stays outside run temp
+
+- **GIVEN** an agent needs a Git worktree
+- **WHEN** it chooses a destination below the announced `worktree_dir`
+- **THEN** it is below the session worktree area
+- **AND** it is not below the parent or child temporary directory
+
+#### Scenario: Counterexample - session end does not delete worktree
+
+- **GIVEN** a managed worktree contains source changes
+- **WHEN** the session ends
+- **THEN** this capability does not delete the worktree
+- **AND** later cleanup requires a separate policy
+
+#### Scenario: Counterexample - worktree directory is not a temporary API root
+
+- **GIVEN** a child process calls a standard temporary-path API
+- **WHEN** Netclaw has injected the run environment
+- **THEN** the API resolves below `temp_dir`
+- **AND** it does not resolve below `worktree_dir`
+
+### Requirement: Project work takes precedence over managed temporary work
+
+Parent and subagent guidance SHALL use declared project scope for work that
+belongs to that project. The managed temporary directory SHALL hold disposable
+work outside a project. A successful project declaration SHALL not cause later
+project commands to select `temp_dir` as an explicit
+`WorkingDirectory`. This guidance SHALL NOT change runtime cwd resolution or
+grant shell authority.
+
+#### Scenario: Declared project remains the default for project work
+
+- **GIVEN** `project_dir` names the project for the current task
+- **WHEN** the agent runs a project shell command without a one-call override
+- **THEN** guidance tells it to omit `WorkingDirectory`
+- **AND** runtime cwd resolution selects `project_dir`
+- **AND** guidance does not select `session_dir` for that command
+
+#### Scenario: A named project is declared before project tool use
+
+- **GIVEN** a task names a project that differs from `project_dir`
+- **AND** `set_working_directory` is available
+- **WHEN** the task needs a shell or file tool in that project
+- **THEN** guidance tells the agent to declare the project once
+- **AND** the declaration precedes the first shell or file tool call
+- **AND** the declaration does not grant shell authority
+
+#### Scenario: A rejected named path is corrected before project work
+
+- **GIVEN** a task names a project path and a fallback project path
+- **AND** `set_working_directory` is available
+- **WHEN** the first declaration is rejected
+- **THEN** guidance declares the fallback before another project tool
+- **AND** the first declaration uses the task's first project path exactly
+- **AND** guidance does not substitute an enclosing directory before rejection
+- **AND** guidance does not probe either path before its declaration
+- **AND** neither declaration grants shell authority
+
+#### Scenario: Child declaration governs later child project commands
+
+- **GIVEN** a subagent successfully declares a different user-named project
+- **WHEN** it runs later shell commands for that project
+- **THEN** guidance uses the child `project_dir`
+- **AND** it does not pass the parent `temp_dir` as `WorkingDirectory`
+- **AND** it does not add an inline directory change to reach the project
+
+#### Scenario: One call in a child directory uses typed scope
+
+- **GIVEN** `project_dir` names a project root
+- **AND** one shell call must run in a named child directory or worktree
+- **WHEN** the agent authors that call
+- **THEN** `Command` contains only the shell operation
+- **AND** `WorkingDirectory` contains the exact child directory
+- **AND** the persistent project root does not change
+
+#### Scenario: Disposable work outside a project uses managed temporary storage
+
+- **GIVEN** a task creates disposable artifacts that do not belong to a project
+- **AND** the audience can see its managed temporary directory
+- **AND** the task does not require a platform temporary path
+- **WHEN** the agent selects a working directory
+- **THEN** guidance selects `temp_dir`
+- **AND** writable artifacts do not use platform temporary storage
+- **AND** it does not declare the managed temporary directory as a project
+
+#### Scenario: Requested directory transition remains authored behavior
+
+- **GIVEN** the task explicitly asks to test or perform a shell directory transition
+- **WHEN** the agent authors the shell call
+- **THEN** guidance preserves the inline transition
+- **AND** the call follows ordinary approval policy
+
+#### Scenario: Project declaration does not authorize project commands
+
+- **GIVEN** an agent successfully declares a project
+- **WHEN** it authors a prompt-worthy command in that project
+- **THEN** the declaration supplies only a trusted root
+- **AND** the command still needs reviewed-safe, one-time, session, or stored authority
+
+### Requirement: Parent and child contexts share one directory-selection order
+
+Personal and Team parent and subagent contexts SHALL state the same directory
+selection order. Project work SHALL use `project_dir`. A named one-call child
+scope SHALL use typed `WorkingDirectory`. Disposable non-project work SHALL use
+`temp_dir`. An inline directory change SHALL remain only for requested
+directory behavior. Public context SHALL not reveal a private project or
+session path.
+
+#### Scenario: Parent context contains the complete order
+
+- **GIVEN** a Personal or Team parent context has project and session paths
+- **WHEN** the context is assembled
+- **THEN** it distinguishes project work from managed temporary work
+- **AND** it distinguishes one-call typed scope from persistent project scope
+
+#### Scenario: Child context contains the complete order
+
+- **GIVEN** a Personal or Team child receives project and session context
+- **WHEN** its first model message is assembled
+- **THEN** it receives the same directory-selection order as the parent
+- **AND** the session rule does not use an unconditional temporary-directory instruction
+
+#### Scenario: Project refresh does not duplicate temporary guidance
+
+- **GIVEN** a child context already contains one managed-temporary-directory rule
+- **WHEN** `set_working_directory` refreshes child project context
+- **THEN** the next prompt contains the updated `project_dir`
+- **AND** it contains exactly one managed-temporary-directory rule
+- **AND** the directory-selection order remains unchanged
+
+#### Scenario: Public context stays redacted
+
+- **GIVEN** a Public parent or subagent context
+- **WHEN** the context is assembled
+- **THEN** no private `project_dir` or `session_dir` value is disclosed
+- **AND** no unavailable scope tool is recommended
+
+#### Scenario: Failed declaration preserves prior scope
+
+- **GIVEN** `set_working_directory` rejects a requested path
+- **WHEN** the next model call starts
+- **THEN** the prior project scope remains unchanged
+- **AND** guidance does not treat the rejected path as declared
+- **AND** an authored shell call follows ordinary approval policy

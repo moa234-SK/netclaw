@@ -1,3 +1,7 @@
+> Post-merge note: this change originally named the auth shape
+> `EndpointOrApiKeyAuth`. The merge with upstream `dev` adopted upstream's
+> `OptionalApiKeyAuth` (#2148) as the surviving name; the text below uses it.
+
 ## Why
 
 The `openai-compatible` provider type covers self-hosted OpenAI-shaped
@@ -14,7 +18,7 @@ and hosted OpenAI-compatible APIs all require Bearer auth.
 
 ## What Changes
 
-- Add one `IProviderAuth` shape: `EndpointOrApiKeyAuth`, supporting
+- Add one `IProviderAuth` shape: `OptionalApiKeyAuth`, supporting
   `[AuthMethod.None, AuthMethod.ApiKey]`.
 - Change `OpenAiCompatibleDescriptor.Auth` from `EndpointOnlyAuth` to the new
   shape. No runtime transport change — all wire paths already send Bearer

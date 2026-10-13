@@ -56,7 +56,7 @@ public sealed class McpOAuthEndToEndTests : IDisposable
         var toolConfig = new ToolConfig();
         var skillRegistry = new SkillRegistry();
         var skillIndex = new SkillIndexContextLayer();
-        var toolAccessPolicy = new ToolAccessPolicy(
+        var toolAccessPolicy = new ToolAccessPolicy(new NetclawPaths(),
             toolConfig,
             new EffectivePolicyDefaults(
                 DeploymentPosture.Personal,
@@ -82,6 +82,9 @@ public sealed class McpOAuthEndToEndTests : IDisposable
             NullNotificationSink.Instance,
             TimeProvider.System,
             new BodylessDcrRuntime(),
+            new McpArtifactMaterializer(
+                new MagicByteContentScanner(new ContentPolicy()),
+                new RecordingLogger<McpArtifactMaterializer>()),
             logger,
             new SessionConfig());
 

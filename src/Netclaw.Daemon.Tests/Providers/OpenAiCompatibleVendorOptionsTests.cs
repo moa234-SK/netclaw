@@ -145,6 +145,7 @@ public sealed class OpenAiCompatibleVendorOptionsTests
         var descriptor = new OpenAiCompatibleDescriptor(httpClient);
         var entry = EntryWithHeaders(new JsonObject { ["x-team-id"] = "team-1" });
         entry.ApiKey = new SensitiveString("sk-test");
+        entry.AuthMethod = AuthMethod.ApiKey;
 
         var result = await descriptor.ProbeAsync(entry, TestContext.Current.CancellationToken);
 

@@ -20,6 +20,7 @@ using Netclaw.Actors.Sessions;
 using Netclaw.Actors.Tests.Sessions;
 using FakeChatClient = Netclaw.Tests.Utilities.FakeChatClient;
 using Netclaw.Channels.Slack;
+using Netclaw.Tests.Utilities;
 using Netclaw.Configuration;
 using Netclaw.Security;
 using SlackNet.Blocks;
@@ -35,7 +36,7 @@ namespace Netclaw.Actors.Tests.Channels;
 /// DataContent inlining) against a stubbed HTTP handler, content scanner,
 /// and reply client. None of these tests touch a live Slack connection.
 /// </summary>
-public sealed class SlackAttachmentIngressVisionTests : TestKit
+public sealed class SlackAttachmentIngressVisionTests : TestKit, IAsyncDisposable
 {
     private static readonly byte[] FakePngBytes = Convert.FromBase64String(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==");
@@ -52,13 +53,27 @@ public sealed class SlackAttachmentIngressVisionTests : TestKit
     private readonly FakeChatClient _chatClient = new() { ResponseText = "ok" };
     private readonly RecordingReplyClient _replyClient = new();
     private readonly ConfigurableFakeSlackFileHandler _httpHandler = new();
-    private readonly NetclawPaths _paths = new(Path.Combine(
-        Path.GetTempPath(),
-        $"netclaw-slack-attachment-tests-{Guid.NewGuid():N}"));
+    private readonly TestSessionTempDirectory _tempDir =
+        TestSessionTempDirectory.Create(prefix: "netclaw-slack-attachment-tests-", createDirectoryTree: true);
+    private NetclawPaths _paths => _tempDir.Paths;
 
     public SlackAttachmentIngressVisionTests(ITestOutputHelper output) : base(output: output)
     {
-        _paths.EnsureDirectoriesExist();
+    }
+
+    // TestKit stops the actor system only after AfterAllAsync returns, and it fails
+    // the test when AfterAllAsync takes more than 5 seconds. Delete the directory
+    // after TestKit has disposed, and not in AfterAllAsync.
+    async ValueTask IAsyncDisposable.DisposeAsync()
+    {
+        try
+        {
+            await base.DisposeAsync();
+        }
+        finally
+        {
+            await _tempDir.DisposeAsync();
+        }
     }
 
     /// <summary>
@@ -145,7 +160,7 @@ public sealed class SlackAttachmentIngressVisionTests : TestKit
             ThreadHistoryFetcher: EmptyThreadHistoryFetcher.Instance,
             AudienceProfiles: profiles,
             ModelCapabilities: Host.Services.GetRequiredService<ModelCapabilities>(),
-            Paths: _paths,
+            StorageResolver: new Netclaw.Actors.Protocol.TestSessionStorageResolver(_paths),
             HttpClient: httpClient,
             PromptInjectionDetector: SafePromptInjectionDetector.Instance);
 
@@ -216,8 +231,9 @@ public sealed class SlackAttachmentIngressVisionTests : TestKit
         Assert.Empty(pdfDataContents);
 
         var sessionId = new SessionId("D1/2000.1");
+        var storage = new Netclaw.Actors.Protocol.TestSessionStorageResolver(_paths).Resolve(sessionId);
         var inboxPath = Path.Combine(
-            SessionDirectoryHelper.GetOrCreateInboxDirectory(sessionId, _paths.SessionsDirectory),
+            SessionDirectoryHelper.GetOrCreateInboxDirectory(storage),
             "report.pdf");
         Assert.True(File.Exists(inboxPath), $"Expected inbox file at {inboxPath}");
     }
@@ -429,7 +445,8 @@ public sealed class SlackAttachmentIngressVisionTests : TestKit
 
         var threadTs = new SlackThreadTs("3300.0");
         var sessionId = new SessionId("D5/3300.0");
-        var inboxDir = SessionDirectoryHelper.GetOrCreateInboxDirectory(sessionId, _paths.SessionsDirectory);
+        var storage = new Netclaw.Actors.Protocol.TestSessionStorageResolver(_paths).Resolve(sessionId);
+        var inboxDir = SessionDirectoryHelper.GetOrCreateInboxDirectory(storage);
 
         var file = new SlackFileReference(
             "F_COLLIDE", "photo.png", "image/png", FakePngBytes.Length,
@@ -517,8 +534,9 @@ public sealed class SlackAttachmentIngressVisionTests : TestKit
         }, duration: TimeSpan.FromSeconds(10), cancellationToken: TestContext.Current.CancellationToken);
 
         var sessionId = new SessionId("D_TXT/3800.1");
+        var storage = new Netclaw.Actors.Protocol.TestSessionStorageResolver(_paths).Resolve(sessionId);
         var inboxPath = Path.Combine(
-            SessionDirectoryHelper.GetOrCreateInboxDirectory(sessionId, _paths.SessionsDirectory),
+            SessionDirectoryHelper.GetOrCreateInboxDirectory(storage),
             "notes.txt");
         Assert.True(File.Exists(inboxPath), $"Expected inbox file at {inboxPath}");
 
@@ -634,7 +652,8 @@ public sealed class SlackAttachmentIngressVisionTests : TestKit
         }, duration: TimeSpan.FromSeconds(10), cancellationToken: TestContext.Current.CancellationToken);
 
         var sessionId = new SessionId("D6/3400.1");
-        var inboxDir = SessionDirectoryHelper.GetOrCreateInboxDirectory(sessionId, _paths.SessionsDirectory);
+        var storage = new Netclaw.Actors.Protocol.TestSessionStorageResolver(_paths).Resolve(sessionId);
+        var inboxDir = SessionDirectoryHelper.GetOrCreateInboxDirectory(storage);
         Assert.Empty(Directory.GetFiles(inboxDir));
     }
 

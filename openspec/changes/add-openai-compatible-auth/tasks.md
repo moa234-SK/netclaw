@@ -1,10 +1,14 @@
+> Post-merge note: this change originally named the auth shape
+> `EndpointOrApiKeyAuth`. The merge with upstream `dev` adopted upstream's
+> `OptionalApiKeyAuth` (#2148) as the surviving name; the text below uses it.
+
 ## 1. Auth contract
 
-- [x] 1.1 Add `EndpointOrApiKeyAuth : IProviderAuth` in
+- [x] 1.1 Add `OptionalApiKeyAuth : IProviderAuth` in
   `src/Netclaw.Providers/IProviderAuth.cs` with
   `SupportedAuthMethods = [AuthMethod.None, AuthMethod.ApiKey]`.
 - [x] 1.2 Change `OpenAiCompatibleDescriptor.Auth` from `EndpointOnlyAuth`
-  to `EndpointOrApiKeyAuth`.
+  to `OptionalApiKeyAuth`.
 - [x] 1.3 Confirmed no transport change is needed: chat client
   (`OpenAiCompatibleChatClient.BuildRequest`), models client, capability
   resolver, and descriptor probe send Bearer when a key exists and no header
@@ -16,14 +20,14 @@
   as "No auth (local endpoint)" and is included only for multi-method
   providers; single-`None` providers (Ollama) still bypass the picker.
   `ParseAuthMethodLabel` round-trips the new label.
-- [x] 2.2 `ProviderStepView.BuildCredentialInput`: `EndpointOrApiKeyAuth`
+- [x] 2.2 `ProviderStepView.BuildCredentialInput`: `OptionalApiKeyAuth`
   branch — "No auth" shows endpoint input (sub-step 2 → probe); "API Key"
   shows endpoint input then a new sub-step 10 for the key input. Back
   navigation from 10 returns to 2.
 - [x] 2.3 `ProviderStepViewModel`: `BuildProbeEntry` already carries
   `ApiKey` when set (no change); `ContributeConfig`/`BuildProviderEntry`
   now default the endpoint from descriptors of shape `EndpointOnlyAuth or
-  EndpointOrApiKeyAuth`; `WriteProviderCredentials` persists the selected
+  OptionalApiKeyAuth`; `WriteProviderCredentials` persists the selected
   method and encrypted key via the existing `ProviderCredentialWriter`.
 - [x] 2.4 `ChatClientDoctorCheck.MissingCredentialMessage`: an entry that
   declares `AuthMethod: ApiKey` with no stored key now fails with guidance
@@ -37,7 +41,7 @@
   `BuildAuthMethodLabels` (covered by 2.1).
 - [x] 3.3 New `AddCredentialsEndpoint` state + `BuildCredentialsEndpointView`
   (endpoint stage before key stage for the ApiKey path);
-  `BuildCredentialsView` handles `EndpointOrApiKeyAuth` for both methods;
+  `BuildCredentialsView` handles `OptionalApiKeyAuth` for both methods;
   new `FixApiKey` state + `BuildFixApiKeyView` for repairing a key'd entry
   (endpoint stage first, then key stage, via `SubmitFixEndpoint`).
 - [x] 3.4 `WriteProviderConfig` persists via `ProviderCredentialWriter` with

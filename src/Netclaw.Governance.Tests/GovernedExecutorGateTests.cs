@@ -31,6 +31,7 @@ public class GovernedExecutorGateTests
         _executor = new DispatchingToolExecutor(
             _registry,
             new ToolAccessPolicy(
+                new NetclawPaths(),
                 new ToolConfig(),
                 new EffectivePolicyDefaults(
                     DeploymentPosture.Personal,
@@ -45,7 +46,12 @@ public class GovernedExecutorGateTests
     private static ToolExecutionContext CreateContext() => new(
         new ToolRunScope
         {
-            Session = new ToolSessionScope.Bound("slack/C777/T1", null),
+            Session = new ToolSessionScope.Bound(
+                "slack/C777/T1",
+                SessionStoragePaths.CreateLegacy(
+                    Path.Combine(AppContext.BaseDirectory, "netclaw-governance-test-workspace"),
+                    Path.Combine(AppContext.BaseDirectory, "netclaw-governance-test-logs"),
+                    "test-session")),
             Audience = TrustAudience.Personal,
             InlineOutputBudget = InlineOutputBudget.Default,
             InteractiveApproval = new InteractiveApprovalCapability.Unavailable(),
@@ -124,6 +130,7 @@ public class GovernedExecutorGateTests
         var executor = new DispatchingToolExecutor(
             _registry,
             new ToolAccessPolicy(
+                new NetclawPaths(),
                 new ToolConfig(),
                 new EffectivePolicyDefaults(
                     DeploymentPosture.Personal,

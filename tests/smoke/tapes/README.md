@@ -63,7 +63,12 @@ that breaks them.
 
 5. **Anchor regexes at every step.** After every `Type` / `Enter` /
    `Down` / etc. that changes the visible state, immediately
-   `Wait+Screen /…/` for an anchor in the next view.
+   `Wait+Screen /…/` for an anchor in the next view. The anchor must be
+   text that only the next view shows. Do not anchor on a menu label, a
+   page title, or a key hint that the current view also shows. Such an
+   anchor matches at once, and the next keys reach the old view. For
+   example, the root dashboard shows the row `Security & Access`, so
+   tapes anchor that page on its row text `Deployment trust stance.`.
 
 6. **Pair each non-trivial tape with an assertion.** Place a sibling
     script at `tests/smoke/assertions/<tape-name>.sh`. The wrapper
@@ -127,6 +132,12 @@ How it differs from the flow tapes:
 - They have **no post-tape assertion**. The PNG comparison is the test.
 - The harness points `run-native-tape.sh` at them via the `TAPE_PREAMBLE`
   and `TAPE_BODY_DIR` env vars.
+
+The daemon inherits the VHS terminal when `netclaw daemon start` starts it.
+Each screenshot tape that starts the daemon must redirect its output to
+`__NETCLAW_HOME__/logs/daemon-stdio.log`.
+This rule keeps asynchronous native-library messages outside the captured terminal.
+The artifact keeps the redirected output for fault analysis.
 
 Keep the recorder at 60 frames per second. End the tape with `Sleep 250ms` after
 the final state anchor. This recorder barrier produces 15 final-state frames.

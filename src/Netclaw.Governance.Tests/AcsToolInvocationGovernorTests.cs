@@ -24,7 +24,12 @@ public class AcsToolInvocationGovernorTests
         {
             Session = sessionId is null
                 ? new ToolSessionScope.Sessionless()
-                : new ToolSessionScope.Bound(sessionId, null),
+                : new ToolSessionScope.Bound(
+                    sessionId,
+                    SessionStoragePaths.CreateLegacy(
+                        Path.Combine(AppContext.BaseDirectory, "netclaw-governor-test-workspace"),
+                        Path.Combine(AppContext.BaseDirectory, "netclaw-governor-test-logs"),
+                        "test-session")),
             Audience = audience,
             InlineOutputBudget = InlineOutputBudget.Default,
             ChannelType = channelType,

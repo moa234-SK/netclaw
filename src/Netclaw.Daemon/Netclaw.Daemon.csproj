@@ -31,6 +31,7 @@
     <ItemGroup>
         <InternalsVisibleTo Include="Netclaw.Daemon.Tests"/>
         <InternalsVisibleTo Include="Netclaw.Cli.Tests"/>
+        <InternalsVisibleTo Include="Netclaw.Actors.MutationTests"/>
     </ItemGroup>
 
     <ItemGroup>
@@ -53,9 +54,10 @@
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
         </None>
         <EmbeddedResource Include="migrations\sqlite\**\*.sql"/>
-        <Content Include="..\..\feeds\skills\.system\files\**\*" Exclude="..\..\feeds\skills\.system\files\**\*.*.*\**" Link="BuiltInSkills\%(RecursiveDir)%(Filename)%(Extension)">
-            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        </Content>
+        <EmbeddedResource Include="..\..\feeds\skills\.system\files\**\*"
+                          LogicalName="Netclaw.SystemSkills/%(RecursiveDir)%(Filename)%(Extension)" />
+        <EmbeddedResource Include="Resources\SystemSkillExecutablePaths.json"
+                          LogicalName="Netclaw.SystemSkillExecutablePaths" />
     </ItemGroup>
 
     <ItemGroup>

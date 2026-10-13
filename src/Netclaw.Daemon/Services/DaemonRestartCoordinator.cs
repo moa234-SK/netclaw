@@ -109,13 +109,10 @@ public sealed class DaemonRestartCoordinator : IDaemonRestartCoordinator
 
             var manifest = new RestartManifest
             {
-                Reason = "config-reload",
-                RequestedAt = _timeProvider.GetUtcNow(),
-                SessionIds = [.. drainResult.AllSessionIds.Select(static id => id.Value)],
-                TimedOutSessionIds = [.. drainResult.TimedOutSessionIds.Select(static id => id.Value)]
+                RestartReminders = [.. drainResult.RestartReminders]
             };
 
-            if (manifest.SessionIds.Count == 0)
+            if (manifest.RestartReminders.Count == 0)
                 await _manifestStore.DeleteAsync();
             else
                 await _manifestStore.WriteAsync(manifest, cancellationToken);
@@ -173,13 +170,10 @@ public sealed class DaemonRestartCoordinator : IDaemonRestartCoordinator
 
             var manifest = new RestartManifest
             {
-                Reason = "self-update",
-                RequestedAt = _timeProvider.GetUtcNow(),
-                SessionIds = [.. drainResult.AllSessionIds.Select(static id => id.Value)],
-                TimedOutSessionIds = [.. drainResult.TimedOutSessionIds.Select(static id => id.Value)]
+                RestartReminders = [.. drainResult.RestartReminders]
             };
 
-            if (manifest.SessionIds.Count == 0)
+            if (manifest.RestartReminders.Count == 0)
                 await _manifestStore.DeleteAsync();
             else
                 await _manifestStore.WriteAsync(manifest, cancellationToken);

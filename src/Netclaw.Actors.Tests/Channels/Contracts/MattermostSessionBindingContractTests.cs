@@ -56,11 +56,12 @@ public sealed class MattermostSessionBindingContractTests(ITestOutputHelper outp
             TimeProvider: TimeProvider.System,
             Options: options,
             DefaultChannelId: null,
+            ChannelRegistry: TestChannelRegistries.MattermostWithProcessingRenderer(_replyClient),
             ReplyClient: _replyClient,
             ContentScanner: new NullContentScanner(),
             AudienceProfiles: TestMattermostGatewayDeps.DefaultAudienceProfiles,
             ModelCapabilities: TestMattermostGatewayDeps.DefaultVisionCapableModel,
-            Paths: TestMattermostGatewayDeps.NewTestPaths(),
+                        StorageResolver: Netclaw.Actors.Protocol.TestSessionStorageResolver.Instance,
             PromptInjectionDetector: detector);
 
         var name = $"mm-session-fail-{Interlocked.Increment(ref _actorCounter)}";
@@ -195,11 +196,12 @@ public sealed class MattermostSessionBindingContractTests(ITestOutputHelper outp
             TimeProvider: TimeProvider.System,
             Options: options,
             DefaultChannelId: null,
+            ChannelRegistry: TestChannelRegistries.MattermostWithProcessingRenderer(_replyClient),
             ReplyClient: _replyClient,
             ContentScanner: new NullContentScanner(),
             AudienceProfiles: TestMattermostGatewayDeps.DefaultAudienceProfiles,
             ModelCapabilities: TestMattermostGatewayDeps.DefaultVisionCapableModel,
-            Paths: TestMattermostGatewayDeps.NewTestPaths(),
+                        StorageResolver: Netclaw.Actors.Protocol.TestSessionStorageResolver.Instance,
             PromptInjectionDetector: detector,
             ThreadHistoryFetcher: historyFetcher);
 
@@ -216,8 +218,8 @@ public sealed class MattermostSessionBindingContractTests(ITestOutputHelper outp
     {
         var ct = TestContext.Current.CancellationToken;
         var sid = new SessionId("session-mm-file-output");
-        var paths = TestMattermostGatewayDeps.NewTestPaths();
-        var filePath = Path.Combine(paths.BasePath, $"mattermost-upload-{Guid.NewGuid():N}.txt");
+        await using var paths = TestMattermostGatewayDeps.NewTestPaths();
+        var filePath = Path.Join(paths.Paths.BasePath, $"mattermost-upload-{Guid.NewGuid():N}.txt");
         await File.WriteAllTextAsync(filePath, "hello mattermost", ct);
 
         var pipeline = new RecordingSessionPipeline(_ =>
@@ -392,11 +394,12 @@ public sealed class MattermostSessionBindingContractTests(ITestOutputHelper outp
             TimeProvider: TimeProvider.System,
             Options: options,
             DefaultChannelId: null,
+            ChannelRegistry: TestChannelRegistries.MattermostWithProcessingRenderer(_replyClient),
             ReplyClient: _replyClient,
             ContentScanner: new NullContentScanner(),
             AudienceProfiles: TestMattermostGatewayDeps.DefaultAudienceProfiles,
             ModelCapabilities: TestMattermostGatewayDeps.DefaultVisionCapableModel,
-            Paths: TestMattermostGatewayDeps.NewTestPaths(),
+                        StorageResolver: Netclaw.Actors.Protocol.TestSessionStorageResolver.Instance,
             CallbackUrl: options.CallbackUrl,
             PromptInjectionDetector: detector,
             CallbackActionStore: store);

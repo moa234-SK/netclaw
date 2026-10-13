@@ -12,12 +12,25 @@ using Xunit;
 
 namespace Netclaw.Actors.Tests.Tools;
 
-public class ShellToolStreamingTests
+public class ShellToolStreamingTests : IDisposable
 {
+    private readonly DisposableTempDir _temp = new();
+
+    public void Dispose() => _temp.Dispose();
+
     private static readonly ShellExecutionEnvironment ShellEnvironment = TestShellEnvironment.Current;
     private readonly ShellTool _tool = CreateTool();
 
     public static bool IsPosix => !OperatingSystem.IsWindows();
+
+    private ToolExecutionContext CreateExecutionContext()
+    {
+        var sessionDirectory = _temp.Path;
+        return TestToolExecutionContext.CreateBound(
+            "test/shell-stream",
+            sessionDirectory,
+            TrustAudience.Personal);
+    }
 
     private static ShellTool CreateTool(ToolConfig? config = null)
     {
@@ -52,14 +65,14 @@ public class ShellToolStreamingTests
         Assert.DoesNotContain("cmd.exe", completion.Result, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static async Task<(List<ToolActivityUpdate> Activities, ToolCompletedUpdate? Completion)>
+    private async Task<(List<ToolActivityUpdate> Activities, ToolCompletedUpdate? Completion)>
         CollectStreamAsync(ShellTool tool, IDictionary<string, object?> args,
             ToolExecutionContext? context = null, CancellationToken ct = default)
     {
         var activities = new List<ToolActivityUpdate>();
         ToolCompletedUpdate? completion = null;
 
-        await foreach (var update in tool.ExecuteStreamAsync(args, context ?? TestToolExecutionContext.CreateUnbound(), ct))
+        await foreach (var update in tool.ExecuteStreamAsync(args, context ?? CreateExecutionContext(), ct))
         {
             switch (update)
             {
@@ -152,7 +165,7 @@ public class ShellToolStreamingTests
         // stdout/stderr and holds the pipe write end open for its own life
         // span. The streaming path must complete once bash exits.
         var args = ToolInput.Create("Command", "sleep 20 & exit 0");
-        var context = TestToolExecutionContext.CreateBound("test/thread", Path.GetTempPath(), new TestToolExecutionContextOptions
+        var context = TestToolExecutionContext.CreateBound("test/thread", _temp.Path, new TestToolExecutionContextOptions
         {
             Audience = TrustAudience.Personal,
             ExecutionTimeout = new ToolExecutionTimeout(TimeSpan.FromSeconds(90))
@@ -207,7 +220,7 @@ public class ShellToolStreamingTests
         var policy = new ShellCommandPolicy(ShellEnvironment, ["kill"], []);
         var tool = new ShellTool(new ToolConfig(), new ToolPathPolicy(ShellEnvironment, []), policy);
         var command = ShellEnvironment.Grammar == ShellGrammar.PowerShell
-            ? "Stop-Process -Id 1"
+            ? "Stop-Process -Name netclawd"
             : "kill -9 1";
         var args = ToolInput.Create("Command", command);
         var (activities, completion) = await CollectStreamAsync(tool, args, ct: TestContext.Current.CancellationToken);
@@ -222,7 +235,7 @@ public class ShellToolStreamingTests
     {
         var args = ToolInput.Create("Command", TestShellEnvironment.TwoOutputLinesCommand);
 
-        var nonStreaming = await _tool.ExecuteAsync(args, TestToolExecutionContext.CreateUnbound(), TestContext.Current.CancellationToken);
+        var nonStreaming = await _tool.ExecuteAsync(args, CreateExecutionContext(), TestContext.Current.CancellationToken);
         var (_, completion) = await CollectStreamAsync(_tool, args, ct: TestContext.Current.CancellationToken);
 
         Assert.NotNull(completion);

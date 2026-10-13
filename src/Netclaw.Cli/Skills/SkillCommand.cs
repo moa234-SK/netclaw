@@ -27,12 +27,18 @@ internal static class SkillCommand
         string[] args, NetclawPaths paths, DaemonApi? daemonApi = null, TextWriter? output = null)
     {
         var subcommand = args.Length > 1 ? args[1] : "list";
+        var writer = output ?? Console.Out;
 
-        if (subcommand is "help" or "-h" or "--help")
-        {
-            WriteHelp();
-            return Task.FromResult(0);
-        }
+        // The search query is free text, so only its first word can ask for help. Every other
+        // subcommand takes names or paths, which a help flag would otherwise replace. A skill
+        // or source may be called "help", so only the flags count after the subcommand.
+        var helpRequested = subcommand is "help" or "-h" or "--help"
+            || CliArgsParser.HasTrailingHelpToken(
+                subcommand is "search" ? args[..Math.Min(args.Length, 3)] : args,
+                startIndex: 2,
+                includeBareHelp: false);
+        if (helpRequested)
+            return Task.FromResult(WriteHelp(writer));
 
         if (subcommand is "source")
         {
@@ -53,7 +59,10 @@ internal static class SkillCommand
         // because a disk scan would silently drop the MCP prompts (AGENTS.md: no silent
         // fallbacks).
         if (subcommand is "list")
-            return RunListAsync(daemonApi, output ?? Console.Out);
+            return RunListAsync(daemonApi, writer);
+
+        if (subcommand is "sync")
+            return RunSyncAsync(daemonApi, writer);
 
         return Task.FromResult(subcommand switch
         {
@@ -62,7 +71,7 @@ internal static class SkillCommand
             "remove" => RunRemove(args, paths),
             "issues" => RunIssues(paths),
             "search" => RunSearch(args, paths),
-            _ => WriteHelp()
+            _ => WriteHelp(writer)
         });
     }
 
@@ -76,7 +85,7 @@ internal static class SkillCommand
     private static async Task<int> RunListAsync(DaemonApi? daemonApi, TextWriter output)
     {
         string? unavailable;
-        var hint = "Start it with `netclaw daemon start` or `netclaw run`.";
+        var hint = "Start it with `netclaw daemon start`.";
         SkillInventory.Response? inventory = null;
 
         if (daemonApi is null)
@@ -160,6 +169,101 @@ internal static class SkillCommand
         output.WriteLine();
         output.WriteLine($"{skills.Count} skill(s)");
         return 0;
+    }
+
+    private static async Task<int> RunSyncAsync(DaemonApi? daemonApi, TextWriter output)
+    {
+        if (daemonApi is null)
+        {
+            output.WriteLine("Daemon unavailable: the daemon API is not configured.");
+            return 1;
+        }
+
+        try
+        {
+            using var cancellation = new CancellationTokenSource();
+            ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
+            {
+                eventArgs.Cancel = true;
+                cancellation.Cancel();
+            };
+            Console.CancelKeyPress += cancelHandler;
+            SkillSyncResult.Response? result;
+            try
+            {
+                output.WriteLine("Waiting for the daemon's skill sync pass. Press Ctrl+C to stop this wait.");
+                result = await daemonApi.SyncSkillsAsync(cancellation.Token);
+            }
+            finally
+            {
+                Console.CancelKeyPress -= cancelHandler;
+            }
+
+            if (result is null || string.IsNullOrWhiteSpace(result.PassId)
+                || result.Sources is null || result.Inventory is null
+                || result.Sources.Any(static source => string.IsNullOrWhiteSpace(source.Name)
+                    || string.IsNullOrWhiteSpace(source.Sidecar)))
+            {
+                output.WriteLine($"Skill sync failed: the daemon at {daemonApi.Endpoint} returned an unreadable result.");
+                return 1;
+            }
+
+            output.WriteLine($"Skill sync pass {result.PassId}");
+            foreach (var source in result.Sources)
+            {
+                var state = source.FailedCount > 0 || source.RejectedCount > 0 ? "failed" : "ok";
+                output.WriteLine(
+                    $"{source.Name}: {state} changed={source.ChangedCount} unchanged={source.UnchangedCount} rejected={source.RejectedCount} failed={source.FailedCount} sidecar={source.Sidecar}");
+                if (!string.IsNullOrWhiteSpace(source.Error))
+                    output.WriteLine($"  Error: {source.Error}");
+            }
+
+            output.WriteLine(result.Inventory.Succeeded
+                ? $"Inventory: ok accepted={result.Inventory.AcceptedCount} rejected={result.Inventory.RejectedCount}"
+                : "Inventory: failed");
+            if (!string.IsNullOrWhiteSpace(result.Inventory.Error))
+                output.WriteLine($"  Error: {result.Inventory.Error}");
+            return result.Inventory.Succeeded
+                && result.Sources.All(static source => source.FailedCount == 0 && source.RejectedCount == 0)
+                ? 0 : 1;
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            output.WriteLine($"Skill sync unavailable: the daemon at {daemonApi.Endpoint} does not serve /api/skills/sync yet.");
+            output.WriteLine("Restart the daemon so it matches this CLI version.");
+            return 1;
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.ServiceUnavailable)
+        {
+            output.WriteLine($"Skill sync unavailable: the daemon at {daemonApi.Endpoint} cannot run the pass now (HTTP 503).");
+            output.WriteLine("Check the daemon status and retry after it starts.");
+            return 1;
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode is not null)
+        {
+            output.WriteLine($"Skill sync failed: the daemon at {daemonApi.Endpoint} returned HTTP {(int)ex.StatusCode}.");
+            return 1;
+        }
+        catch (HttpRequestException ex)
+        {
+            output.WriteLine($"Skill sync unavailable: could not reach the daemon at {daemonApi.Endpoint} ({ex.Message}).");
+            return 1;
+        }
+        catch (OperationCanceledException)
+        {
+            output.WriteLine("Skill sync wait canceled. The daemon can still complete the shared pass.");
+            return 1;
+        }
+        catch (JsonException)
+        {
+            output.WriteLine($"Skill sync failed: the daemon at {daemonApi.Endpoint} returned an unreadable result.");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            output.WriteLine($"Skill sync failed: {ex.Message}");
+            return 1;
+        }
     }
 
     // ── Subcommand implementations ──
@@ -628,26 +732,27 @@ internal static class SkillCommand
         return "external";
     }
 
-    private static int WriteHelp()
+    private static int WriteHelp(TextWriter writer)
     {
-        Console.WriteLine("Usage: netclaw skill <subcommand>");
-        Console.WriteLine();
-        Console.WriteLine("Subcommands:");
-        Console.WriteLine("  list                                          List all discovered skills (default)");
-        Console.WriteLine("  show <name>                                   Show skill details and content");
-        Console.WriteLine("  validate <path>                               Validate a SKILL.md file's frontmatter");
-        Console.WriteLine("  remove <name>                                 Remove a native skill");
-        Console.WriteLine("  issues                                        Show only scanner issues");
-        Console.WriteLine("  search <query>                                Search skills by name or description");
-        Console.WriteLine("  source list                                   List configured external sources");
-        Console.WriteLine("  source add <name> --path <dir>                Add a custom external source");
-        Console.WriteLine("  source add <name> --well-known <alias>        Add a well-known source (claude-code, open-code)");
-        Console.WriteLine("  source remove <name>                          Remove an external source");
-        Console.WriteLine("  source enable <name>                          Enable an external source");
-        Console.WriteLine("  source disable <name>                         Disable an external source");
-        Console.WriteLine();
-        Console.WriteLine("`list` needs the running daemon (it includes live MCP prompt skills);");
-        Console.WriteLine("every other subcommand is offline — no daemon required.");
+        writer.WriteLine("Usage: netclaw skill <subcommand>");
+        writer.WriteLine();
+        writer.WriteLine("Subcommands:");
+        writer.WriteLine("  list                                          List all discovered skills (default)");
+        writer.WriteLine("  sync                                          Sync configured external skill sources");
+        writer.WriteLine("  show <name>                                   Show skill details and content");
+        writer.WriteLine("  validate <path>                               Validate a SKILL.md file's frontmatter");
+        writer.WriteLine("  remove <name>                                 Remove a native skill");
+        writer.WriteLine("  issues                                        Show only scanner issues");
+        writer.WriteLine("  search <query>                                Search skills by name or description");
+        writer.WriteLine("  source list                                   List configured external sources");
+        writer.WriteLine("  source add <name> --path <dir>                Add a custom external source");
+        writer.WriteLine("  source add <name> --well-known <alias>        Add a well-known source (claude-code, open-code)");
+        writer.WriteLine("  source remove <name>                          Remove an external source");
+        writer.WriteLine("  source enable <name>                          Enable an external source");
+        writer.WriteLine("  source disable <name>                         Disable an external source");
+        writer.WriteLine();
+        writer.WriteLine("`list` and `sync` need the running daemon (list includes live MCP prompt skills);");
+        writer.WriteLine("every other subcommand is offline — no daemon required.");
         return 0;
     }
 

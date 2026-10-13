@@ -9,6 +9,7 @@ using Akka.Pattern;
 using Microsoft.Extensions.Logging;
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Hosting;
+using Netclaw.Actors.Protocol;
 using Netclaw.Configuration;
 using Netclaw.Security;
 
@@ -19,6 +20,7 @@ public sealed class MattermostChannel : IChannel
     private readonly ActorSystem _system;
     private readonly ISessionPipeline _pipeline;
     private readonly SessionIngressGate _ingressGate;
+    private readonly IChannelRegistry _channelRegistry;
     private readonly IMattermostGatewayClient _gatewayClient;
     private readonly IMattermostReplyClient _replyClient;
     private readonly IContentScanner _contentScanner;
@@ -31,7 +33,7 @@ public sealed class MattermostChannel : IChannel
     private readonly ILogger<MattermostChannel> _logger;
     private readonly ToolAudienceProfiles _audienceProfiles;
     private readonly ModelCapabilities _modelCapabilities;
-    private readonly NetclawPaths _paths;
+    private readonly ISessionStorageResolver _storageResolver;
     private readonly MattermostCallbackActionStore? _callbackActionStore;
 
     private readonly object _connectionSetupLock = new();
@@ -50,6 +52,7 @@ public sealed class MattermostChannel : IChannel
         ActorSystem system,
         ISessionPipeline pipeline,
         SessionIngressGate ingressGate,
+        IChannelRegistry channelRegistry,
         IMattermostGatewayClient gatewayClient,
         IMattermostReplyClient replyClient,
         IContentScanner contentScanner,
@@ -62,12 +65,13 @@ public sealed class MattermostChannel : IChannel
         ILogger<MattermostChannel> logger,
         ToolConfig toolConfig,
         ModelCapabilities modelCapabilities,
-        NetclawPaths paths,
+        ISessionStorageResolver storageResolver,
         MattermostCallbackActionStore? callbackActionStore = null)
     {
         _system = system;
         _pipeline = pipeline;
         _ingressGate = ingressGate;
+        _channelRegistry = channelRegistry;
         _gatewayClient = gatewayClient;
         _replyClient = replyClient;
         _contentScanner = contentScanner;
@@ -81,7 +85,7 @@ public sealed class MattermostChannel : IChannel
         _logger = logger;
         _audienceProfiles = toolConfig.AudienceProfiles;
         _modelCapabilities = modelCapabilities;
-        _paths = paths;
+        _storageResolver = storageResolver;
         _callbackActionStore = callbackActionStore;
 
         _gatewayClient.CleanReconnectRequired += HandleCleanReconnectRequiredAsync;
@@ -193,11 +197,12 @@ public sealed class MattermostChannel : IChannel
                 TimeProvider: _timeProvider,
                 Options: _options,
                 DefaultChannelId: DefaultChannelId,
+                ChannelRegistry: _channelRegistry,
                 ReplyClient: _replyClient,
                 ContentScanner: _contentScanner,
                 AudienceProfiles: _audienceProfiles,
                 ModelCapabilities: _modelCapabilities,
-                Paths: _paths,
+                StorageResolver: _storageResolver,
                 ServerUrl: serverUrl,
                 CallbackUrl: _options.CallbackUrl,
                 BotUserId: botUserId,

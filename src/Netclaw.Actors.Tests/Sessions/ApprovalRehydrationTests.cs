@@ -68,6 +68,229 @@ public sealed class ApprovalRehydrationTests : LlmSessionTestBase
         services.AddSingleton(registry);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Restart_drain_stops_durable_approval_wait_and_cold_response_resumes_original_turn(bool useTextResponse)
+    {
+        const string callId = "call-shell-restart-drain";
+        _toolExecutor.GatedTools.Add("shell_execute");
+        _fakeChatClient.ToolCallsOnFirstCall =
+        [
+            new FunctionCallContent(callId, "shell_execute",
+                new Dictionary<string, object?> { ["command"] = "git status" })
+        ];
+
+        var sessionId = new SessionId("test-channel/restart-drain-pending-approval");
+        var sessionManager = ActorRegistry.Get<SessionManagerActorKey>();
+        var subscriber = CreateTestProbe("restart-drain-pending-sub");
+
+        await sessionManager.Ask<SessionJoined>(new JoinSession(subscriber)
+        {
+            SessionId = sessionId,
+            Filter = OutputFilter.Full
+        }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
+
+        await sessionManager.Ask<CommandAck>(new SendUserMessage
+        {
+            SessionId = sessionId,
+            Content = "Run git status",
+            Source = RequesterSource("U-requester")
+        }, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        await subscriber.ExpectMsgAsync<ToolCallOutput>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        await subscriber.ExpectMsgAsync<ToolInteractionRequest>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(0, _toolExecutor.SuccessfulExecutions);
+
+        var escapedId = Uri.EscapeDataString(sessionId.Value);
+        var child = await Sys.ActorSelection($"/user/session-manager/{escapedId}")
+            .ResolveOne(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Watch(child);
+
+        var ack = await sessionManager.Ask<CommandAck>(
+            new PrepareForDaemonRestart(sessionId, "config-reload"),
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Equal(sessionId, ack.SessionId);
+        await ExpectTerminatedAsync(child, TimeSpan.FromSeconds(5),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        var recoveredSubscriber = CreateTestProbe("restart-drain-recovered-sub");
+        await sessionManager.Ask<SessionJoined>(new JoinSession(recoveredSubscriber)
+        {
+            SessionId = sessionId,
+            Filter = OutputFilter.Full
+        }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await recoveredSubscriber.ExpectMsgAsync<SessionJoined>(
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        var buttonResponse = new ToolInteractionResponse
+        {
+            SessionId = sessionId,
+            CallId = new Netclaw.Tools.ToolCallId(callId),
+            SelectedKey = new ApprovalOptionKey(ApprovalOptionKeys.ApproveOnce),
+            SenderId = new SenderId("U-requester")
+        };
+        IWithSessionId response = useTextResponse
+            ? new ToolInteractionTextResponse
+            {
+                SessionId = sessionId,
+                Text = "A",
+                SenderId = new SenderId("U-requester")
+            }
+            : buttonResponse;
+        var accepted = await sessionManager.Ask<ISessionResponse>(
+            response, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.IsType<CommandAck>(accepted);
+
+        await recoveredSubscriber.ExpectMsgAsync<ToolResultOutput>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        await recoveredSubscriber.ExpectMsgAsync<TextOutput>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        var completed = await recoveredSubscriber.ExpectMsgAsync<TurnCompleted>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(TurnOutcome.Completed, completed.Outcome);
+        Assert.Equal(1, _toolExecutor.SuccessfulExecutions);
+        Assert.Equal(TrustAudience.Team, _toolExecutor.LastExecutionAudience);
+
+        var duplicate = await sessionManager.Ask<ISessionResponse>(
+            buttonResponse, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.IsType<CommandNack>(duplicate);
+        Assert.Equal(1, _toolExecutor.SuccessfulExecutions);
+    }
+
+    [Fact]
+    public async Task Restart_drain_waits_for_active_sibling_then_preserves_its_result()
+    {
+        const string shellCallId = "call-shell-restart-sibling";
+        _toolExecutor.GatedTools.Add("shell_execute");
+        _toolExecutor.BlockNextSuccessfulExecution("read_file");
+        _fakeChatClient.ToolCallsOnFirstCall =
+        [
+            new FunctionCallContent(shellCallId, "shell_execute",
+                new Dictionary<string, object?> { ["command"] = "git status" }),
+            new FunctionCallContent("call-read-restart-sibling", "read_file",
+                new Dictionary<string, object?> { ["path"] = "README.md" })
+        ];
+
+        var sessionId = new SessionId("test-channel/restart-drain-active-sibling");
+        var sessionManager = ActorRegistry.Get<SessionManagerActorKey>();
+        var subscriber = CreateTestProbe("restart-drain-sibling-sub");
+        await sessionManager.Ask<SessionJoined>(new JoinSession(subscriber)
+        {
+            SessionId = sessionId,
+            Filter = OutputFilter.Full
+        }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
+
+        await sessionManager.Ask<CommandAck>(new SendUserMessage
+        {
+            SessionId = sessionId,
+            Content = "Read the file and run git status",
+            Source = RequesterSource("U-requester")
+        }, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        await subscriber.ExpectMsgAsync<ToolCallOutput>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        await subscriber.ExpectMsgAsync<ToolCallOutput>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        await subscriber.ExpectMsgAsync<ToolInteractionRequest>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        await _toolExecutor.BlockedExecutionStarted.Task.WaitAsync(
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        var escapedId = Uri.EscapeDataString(sessionId.Value);
+        var child = await Sys.ActorSelection($"/user/session-manager/{escapedId}")
+            .ResolveOne(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Watch(child);
+        var drainProbe = CreateTestProbe("restart-drain-sibling-ack");
+        child.Tell(new PrepareForDaemonRestart(sessionId, "config-reload"), drainProbe.Ref);
+        await drainProbe.ExpectNoMsgAsync(TimeSpan.FromMilliseconds(250),
+            TestContext.Current.CancellationToken);
+
+        _toolExecutor.ReleaseBlockedExecution();
+        await subscriber.ExpectMsgAsync<ToolResultOutput>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        await drainProbe.ExpectMsgAsync<CommandAck>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        await ExpectTerminatedAsync(child, TimeSpan.FromSeconds(5),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        var recoveredSubscriber = CreateTestProbe("restart-drain-sibling-recovered-sub");
+        await sessionManager.Ask<SessionJoined>(new JoinSession(recoveredSubscriber)
+        {
+            SessionId = sessionId,
+            Filter = OutputFilter.Full
+        }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await recoveredSubscriber.ExpectMsgAsync<SessionJoined>(
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        sessionManager.Tell(new ToolInteractionResponse
+        {
+            SessionId = sessionId,
+            CallId = new Netclaw.Tools.ToolCallId(shellCallId),
+            SelectedKey = new ApprovalOptionKey(ApprovalOptionKeys.ApproveOnce),
+            SenderId = new SenderId("U-requester")
+        }, ActorRefs.Nobody);
+
+        await recoveredSubscriber.FishForMessageAsync<TurnCompleted>(
+            _ => true, TimeSpan.FromSeconds(5),
+            cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(1, _toolExecutor.ExecutionsFor("read_file"));
+        Assert.Equal(1, _toolExecutor.ExecutionsFor("shell_execute"));
+    }
+
+    [Fact]
+    public async Task Restart_drain_keeps_the_bounded_path_when_user_input_is_buffered()
+    {
+        _toolExecutor.GatedTools.Add("shell_execute");
+        _fakeChatClient.ToolCallsOnFirstCall =
+        [
+            new FunctionCallContent("call-shell-buffered-input", "shell_execute",
+                new Dictionary<string, object?> { ["command"] = "git status" })
+        ];
+
+        var sessionId = new SessionId("test-channel/restart-drain-buffered-input");
+        var sessionManager = ActorRegistry.Get<SessionManagerActorKey>();
+        var subscriber = CreateTestProbe("restart-drain-buffered-sub");
+        await sessionManager.Ask<SessionJoined>(new JoinSession(subscriber)
+        {
+            SessionId = sessionId,
+            Filter = OutputFilter.Full
+        }, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        await subscriber.ExpectMsgAsync<SessionJoined>(cancellationToken: TestContext.Current.CancellationToken);
+
+        await sessionManager.Ask<CommandAck>(new SendUserMessage
+        {
+            SessionId = sessionId,
+            Content = "Run git status",
+            Source = RequesterSource("U-requester")
+        }, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        await subscriber.ExpectMsgAsync<ToolCallOutput>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        await subscriber.ExpectMsgAsync<ToolInteractionRequest>(
+            TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+
+        await sessionManager.Ask<CommandAck>(new SendUserMessage
+        {
+            SessionId = sessionId,
+            Content = "Also check the branch",
+            Source = RequesterSource("U-requester")
+        }, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        var escapedId = Uri.EscapeDataString(sessionId.Value);
+        var child = await Sys.ActorSelection($"/user/session-manager/{escapedId}")
+            .ResolveOne(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        var drainProbe = CreateTestProbe("restart-drain-buffered-ack");
+        child.Tell(new PrepareForDaemonRestart(sessionId, "config-reload"), drainProbe.Ref);
+
+        await drainProbe.ExpectNoMsgAsync(TimeSpan.FromMilliseconds(250),
+            TestContext.Current.CancellationToken);
+        Assert.Equal(0, _toolExecutor.SuccessfulExecutions);
+    }
+
     [Fact]
     public async Task Passivated_session_resumes_tool_batch_when_approval_arrives()
     {
@@ -1392,12 +1615,12 @@ public sealed class ApprovalRehydrationTests : LlmSessionTestBase
     }
 
     [Fact]
-    public async Task Cold_recovered_denied_scratch_retry_preserves_session_directory_hint()
+    public async Task Cold_recovered_denied_managed_temporary_retry_preserves_directory_hint()
     {
-        const string callId = "call-shell-scratch-denied";
-        const string scratchDirectory = "/home/user/.netclaw/sessions/example";
+        const string callId = "call-shell-managed-temporary-denied";
+        const string managedTemporaryDirectory = "/home/user/.netclaw/sessions/example";
         _toolExecutor.GatedTools.Add("shell_execute");
-        _toolExecutor.SessionScratchRetryTools["shell_execute"] = scratchDirectory;
+        _toolExecutor.ManagedTemporaryRetryTools["shell_execute"] = managedTemporaryDirectory;
 
         _fakeChatClient.ToolCallsOnFirstCall =
         [
@@ -1405,9 +1628,9 @@ public sealed class ApprovalRehydrationTests : LlmSessionTestBase
                 new Dictionary<string, object?> { ["command"] = "git status" })
         ];
 
-        var sessionId = new SessionId("test-channel/scratch-denied-redrive");
+        var sessionId = new SessionId("test-channel/managed-temporary-denied-redrive");
         var sessionManager = ActorRegistry.Get<SessionManagerActorKey>();
-        var subscriber = CreateTestProbe("scratch-denied-redrive-sub");
+        var subscriber = CreateTestProbe("managed-temporary-denied-redrive-sub");
 
         await sessionManager.Ask<SessionJoined>(new JoinSession(subscriber)
         {
@@ -1430,7 +1653,7 @@ public sealed class ApprovalRehydrationTests : LlmSessionTestBase
 
         await ColdRespawnAsync(sessionId);
 
-        var subscriberB = CreateTestProbe("scratch-denied-redrive-sub-b");
+        var subscriberB = CreateTestProbe("managed-temporary-denied-redrive-sub-b");
         await sessionManager.Ask<SessionJoined>(new JoinSession(subscriberB)
         {
             SessionId = sessionId,
@@ -1454,7 +1677,7 @@ public sealed class ApprovalRehydrationTests : LlmSessionTestBase
             TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Contains("approval_denied_by_user", toolResult.Result, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains(scratchDirectory, toolResult.Result, StringComparison.Ordinal);
+        Assert.Contains(managedTemporaryDirectory, toolResult.Result, StringComparison.Ordinal);
         Assert.DoesNotContain("set_working_directory", toolResult.Result, StringComparison.Ordinal);
         Assert.Equal(0, _toolExecutor.SuccessfulExecutions);
     }
@@ -1711,7 +1934,8 @@ internal sealed class ApprovalGateToolExecutor : IToolExecutor
     public int SuccessfulExecutions => _successfulExecutions;
 
     public System.Collections.Concurrent.ConcurrentQueue<Netclaw.Tools.AuthorizationAttemptId>
-        AuthorizationAttempts { get; } = new();
+        AuthorizationAttempts
+    { get; } = new();
 
     public TaskCompletionSource<object?> BlockedExecutionStarted { get; private set; } =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1719,7 +1943,7 @@ internal sealed class ApprovalGateToolExecutor : IToolExecutor
     /// <summary>Tool names that require interactive approval before execution.</summary>
     public HashSet<string> GatedTools { get; } = [];
 
-    public Dictionary<string, string> SessionScratchRetryTools { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> ManagedTemporaryRetryTools { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Audience on the execution context of the most recent successful
@@ -1776,12 +2000,12 @@ internal sealed class ApprovalGateToolExecutor : IToolExecutor
                     Cwd: null,
                     IsMessy: false,
                     Candidates: [new Netclaw.Security.ApprovalCandidate(toolCall.Name, Directory: null)]);
-                if (SessionScratchRetryTools.TryGetValue(toolCall.Name, out var scratchDirectory))
+                if (ManagedTemporaryRetryTools.TryGetValue(toolCall.Name, out var managedTemporaryDirectory))
                 {
                     approvalContext = approvalContext with
                     {
-                        IsSessionScratchRetry = true,
-                        SessionScratchDirectory = scratchDirectory
+                        IsManagedTemporaryRetry = true,
+                        ManagedTemporaryDirectory = managedTemporaryDirectory
                     };
                 }
 

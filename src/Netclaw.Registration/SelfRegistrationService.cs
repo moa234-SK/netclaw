@@ -13,7 +13,7 @@ namespace Netclaw.Registration;
 
 /// <summary>
 /// Mints device pairing codes for the auto-pairing registration flow.
-/// Implemented by the daemon over its <c>PairingCodeService</c>; the seam
+/// Implemented by the daemon over its pairing actor; the seam
 /// keeps this library free of a reference to the daemon executable,
 /// mirroring <see cref="IStatusSnapshotProvider"/>.
 /// </summary>
@@ -23,7 +23,7 @@ public interface IRegistrationPairingProvider
     /// Mints a single-use pairing code (<c>XXXX-XXXX</c>) that replaces any
     /// previously pending code. Call only when auto-pairing is active.
     /// </summary>
-    string MintPairingCode();
+    Task<string> MintPairingCodeAsync(CancellationToken cancellationToken);
 }
 
 /// <summary>
@@ -91,7 +91,9 @@ public sealed class SelfRegistrationService : BackgroundService
     {
         var status = await _statusProvider.GetStatusAsync(cancellationToken);
         _lastProjection = BuildProjection(status);
-        var pairingCode = AutoPairActive() ? _pairingProvider.MintPairingCode() : null;
+        var pairingCode = AutoPairActive()
+            ? await _pairingProvider.MintPairingCodeAsync(cancellationToken)
+            : null;
         await PostEnvelopeAsync(status, pairingCode, cancellationToken);
     }
 

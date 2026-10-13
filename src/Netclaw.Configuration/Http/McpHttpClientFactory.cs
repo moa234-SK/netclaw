@@ -4,6 +4,7 @@
 // </copyright>
 // -----------------------------------------------------------------------
 using System.Net;
+using System.Net.Http.Headers;
 
 namespace Netclaw.Configuration.Http;
 
@@ -17,18 +18,29 @@ internal static class McpHttpClientFactory
     internal const string InitializeMethod = "initialize";
 
     /// <summary>
-    /// Gets the client shared by every MCP HTTP transport in this process.
-    /// The process owns its lifetime so one short-lived transport cannot close
-    /// the connection pool while another transport is using it.
+    /// Gets the socket handler that backs every MCP HTTP client in this process. The
+    /// process owns its lifetime, so no transport can close the connection pool.
     /// </summary>
-    public static HttpClient Shared { get; } = Create(new SocketsHttpHandler
+    internal static HttpMessageHandler SharedPrimaryHandler { get; } = new SocketsHttpHandler
     {
         // MCP profiles share this connection pool. Ambient cookies could cross
         // profile boundaries on the same host; authentication stays explicit.
         UseCookies = false,
-    });
+    };
 
-    internal static HttpClient Create(HttpMessageHandler innerHandler)
+    /// <summary>
+    /// Gets the client shared by every MCP HTTP transport in this process.
+    /// The process owns its lifetime so one short-lived transport cannot close
+    /// the connection pool while another transport is using it.
+    /// </summary>
+    public static HttpClient Shared { get; } = Create(SharedPrimaryHandler, disposeHandler: false);
+
+    /// <summary>
+    /// Builds an MCP client over <paramref name="innerHandler"/>. Pass
+    /// <paramref name="disposeHandler"/> as <c>false</c> when the inner chain ends in a
+    /// handler that other clients share.
+    /// </summary>
+    internal static HttpClient Create(HttpMessageHandler innerHandler, bool disposeHandler)
     {
         ArgumentNullException.ThrowIfNull(innerHandler);
 
@@ -40,7 +52,7 @@ internal static class McpHttpClientFactory
             {
                 InnerHandler = innerHandler,
             },
-        });
+        }, disposeHandler);
     }
 
     /// <summary>
@@ -103,6 +115,12 @@ internal sealed class OAuthClientRejectionHandler : DelegatingHandler
         {
             return await base.SendAsync(request, cancellationToken);
         }
+
+        // MCP SDK 2.2.0 parses successful token responses as JSON. GitHub returns
+        // form data unless the request asks for JSON.
+        if (!request.Headers.Accept.Any(
+                value => string.Equals(value.MediaType, "application/json", StringComparison.OrdinalIgnoreCase)))
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         var requestBody = await request.Content.ReadAsStringAsync(cancellationToken);
         var response = await base.SendAsync(request, cancellationToken);

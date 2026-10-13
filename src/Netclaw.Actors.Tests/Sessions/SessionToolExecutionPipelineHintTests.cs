@@ -3,6 +3,7 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
+using Netclaw.Actors.Authorization.Consent;
 using Netclaw.Actors.Sessions;
 using Netclaw.Actors.Sessions.Pipelines;
 using Netclaw.Actors.Tools;
@@ -27,7 +28,7 @@ public sealed class SessionToolExecutionPipelineHintTests
     {
         var hint = SessionToolExecutionPipeline.BuildSetWorkingDirectoryHint(
             toolName: ShellTool,
-            decision: ApprovalDecision.Denied,
+            refusal: RefusalKind.Denied,
             cwd: "/home/user/repos/bar",
             sessionDirectory: "/home/user/.netclaw/sessions/abc",
             projectDirectory: null,
@@ -42,7 +43,7 @@ public sealed class SessionToolExecutionPipelineHintTests
     {
         var hint = SessionToolExecutionPipeline.BuildSetWorkingDirectoryHint(
             toolName: ShellTool,
-            decision: ApprovalDecision.Denied,
+            refusal: RefusalKind.Denied,
             cwd: "/home/user/repos/bar",
             sessionDirectory: "/home/user/.netclaw/sessions/abc",
             projectDirectory: null,
@@ -56,7 +57,7 @@ public sealed class SessionToolExecutionPipelineHintTests
     {
         var hint = SessionToolExecutionPipeline.BuildSetWorkingDirectoryHint(
             toolName: ShellTool,
-            decision: ApprovalDecision.TimedOut,
+            refusal: RefusalKind.TimedOut,
             cwd: "/home/user/repos/bar",
             sessionDirectory: "/home/user/.netclaw/sessions/abc",
             projectDirectory: null,
@@ -70,7 +71,7 @@ public sealed class SessionToolExecutionPipelineHintTests
     {
         var hint = SessionToolExecutionPipeline.BuildSetWorkingDirectoryHint(
             toolName: "file_write",
-            decision: ApprovalDecision.Denied,
+            refusal: RefusalKind.Denied,
             cwd: "/home/user/repos/bar",
             sessionDirectory: "/home/user/.netclaw/sessions/abc",
             projectDirectory: null,
@@ -84,7 +85,7 @@ public sealed class SessionToolExecutionPipelineHintTests
     {
         var hint = SessionToolExecutionPipeline.BuildSetWorkingDirectoryHint(
             toolName: ShellTool,
-            decision: ApprovalDecision.Denied,
+            refusal: RefusalKind.Denied,
             cwd: "/home/user/.netclaw/sessions/abc/sub",
             sessionDirectory: "/home/user/.netclaw/sessions/abc",
             projectDirectory: null,
@@ -98,7 +99,7 @@ public sealed class SessionToolExecutionPipelineHintTests
     {
         var hint = SessionToolExecutionPipeline.BuildSetWorkingDirectoryHint(
             toolName: ShellTool,
-            decision: ApprovalDecision.Denied,
+            refusal: RefusalKind.Denied,
             cwd: "/home/user/repos/foo/sub",
             sessionDirectory: "/home/user/.netclaw/sessions/abc",
             projectDirectory: "/home/user/repos/foo",
@@ -112,7 +113,7 @@ public sealed class SessionToolExecutionPipelineHintTests
     {
         var hint = SessionToolExecutionPipeline.BuildSetWorkingDirectoryHint(
             toolName: ShellTool,
-            decision: ApprovalDecision.Denied,
+            refusal: RefusalKind.Denied,
             cwd: null,
             sessionDirectory: "/home/user/.netclaw/sessions/abc",
             projectDirectory: null,
@@ -122,7 +123,7 @@ public sealed class SessionToolExecutionPipelineHintTests
     }
 
     [Fact]
-    public void Denied_platform_temp_retry_recommends_session_scratch()
+    public void Denied_managed_temp_retry_recommends_managed_temp_directory()
     {
         var context = new ToolApprovalContext(
             ToolName: ShellTool,
@@ -131,21 +132,21 @@ public sealed class SessionToolExecutionPipelineHintTests
             CandidateVerbs: ["diagnostic-command"],
             Options: [])
         {
-            IsSessionScratchRetry = true,
-            SessionScratchDirectory = "/home/user/.netclaw/sessions/abc",
+            IsManagedTemporaryRetry = true,
+            ManagedTemporaryDirectory = "/home/user/.netclaw/sessions/abc",
             PlatformTemporaryRoot = "/tmp"
         };
 
         var hint = SessionToolExecutionPipeline.BuildSetWorkingDirectoryHint(
             toolName: ShellTool,
-            decision: ApprovalDecision.Denied,
+            refusal: RefusalKind.Denied,
             cwd: "/tmp",
             sessionDirectory: "/home/user/.netclaw/sessions/abc",
             projectDirectory: null,
             setWorkingDirectoryAvailable: true,
             approvalContext: context);
 
-        Assert.Contains("private session scratch", hint);
+        Assert.Contains("managed temporary directory", hint);
         Assert.Contains("/home/user/.netclaw/sessions/abc", hint);
         Assert.DoesNotContain("set_working_directory", hint);
     }
@@ -160,7 +161,7 @@ public sealed class SessionToolExecutionPipelineHintTests
 
         var hint = SessionToolExecutionPipeline.BuildSetWorkingDirectoryHint(
             toolName: ShellTool,
-            decision: ApprovalDecision.Denied,
+            refusal: RefusalKind.Denied,
             cwd: "/outside/project",
             sessionDirectory: "/home/user/.netclaw/sessions/abc",
             projectDirectory: null,
@@ -171,46 +172,4 @@ public sealed class SessionToolExecutionPipelineHintTests
         Assert.Empty(hint);
     }
 
-    [Fact]
-    public void Project_scope_correction_reports_only_the_failure_reason()
-    {
-        var context = new ToolApprovalContext(
-            ToolName: ShellTool,
-            DisplayText: "head -40 src/file.cs",
-            Patterns: ["head"],
-            CandidateVerbs: ["head"],
-            Options: [])
-        {
-            SuggestedProjectDirectory = "/home/user/repos/project"
-        };
-
-        var correction = SessionToolExecutionPipeline.BuildProjectScopeDeclarationCorrection(
-            context,
-            setWorkingDirectoryAvailable: true);
-
-        Assert.Contains("working_directory_not_declared", correction);
-        Assert.DoesNotContain("set_working_directory", correction);
-        Assert.Contains("Project directory: '/home/user/repos/project'", correction);
-        Assert.DoesNotContain("Next action", correction);
-    }
-
-    [Fact]
-    public void Project_scope_correction_is_suppressed_when_tool_is_unavailable()
-    {
-        var context = new ToolApprovalContext(
-            ToolName: ShellTool,
-            DisplayText: "head -40 src/file.cs",
-            Patterns: ["head"],
-            CandidateVerbs: ["head"],
-            Options: [])
-        {
-            SuggestedProjectDirectory = "/home/user/repos/project"
-        };
-
-        var correction = SessionToolExecutionPipeline.BuildProjectScopeDeclarationCorrection(
-            context,
-            setWorkingDirectoryAvailable: false);
-
-        Assert.Empty(correction);
-    }
 }

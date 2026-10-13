@@ -55,7 +55,7 @@ public sealed class DiscordSessionBindingContractTests(ITestOutputHelper output)
             ContentScanner: new NullContentScanner(),
             AudienceProfiles: TestDiscordGatewayDeps.DefaultAudienceProfiles,
             ModelCapabilities: TestDiscordGatewayDeps.DefaultVisionCapableModel,
-            Paths: TestDiscordGatewayDeps.NewTestPaths(),
+                        StorageResolver: Netclaw.Actors.Protocol.TestSessionStorageResolver.Instance,
             PromptInjectionDetector: detector);
 
         return Sys.ActorOf(DiscordSessionBindingActor.CreateProps(
@@ -196,7 +196,7 @@ public sealed class DiscordSessionBindingContractTests(ITestOutputHelper output)
             ContentScanner: new NullContentScanner(),
             AudienceProfiles: TestDiscordGatewayDeps.DefaultAudienceProfiles,
             ModelCapabilities: TestDiscordGatewayDeps.DefaultVisionCapableModel,
-            Paths: TestDiscordGatewayDeps.NewTestPaths(),
+                        StorageResolver: Netclaw.Actors.Protocol.TestSessionStorageResolver.Instance,
             PromptInjectionDetector: detector,
             ThreadHistoryFetcher: historyFetcher);
 
@@ -214,8 +214,8 @@ public sealed class DiscordSessionBindingContractTests(ITestOutputHelper output)
     {
         var ct = TestContext.Current.CancellationToken;
         var sid = new SessionId("session-discord-file-output");
-        var paths = TestDiscordGatewayDeps.NewTestPaths();
-        var filePath = Path.Combine(paths.BasePath, $"discord-upload-{Guid.NewGuid():N}.txt");
+        await using var paths = TestDiscordGatewayDeps.NewTestPaths();
+        var filePath = Path.Join(paths.Paths.BasePath, $"discord-upload-{Guid.NewGuid():N}.txt");
         await File.WriteAllTextAsync(filePath, "hello discord", ct);
 
         var pipeline = new RecordingSessionPipeline(_ =>

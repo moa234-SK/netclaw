@@ -15,7 +15,7 @@ internal static class ToolRemediationPresenter
         ToolInvocationReceipt? receipt,
         bool setWorkingDirectoryAvailable)
     {
-        if (receipt?.RemediationCode is not { } remediationCode)
+        if (receipt is not ToolInvocationReceipt.Correction { RemediationCode: var remediationCode })
             return message;
 
         var action = remediationCode switch
@@ -23,12 +23,22 @@ internal static class ToolRemediationPresenter
             ToolRemediationCode.SetWorkingDirectory when setWorkingDirectoryAvailable =>
                 "Next action: call set_working_directory with an allowed project directory for this task, then retry the failed tool call.",
             ToolRemediationCode.SetWorkingDirectory => null,
-            ToolRemediationCode.UseSessionScratch =>
-                "Next action: use the session scratch directory from this result for disposable files, or retry unchanged for exact platform paths.",
+            ToolRemediationCode.UseShellWorkingDirectory =>
+                "Next action: remove the leading directory change and use the suggested WorkingDirectory for child-directory work. " +
+                "If the task needs shell directory behavior, keep the command and set WorkingDirectory to the current project directory. " +
+                "The new call passes normal policy.",
+            ToolRemediationCode.UseManagedTemporaryDirectory =>
+                "Next action: use the managed temporary directory from this result for disposable files, or retry unchanged for exact platform paths.",
             ToolRemediationCode.ProvideUniqueOldString =>
                 "Next action: retry file_edit with a unique OldString, or set ReplaceAll=true when every match should change.",
             ToolRemediationCode.UseNativeTool =>
                 "Next action: call the native Netclaw tool named in this result directly instead of shell_execute.",
+            ToolRemediationCode.RewriteShellCommandWords =>
+                "Next action: rewrite the command as this result says and call shell_execute again. The new call passes normal approval.",
+            ToolRemediationCode.ShortenShellCommand =>
+                "Next action: call shell_execute again with the shorter command. The new call passes normal approval.",
+            ToolRemediationCode.BreakToolCycle =>
+                "Next action: choose a different action, load a missing tool, or finish the task.",
             _ => throw new InvalidOperationException("Unsupported tool remediation code.")
         };
 

@@ -54,7 +54,7 @@ SMOKE_LOG_DIR="${SMOKE_LOG_DIR:-${ROOT_DIR}/smoke-logs}"
 
 # Cheapest harness checks first so a harness-level break fails fast
 # before paying for the wizard + probe tapes.
-LIGHT_TAPES=(help init-wizard init-existing init-redo-identity provider-add provider-rename config-search config-exposure config-posture config-features config-audience config-channels config-mention-thread config-surfaces config-ops-surfaces config-workspaces-picker config-skill-picker config-back-nav tui-cleanup mcp-permissions mcp-permissions-save approvals model-manager sessions-tui)
+LIGHT_TAPES=(help init-wizard init-wizard-authenticated init-existing init-redo-identity init-redo-chat chat-admission-quit provider-add provider-rename config-search config-exposure config-posture config-features config-audience config-channels config-mention-thread config-surfaces config-ops-surfaces config-workspaces-picker config-skill-picker config-retention config-back-nav tui-cleanup mcp-permissions mcp-permissions-save approvals model-manager sessions-tui reminder-run)
 FULL_TAPES=("${LIGHT_TAPES[@]}")
 
 LIGHT_SCENARIOS=(
@@ -66,6 +66,7 @@ LIGHT_SCENARIOS=(
   reminders
   pairing
   mcp-setup
+  skill-sync
   webhook-routes
 )
 FULL_SCENARIOS=("${LIGHT_SCENARIOS[@]}")
@@ -279,9 +280,11 @@ if [[ ! -x "$NETCLAW_SMOKE_LLM_SERVER" ]]; then
 fi
 
 SMOKE_LLM_MODEL="${SMOKE_LLM_MODEL:-netclaw-smoke-tool-model}"
+SMOKE_LLM_PROTECTED_API_KEY="${SMOKE_LLM_PROTECTED_API_KEY:-netclaw-smoke-protected-api-key}"
 SMOKE_LLM_LOG="${RUN_ROOT}/smoke-llm.log"
 SMOKE_LLM_REQUEST_RECORD="${RUN_ROOT}/smoke-llm-requests.jsonl"
-"$NETCLAW_SMOKE_LLM_SERVER" --port 0 --request-record "$SMOKE_LLM_REQUEST_RECORD" >"$SMOKE_LLM_LOG" 2>&1 &
+"$NETCLAW_SMOKE_LLM_SERVER" --port 0 --request-record "$SMOKE_LLM_REQUEST_RECORD" \
+  --protected-api-key "$SMOKE_LLM_PROTECTED_API_KEY" >"$SMOKE_LLM_LOG" 2>&1 &
 SMOKE_LLM_PID=$!
 for _ in $(seq 1 100); do
   SMOKE_LLM_ENDPOINT="$(sed -n 's/^\[smoke-llm:listening\] //p' "$SMOKE_LLM_LOG" | head -1)"
@@ -300,13 +303,17 @@ if [[ -z "${SMOKE_LLM_ENDPOINT:-}" ]] || ! curl -fsS "${SMOKE_LLM_ENDPOINT}/heal
   cat "$SMOKE_LLM_LOG" >&2 || true
   exit 1
 fi
+SMOKE_LLM_PROTECTED_ENDPOINT="${SMOKE_LLM_ENDPOINT}/test/protected"
 export NETCLAW_SMOKE_LLM_SERVER SMOKE_LLM_MODEL SMOKE_LLM_ENDPOINT SMOKE_LLM_LOG SMOKE_LLM_REQUEST_RECORD
+export SMOKE_LLM_PROTECTED_API_KEY SMOKE_LLM_PROTECTED_ENDPOINT
 echo "    SMOKE_LLM_ENDPOINT=${SMOKE_LLM_ENDPOINT}"
 
 # ── 3) Ensure vhs ────────────────────────────────────────────────────────────
 
-echo "==> Ensuring vhs is installed..."
-bash "${SMOKE_SCRIPTS}/install-vhs.sh"
+if (( ${#tapes[@]} > 0 || shots_mode == 1 )); then
+  echo "==> Ensuring vhs is installed..."
+  bash "${SMOKE_SCRIPTS}/install-vhs.sh"
+fi
 
 # ── 4) Run tapes + scenarios ─────────────────────────────────────────────────
 

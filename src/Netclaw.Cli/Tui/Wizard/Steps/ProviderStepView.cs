@@ -67,7 +67,7 @@ public sealed class ProviderStepView : IWizardStepView
             7 => BuildGitHubCopilotAuthHost(vm, callbacks),
             8 => BuildGitHubCopilotEnterpriseHost(vm, callbacks),
             9 => BuildGitHubCopilotEnterpriseApiBase(vm, callbacks),
-            10 => BuildApiKeyInput(vm, callbacks),
+            10 => BuildOptionalApiKey(vm, callbacks),
             _ => Layouts.Empty()
         };
     }
@@ -93,7 +93,10 @@ public sealed class ProviderStepView : IWizardStepView
                 {
                     vm.SelectedProviderType = typeKey;
                     var descriptor = registry.Get(typeKey);
-                    if (descriptor.Auth.SupportedAuthMethods is [AuthMethod.None])
+                    // Credential-optional providers skip the auth picker: there is
+                    // nothing required to choose. An optional Bearer key is offered
+                    // later, after the endpoint (sub-step 10).
+                    if (descriptor.Auth.IsCredentialOptional())
                     {
                         vm.SelectedAuthMethod = AuthMethod.None;
                         vm.SetSubStep(2);
@@ -202,7 +205,7 @@ public sealed class ProviderStepView : IWizardStepView
         _githubCopilotHostInput = new TextInputNode()
             .WithPlaceholder("https://ghe.example.com");
         if (!string.IsNullOrWhiteSpace(vm.GitHubCopilotHostInput))
-            _githubCopilotHostInput.Text = vm.GitHubCopilotHostInput;
+            WizardStepHelpers.SeedTextInput(_githubCopilotHostInput, vm.GitHubCopilotHostInput);
         _githubCopilotHostInput.OnFocused();
         _lastFocusedInput = _githubCopilotHostInput;
 
@@ -238,7 +241,7 @@ public sealed class ProviderStepView : IWizardStepView
         _githubCopilotApiBaseInput = new TextInputNode()
             .WithPlaceholder(placeholder);
         if (!string.IsNullOrWhiteSpace(vm.GitHubCopilotApiBaseInput))
-            _githubCopilotApiBaseInput.Text = vm.GitHubCopilotApiBaseInput;
+            WizardStepHelpers.SeedTextInput(_githubCopilotApiBaseInput, vm.GitHubCopilotApiBaseInput);
         _githubCopilotApiBaseInput.OnFocused();
         _lastFocusedInput = _githubCopilotApiBaseInput;
 
@@ -275,12 +278,11 @@ public sealed class ProviderStepView : IWizardStepView
 
         _lastFocusedList = null;
 
-        if (descriptor.Auth is EndpointOnlyAuth
-            || (descriptor.Auth is EndpointOrApiKeyAuth && vm.SelectedAuthMethod == AuthMethod.None))
+        if (descriptor.Auth.IsCredentialOptional())
         {
             var defaultEndpoint = descriptor.DefaultEndpoint;
             _endpointInput = new TextInputNode().WithPlaceholder(defaultEndpoint);
-            _endpointInput.Text = vm.EndpointInput ?? defaultEndpoint;
+            WizardStepHelpers.SeedTextInput(_endpointInput, vm.EndpointInput ?? defaultEndpoint);
             _endpointInput.OnFocused();
             _lastFocusedInput = _endpointInput;
 
@@ -288,37 +290,20 @@ public sealed class ProviderStepView : IWizardStepView
                 .Subscribe(text =>
                 {
                     vm.EndpointInput = string.IsNullOrWhiteSpace(text) ? defaultEndpoint : text;
-                    vm.SetSubStep(3);
-                    vm.StartProbe();
-                    callbacks.InvalidateAndRedraw();
-                })
-                .DisposeWith(callbacks.Subscriptions);
 
-            var hint = descriptor.Auth is EndpointOrApiKeyAuth
-                ? new TextNode("  No auth selected. Back up and choose API Key if your endpoint requires a key.")
-                    .WithForeground(Color.Gray)
-                : new TextNode("").Height(1);
+                    // A provider that takes an optional Bearer key gets one more
+                    // prompt before the probe, so the probe validates the key the
+                    // operator actually intends to use.
+                    if (descriptor.Auth.OffersOptionalApiKey())
+                    {
+                        vm.SetSubStep(10);
+                    }
+                    else
+                    {
+                        vm.SetSubStep(3);
+                        vm.StartProbe();
+                    }
 
-            return Layouts.Vertical()
-                .WithChild(new TextNode($"  {displayName} endpoint:").WithForeground(Color.White))
-                .WithChild(WizardStepHelpers.BuildTextInputPanel(_endpointInput, "Endpoint"))
-                .WithChild(hint);
-        }
-
-        if (descriptor.Auth is EndpointOrApiKeyAuth)
-        {
-            // API key selected for an optional-auth endpoint: endpoint first, then the key.
-            var defaultEndpoint = descriptor.DefaultEndpoint;
-            _endpointInput = new TextInputNode().WithPlaceholder(defaultEndpoint);
-            _endpointInput.Text = vm.EndpointInput ?? defaultEndpoint;
-            _endpointInput.OnFocused();
-            _lastFocusedInput = _endpointInput;
-
-            _endpointInput.Submitted
-                .Subscribe(text =>
-                {
-                    vm.EndpointInput = string.IsNullOrWhiteSpace(text) ? defaultEndpoint : text;
-                    vm.SetSubStep(10);
                     callbacks.InvalidateAndRedraw();
                 })
                 .DisposeWith(callbacks.Subscriptions);
@@ -328,23 +313,12 @@ public sealed class ProviderStepView : IWizardStepView
                 .WithChild(WizardStepHelpers.BuildTextInputPanel(_endpointInput, "Endpoint"));
         }
 
-        return BuildApiKeyInput(vm, callbacks);
-    }
-
-    private ILayoutNode BuildApiKeyInput(ProviderStepViewModel vm, StepViewCallbacks callbacks)
-    {
-        var providerType = vm.SelectedProviderType ?? "unknown";
-        var descriptor = vm.Registry.Get(providerType);
-        var displayName = descriptor.DisplayName;
-
-        _lastFocusedList = null;
-
         _apiKeyInput = new TextInputNode()
             .AsPassword()
             .WithPlaceholder($"Enter {displayName} API key...");
 
         if (!string.IsNullOrWhiteSpace(vm.ApiKeyInput))
-            _apiKeyInput.Text = vm.ApiKeyInput;
+            WizardStepHelpers.SeedTextInput(_apiKeyInput, vm.ApiKeyInput);
 
         _apiKeyInput.OnFocused();
         _lastFocusedInput = _apiKeyInput;
@@ -363,6 +337,54 @@ public sealed class ProviderStepView : IWizardStepView
         return Layouts.Vertical()
             .WithChild(new TextNode($"  {displayName} API key:").WithForeground(Color.White))
             .WithChild(WizardStepHelpers.BuildTextInputPanel(_apiKeyInput, "API Key"));
+    }
+
+    /// <summary>
+    /// Optional Bearer key prompt for credential-optional providers
+    /// (<see cref="OptionalApiKeyAuth"/>). Pressing Enter with a blank field
+    /// keeps the provider credential-free, which is the default behavior.
+    /// </summary>
+    private ILayoutNode BuildOptionalApiKey(ProviderStepViewModel vm, StepViewCallbacks callbacks)
+    {
+        var providerType = vm.SelectedProviderType ?? "unknown";
+        var descriptor = vm.Registry.Get(providerType);
+
+        _lastFocusedList = null;
+
+        _apiKeyInput = new TextInputNode()
+            .AsPassword()
+            .WithPlaceholder("Leave blank for no authentication...");
+        WizardStepHelpers.SeedTextInput(_apiKeyInput, vm.ApiKeyInput ?? string.Empty);
+        _apiKeyInput.OnFocused();
+        _lastFocusedInput = _apiKeyInput;
+
+        // No Where(!IsNullOrWhiteSpace) filter here — unlike the required-key
+        // path, a blank submit is the meaningful "no key" answer.
+        _apiKeyInput.Submitted
+            .Subscribe(text =>
+            {
+                vm.ApiKeyInput = string.IsNullOrWhiteSpace(text) ? null : text;
+
+                // Record ApiKey only when a key exists, so the wizard writes the
+                // same shape as `netclaw provider add --api-key`. The runtime never
+                // requires the key for this provider type.
+                vm.SelectedAuthMethod = vm.ApiKeyInput is null
+                    ? AuthMethod.None
+                    : AuthMethod.ApiKey;
+                vm.SetSubStep(3);
+                vm.StartProbe();
+                callbacks.InvalidateAndRedraw();
+            })
+            .DisposeWith(callbacks.Subscriptions);
+
+        return Layouts.Vertical()
+            .WithChild(new TextNode($"  {descriptor.DisplayName} API key (optional):").WithForeground(Color.White))
+            .WithChild(WizardStepHelpers.BuildTextInputPanel(_apiKeyInput, "API Key"))
+            .WithChild(new TextNode("").Height(1))
+            .WithChild(new TextNode("  Only needed when the endpoint sits behind an authenticated gateway.")
+                .WithForeground(Color.Gray))
+            .WithChild(new TextNode("  Press [Enter] to skip. A supplied key is stored in secrets.json.")
+                .WithForeground(Color.Gray));
     }
 
     private ILayoutNode BuildValidation(ProviderStepViewModel vm)

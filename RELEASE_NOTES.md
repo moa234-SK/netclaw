@@ -1,5 +1,225 @@
 # NetClaw Release Notes
 
+## 0.27.1 (2026-10-06)
+
+This is the stable 0.27.1 release. Configured tool lists now replace the defaults, so a narrowed allowlist narrows. Shell and tool approval now uses one authorizer and real parser facts, which gives fewer prompts and closes several ways around approval. Mattermost gets native typing indicators. MCP connections keep rotated tokens and deliver real file artifacts. The daemon stops more gracefully.
+
+### Configuration
+
+- **Configured tool lists now replace the defaults.** Before this change, the daemon added configured `Tools` list items to the built-in defaults, so an operator could not narrow an audience tool allowlist, file roots, `GlobalReadRoots`, attachment categories, or `WebFetch.HttpAllowList`. The Security & Access TUI tool-group and attachment changes also had no effect on the daemon. Now a configured list is the complete list.
+  - `[]`, `null`, and `{}` give an empty list. For `null` and `{}`, the daemon logs a startup warning that names the key.
+  - The daemon now stops at startup, with an error that names the key, when a list key has a scalar value, when an attachment category is not one defined name (for example `"Bogus"` or `"Pdf, Document"`), or when an empty `NETCLAW_*` variable and a config file both set the same list.
+  - `netclaw doctor` now warns when a Public or Team allowlist does not include `tool_output_read`. Spilled tool output tells the model to call that tool. The warning has no auto-fix, because a narrow list can be intentional.
+  - **Exact older default lists map to today's defaults.** `netclaw init` 0.8.0 to 0.25.4 (and 0.26.0-beta.1 to beta.5) wrote the complete Public and Team `AllowedTools` default lists. When a stored list exactly matches one of those older lists, the daemon applies today's default for that audience and logs a startup warning. A 0.8.0 to 0.19.0 Public list maps to today's Public default and so loses `file_write`.
+  - **`netclaw doctor --fix` removes copied default lists.** `netclaw doctor` reports a Public or Team `AllowedTools` list that exactly matches any shipped default, which includes today's default. `netclaw doctor --fix` backs up `netclaw.json` to `netclaw.json.legacy-tool-defaults.bak` (or the next free `.N.bak`) and deletes that key. The rest of the profile stays. The audience then follows the default, so it gets the tools that later releases add.
+  - **Edited older lists are applied as written.** An older list that was edited, for example with Web Access turned off in the TUI, or the 17-tool list that the 0.24 TUI wrote when it changed a profile from `All` to `Allowlist`, is not an exact match. The daemon applies it as written, so it does not get `file_search` or `tool_output_read`. Add those tools to the list by hand.
+  - **Upgrade impact:** if `netclaw.json` has a narrowed list, the daemon now applies it. For example, `"Team": { "AllowedTools": ["file_read", "file_list"] }` gave all 15 Team tools before and gives only those two tools now. To add one entry to a default list, write the complete list, for example `"GlobalReadRoots": ["{skills_dir}", "{identity_dir}", "{workspaces_dir}", "/srv/docs"]`. Check each `Tools` list in `netclaw.json`, `secrets.json`, and `NETCLAW_*` variables before you upgrade.
+
+- **`netclaw init` saves the posture, not the default tool lists.** Init writes `Security.DeploymentPosture`, `Security.ShellExecutionMode`, `Security.StrictDefaults`, and `Tools.ShellMode`. It does not write `Tools.AudienceProfiles`. The daemon computes the audience profiles from the posture, so a new install gets the tools that later releases add to its defaults. The Personal posture rule, approval for `shell_execute` on Personal, is now a daemon default. A new install gets the same effective tool configuration as before. `netclaw doctor` no longer asks for explicit audience profiles.
+- **The CLI reads audience profiles the same way as the daemon.** `netclaw doctor` and the init wizard now resolve profiles consistently with the running daemon, so what you see in the CLI matches what the daemon enforces ([#2367](https://github.com/netclaw-dev/netclaw/pull/2367)).
+
+### Shell authorization and tool approval
+
+Netclaw now routes every tool call through one authorizer, and shell approval reads facts from the `ShellSyntaxTree` parser instead of guessing.
+
+- **Security: shell approval sees commands that the parser missed before.** A backslash-newline inside `$(…)`, or a `#` right after a quote, could hide a command from the parser. In 0.27.0 and earlier, such a command could run with no approval. A command with a carriage return now always needs a one-time approval ([#2368](https://github.com/netclaw-dev/netclaw/pull/2368), [ShellSyntaxTree #243](https://github.com/Aaronontheweb/ShellSyntaxTree/pull/243)).
+- **A folder grant stays inside its folder.** A folder, repository, or chat grant no longer covers a loop or variable value that points outside the folder. Only a grant for anywhere covers it ([#2363](https://github.com/netclaw-dev/netclaw/pull/2363)).
+- **One authorizer for every tool.** A single linear `ToolAuthorizer` routes every tool call and every shell call through the same authority and consent loop. There is no second gate to drift ([#2299](https://github.com/netclaw-dev/netclaw/pull/2299), [#2301](https://github.com/netclaw-dev/netclaw/pull/2301), [#2302](https://github.com/netclaw-dev/netclaw/pull/2302), [#2303](https://github.com/netclaw-dev/netclaw/pull/2303), [#2304](https://github.com/netclaw-dev/netclaw/pull/2304)).
+- **A stored grant decides for unattended runs.** A grant that covers a command lets an unattended run use it, also outside the trusted roots. Unattended runs follow the same audience policy as attended runs, and a call that would prompt is denied ([#2338](https://github.com/netclaw-dev/netclaw/pull/2338)).
+- **The approval choice shows in the tool result.** Authorization attempts share one set of consent terms, and the agent sees which choice you made ([#2282](https://github.com/netclaw-dev/netclaw/pull/2282), [#2327](https://github.com/netclaw-dev/netclaw/pull/2327)).
+- **An unresolved trust audience stops the call.** Netclaw does not run a tool or shell command when it cannot resolve which audience governs it ([#2257](https://github.com/netclaw-dev/netclaw/pull/2257)).
+- **Shell approval uses real parser facts.** Glob, binding, quoting, and command-word facts come from `ShellSyntaxTree` 0.4.0 ([#2321](https://github.com/netclaw-dev/netclaw/pull/2321), [#2349](https://github.com/netclaw-dev/netclaw/pull/2349), [#2354](https://github.com/netclaw-dev/netclaw/pull/2354)).
+- **A verb grant covers its arguments.** A grant that names a verb, such as `dotnet build`, covers any later words. A safe phrase can read each path the audience may read ([#2359](https://github.com/netclaw-dev/netclaw/pull/2359), [#2314](https://github.com/netclaw-dev/netclaw/pull/2314)).
+- **Fewer prompts for read-only commands.** More common read commands run with no prompt ([#2310](https://github.com/netclaw-dev/netclaw/pull/2310), [#2342](https://github.com/netclaw-dev/netclaw/pull/2342)). Test builtins and run-time output values count as data ([#2344](https://github.com/netclaw-dev/netclaw/pull/2344), [#2315](https://github.com/netclaw-dev/netclaw/pull/2315)). `echo` in a loop after `cd` no longer prompts, and the agent gets advice to quote a word instead of a one-time prompt ([#2361](https://github.com/netclaw-dev/netclaw/pull/2361)).
+- **Each command in a call is judged on its own.** An unresolved part no longer forces a prompt for the whole call ([#2318](https://github.com/netclaw-dev/netclaw/pull/2318)). An API route is not read as a folder ([#2317](https://github.com/netclaw-dev/netclaw/pull/2317)), and a multi-line operand is scoped by its clean text ([#2316](https://github.com/netclaw-dev/netclaw/pull/2316)).
+- **Better word handling.** A quoted program word with a space is a normal word, a file name is not a command word, and a program path matches by its file, not its spelling ([#2336](https://github.com/netclaw-dev/netclaw/pull/2336), [#2334](https://github.com/netclaw-dev/netclaw/pull/2334), [#2312](https://github.com/netclaw-dev/netclaw/pull/2312), [#2329](https://github.com/netclaw-dev/netclaw/pull/2329)).
+- **Only a kill of the Netclaw daemon is hard-denied.** Before, every `kill`, `pkill`, `killall`, and `Stop-Process` was hard-denied. Now those commands prompt, and a grant can cover them. A kill that names the Netclaw daemon is still denied ([#2319](https://github.com/netclaw-dev/netclaw/pull/2319)).
+- **Static shell assignments can use exact reusable approvals.** Netclaw binds each grant to a digest of the complete Bash or PowerShell assignment facts. Finite PowerShell loops can reuse exact grants after Netclaw checks the public path facts ([#2215](https://github.com/netclaw-dev/netclaw/pull/2215)).
+- **The grant store stays clean.** Netclaw does not save junk grants, and older grants match on their own command words ([#2339](https://github.com/netclaw-dev/netclaw/pull/2339), [#2322](https://github.com/netclaw-dev/netclaw/pull/2322)).
+- **Config files are readable, except secrets.** The agent and the shell can read each config file except `secrets.json`, `keys/`, and `webhooks/`. File tools can read the grant store ([#2337](https://github.com/netclaw-dev/netclaw/pull/2337), [#2323](https://github.com/netclaw-dev/netclaw/pull/2323)).
+- **A command too long to show gets a correction.** When a shell command is too long for an approval prompt, the agent gets a correction that asks for a shorter command ([#2355](https://github.com/netclaw-dev/netclaw/pull/2355)).
+- **Skill folders are no longer write-protected.** A skill edit is allowed, and the next skill sync restores system skill files ([#2357](https://github.com/netclaw-dev/netclaw/pull/2357)).
+
+### Channels
+
+- **Native Mattermost typing indicators.** Mattermost shows typing indicators for active session turns, and approval action IDs are now alphanumeric ([#2358](https://github.com/netclaw-dev/netclaw/pull/2358), [#2366](https://github.com/netclaw-dev/netclaw/pull/2366)).
+- **Long approval prompts stay postable.** Netclaw shortens a long approval prompt so the channel accepts it. When a post fails, Netclaw reports the failure and does not report it as a denial ([#2353](https://github.com/netclaw-dev/netclaw/pull/2353)).
+
+### MCP
+
+- **MCP tool results carry real artifacts.** Binary image, audio, and embedded-resource blocks from MCP tools are scanned with the existing content scanner, stored in the session artifact directory, and delivered to the primary channel through the normal file-output path. Rejected or unsupported artifacts stay visible as notes, and text-only results keep working unchanged ([#2232](https://github.com/netclaw-dev/netclaw/pull/2232)).
+- **Multi-content MCP tool results render readably.** When the MCP SDK returns a successful result as in-memory content objects, text blocks are joined and image attachments project as MIME markers instead of surfacing the literal type name ([#2180](https://github.com/netclaw-dev/netclaw/pull/2180), fixes [#2051](https://github.com/netclaw-dev/netclaw/issues/2051)).
+- **A reconnect no longer loses a rotated refresh token.** Netclaw sends one refresh grant at a time for each MCP server, and each connection redeems the newest stored refresh token. A connection from before an explicit authorization cannot replace the credentials of that authorization ([#2263](https://github.com/netclaw-dev/netclaw/issues/2263)).
+- **Rejected refresh grants are logged.** The daemon logs the token endpoint status and the OAuth `error` fields when an authorization server rejects a refresh. The refresh diagnostic line no longer reports an absent client secret as a blocker ([#2263](https://github.com/netclaw-dev/netclaw/issues/2263)).
+- **Catalog refresh backs off.** Failing catalog refreshes back off instead of hammering the endpoint, and a degraded server is reported rather than silently dropped ([#2276](https://github.com/netclaw-dev/netclaw/pull/2276)).
+
+### Reliability
+
+- **Graceful daemon stop, bounded to thirty seconds.** Shutdown drains webhook alerts and stops durable approval waits before delivery is cancelled, so work in flight has a chance to land ([#2211](https://github.com/netclaw-dev/netclaw/pull/2211), [#2208](https://github.com/netclaw-dev/netclaw/pull/2208), [#2251](https://github.com/netclaw-dev/netclaw/pull/2251)).
+- **A graceful stop can resume interrupted sessions.** The daemon can resume a session that a graceful stop interrupted. It saves accepted session input before it acknowledges it, so a crash does not lose that input ([#2210](https://github.com/netclaw-dev/netclaw/pull/2210), [#2209](https://github.com/netclaw-dev/netclaw/pull/2209)).
+- **Reminders get tested in-session.** You can test a reminder in a chat with `/run-reminder`, and reminder tools are now scoped to the caller audience ([#2328](https://github.com/netclaw-dev/netclaw/pull/2328), [#2240](https://github.com/netclaw-dev/netclaw/pull/2240)).
+- **Skill management is safer and more flexible.** System skills are kept when a local skill uses the same name, and links and protected paths are denied in `skill_manage` mutations ([#2249](https://github.com/netclaw-dev/netclaw/pull/2249), [#2247](https://github.com/netclaw-dev/netclaw/pull/2247)). `skill_read_resource` returns the resource path ([#2325](https://github.com/netclaw-dev/netclaw/pull/2325)).
+- **Webhook credential leaks are fixed.** Diagnostics no longer leak webhook credentials ([#2237](https://github.com/netclaw-dev/netclaw/pull/2237)).
+
+## 0.27.0 (2026-09-23)
+
+This is the stable 0.27.0 release, closing the beta cycle. The headline: NetClaw now remembers across sessions with local, on-device semantic memory - no cloud embeddings, no external services. Around that, shell approvals got sharper and quieter for both Bash and PowerShell, Slack replies render far better, MCP connections start faster and support OAuth client secrets, and the whole release carries a long tail of robustness fixes backed by behavioral evals.
+
+### Local semantic memory (ONNX)
+
+NetClaw remembers you across sessions, entirely on your machine. A new `Netclaw.Embeddings` assembly embeds every cross-session memory locally with ONNX and searches it on-device - no cloud, no external service.
+
+- **Embed at write time, recall by meaning.** Memories are embedded on store, nominated by kNN during curation, and found through hybrid vector + lexical recall ([#1749](https://github.com/netclaw-dev/netclaw/pull/1749)).
+- **A cross-encoder keeps weak matches out, with evidence behind it.** On an out-of-sample test of 450 real-traffic queries, the relevance gate cuts irrelevant injections almost entirely while keeping the good recall intact ([#1588](https://github.com/netclaw-dev/netclaw/pull/1588), [#1749](https://github.com/netclaw-dev/netclaw/pull/1749)).
+
+| Metric | Hybrid floor only | Cross-encoder gate |
+|--------|------------------:|-------------------:|
+| Correct zero-injection | 7.3% | 86.8% |
+| Relevant recall retention | — | 98.3% |
+| Mean injected items | 2.538 | 0.251 |
+| F0.5 | 0.100 | 0.130 |
+
+- **Local, pinned models.** Defaults are [`snowflake-arctic-embed-m-int8`](https://huggingface.co/Snowflake/snowflake-arctic-embed-m) for embedding and [`ms-marco-minilm-l-6-v2`](https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2) for the relevance gate. Both come from a pinned allowlist - NetClaw never loads an arbitrary model ([#1749](https://github.com/netclaw-dev/netclaw/pull/1749)).
+- **Faster and lighter at rest.** The int8 embedder used about 57% less steady-state RSS than fp32 and ran about 1.7x faster ([#1749](https://github.com/netclaw-dev/netclaw/pull/1749)).
+- **On by default - and we recommend leaving it on.** If you need to opt out, set `Memory.Embeddings.Enabled = false` in `netclaw.json`. Models download on first daemon start, alert on failure, and can be pre-provisioned for a fully offline start ([#1749](https://github.com/netclaw-dev/netclaw/pull/1749)).
+- **Backfill your existing memories.** Run `netclaw memory backfill-embeddings` once to embed memories you already had before upgrading, so older context is searchable too. `netclaw doctor` reports embedding model health ([#1749](https://github.com/netclaw-dev/netclaw/pull/1749)).
+
+> **Upgrade note:** embeddings default to enabled. Expect roughly 800 MB total RSS on the reference configuration, and plan for model access on first start. Operators can disable embeddings with `Memory.Embeddings.Enabled = false` or pre-provision the models for offline use.
+
+### Smarter, quieter shell approvals
+
+The approval engine got both sharper and less noisy this cycle - it catches unsafe commands it used to guess at, and stops prompting you for the ones that were always safe.
+
+- **Static proof for compound shell scopes.** Netclaw authorizes proved static Bash command scopes; link scopes stay outside compound grants, sibling scopes need their own grant, and scope proof preserves causal policy ([#2191](https://github.com/netclaw-dev/netclaw/pull/2191), [#2193](https://github.com/netclaw-dev/netclaw/pull/2193)).
+- **Explicit repository grants for registered worktrees.** Shell cwd parent traversal is rejected before approval ([#2195](https://github.com/netclaw-dev/netclaw/pull/2195), [#2194](https://github.com/netclaw-dev/netclaw/pull/2194)).
+- **Reuse shell approvals after bare status output.** A bare `$?` no longer drops every reusable approval candidate; unknown parameters, redirects, and substitutions stay strict ([#2200](https://github.com/netclaw-dev/netclaw/pull/2200)).
+- **Less Windows fatigue.** Netclaw reuses proven facts across similar PowerShell reviews and reduces prompts, and blocks PowerShell syntax it cannot analyze safely instead of guessing ([#2177](https://github.com/netclaw-dev/netclaw/pull/2177), [#2176](https://github.com/netclaw-dev/netclaw/pull/2176)).
+- **One component completes shell authorization.** `ShellPolicyCoordinator` is the only completion path ([#2152](https://github.com/netclaw-dev/netclaw/pull/2152)).
+- **Correlated authorization attempts.** Every tool call carries a PII-free `AuthorizationAttemptId` through evaluation, prompt, decision, retry, and result - one query reconstructs a full authorization attempt, including across cold recovery and sub-agents ([#2078](https://github.com/netclaw-dev/netclaw/pull/2078)).
+
+### Better Slack rendering and reliability
+
+- **Native Slack Markdown blocks for model replies.** Replies go out as a single Slack `MarkdownBlock` and render with Slack's own renderer - tables included. No more hand-built rich-text tree or the ~1,100-line converter it needed. Over-12,000-char replies fall back to plain text ([#2095](https://github.com/netclaw-dev/netclaw/pull/2095)).
+- **Slack Socket Mode supervision.** A supervisor checks the transport every 5s, reconnects with exponential backoff up to 5 minutes, classifies fatal vs. transient failures, and alerts through the channel health contract ([#2089](https://github.com/netclaw-dev/netclaw/pull/2089)).
+
+### More dependable MCP
+
+- **OAuth client secrets for MCP servers.** Connect to pre-registered confidential OAuth clients over HTTP and SSE. `netclaw mcp add` writes the client ID to `netclaw.json` and the encrypted secret to `secrets.json`; the configured identity reaches the SDK for authorization-code and refresh-token exchange ([#2169](https://github.com/netclaw-dev/netclaw/pull/2169)).
+- **Concurrent MCP startup.** Enabled MCP connections start in parallel through their server gates, so the daemon listener comes up faster; each failed server stays separate from the successful catalog ([#2203](https://github.com/netclaw-dev/netclaw/pull/2203)).
+- **MCP auth failures demote only when real.** A typed HTTP 401 marks HTTP servers `AuthFailed`; tool-result text demotes OAuth-capable servers only, so stdio and static-header servers no longer trip false alarms. The remedy names the credential you configured ([#2062](https://github.com/netclaw-dev/netclaw/pull/2062), [#2057](https://github.com/netclaw-dev/netclaw/pull/2057)).
+- **OAuth token exchanges request JSON responses**, keeping GitHub-compatible endpoints aligned with the MCP SDK decoder ([#2141](https://github.com/netclaw-dev/netclaw/issues/2141), [#2167](https://github.com/netclaw-dev/netclaw/pull/2167)).
+- **openai-compatible providers accept an optional API key** for endpoints that need no key ([#2148](https://github.com/netclaw-dev/netclaw/pull/2148)).
+
+### Unified session storage
+
+Sessions now live in one versioned storage envelope with a managed temporary directory per process.
+
+- One versioned layout holds work files, attachment staging, artifacts, temp files, worktrees, and logs ([#2090](https://github.com/netclaw-dev/netclaw/pull/2090)).
+- Each process gets its own managed temp directory through standard environment variables ([#2090](https://github.com/netclaw-dev/netclaw/pull/2090)).
+- Child runs inherit parent roots and restrictions; successful `spawn_agent` results return child run, log, and artifact paths ([#2090](https://github.com/netclaw-dev/netclaw/pull/2090)).
+- File authority stays explicit - Netclaw validates attachment destinations before copy and denies linked and write-protected destinations ([#2145](https://github.com/netclaw-dev/netclaw/pull/2145)).
+
+> **Downgrade note:** a pre-0.27 binary cannot resume a session that has a versioned storage binding. Existing sessions keep their current paths.
+
+### System skills ship inside the daemon
+
+- **System skills restore from the installed binary.** Startup replaces only the managed `.system` tree and keeps user skills unchanged ([#2138](https://github.com/netclaw-dev/netclaw/pull/2138)).
+- **`netclaw skill sync` starts an external source pass immediately**, without saving configuration; a partial failure returns exit code 1 ([#2140](https://github.com/netclaw-dev/netclaw/pull/2140)).
+- **The legacy hosted system-skill feed retires.** `netclaw doctor --fix` removes the obsolete `SkillSync.DisableSystemSkillSync` property ([#2138](https://github.com/netclaw-dev/netclaw/pull/2138)).
+
+### Security posture
+
+- **Path access mutation gate.** Netclaw blocks file-tool writes that mutate a path outside approved authority ([#2155](https://github.com/netclaw-dev/netclaw/pull/2155)).
+- **Focused reminder execution mutation gate** tightens the reminder path ([#2178](https://github.com/netclaw-dev/netclaw/pull/2178)).
+- **Full reset keeps installed binaries.** A reset from the init TUI purges everything except `bin/`, so the CLI no longer deletes itself mid-reset ([#2085](https://github.com/netclaw-dev/netclaw/pull/2085), [#2086](https://github.com/netclaw-dev/netclaw/pull/2086)).
+
+### Proven by eval, not vibes
+
+- Eval slider drove the shell approval work; behavioral guidance aligned end to end ([#2216](https://github.com/netclaw-dev/netclaw/pull/2216)).
+- Native smoke tests run against a deterministic local provider; CLI command streams virtualized in tests ([#2081](https://github.com/netclaw-dev/netclaw/pull/2081), [#2076](https://github.com/netclaw-dev/netclaw/pull/2076)).
+
+---
+## 0.27.0-beta.4 (2026-09-14)
+
+Follow-up beta to 0.27.0-beta.3. Shell authorization is safer and less noisy on Windows, openai-compatible providers accept an optional API key, and OAuth token exchanges stay aligned with the MCP SDK.
+
+### Shell authorization
+
+- **Less Windows approval fatigue.** Netclaw reuses proven facts across similar PowerShell reviews and reduces the number of prompts you face ([#2177](https://github.com/netclaw-dev/netclaw/pull/2177)).
+- **Unsafe partial PowerShell analyses are denied.** Netclaw blocks PowerShell syntax it cannot analyze safely instead of guessing, and it keeps legacy deny patterns ([#2176](https://github.com/netclaw-dev/netclaw/pull/2176)).
+
+### Providers
+
+- **openai-compatible providers accept an optional API key.** Connect to endpoints that do not require a key ([#2148](https://github.com/netclaw-dev/netclaw/pull/2148)).
+
+### MCP reliability
+
+- **OAuth token exchanges request JSON responses.** This keeps GitHub-compatible token endpoints aligned with the MCP SDK decoder ([#2141](https://github.com/netclaw-dev/netclaw/issues/2141), [#2167](https://github.com/netclaw-dev/netclaw/pull/2167)).
+
+### Security
+
+- **Path access mutation gate.** Netclaw blocks file-tool writes that mutate a path outside approved authority ([#2155](https://github.com/netclaw-dev/netclaw/pull/2155)).
+
+### Internal
+
+- Approval directory and tool authorization mutation gates plus focused smoke isolation tighten the test surface ([#2168](https://github.com/netclaw-dev/netclaw/pull/2168), [#2170](https://github.com/netclaw-dev/netclaw/pull/2170), [#2171](https://github.com/netclaw-dev/netclaw/pull/2171), [#2172](https://github.com/netclaw-dev/netclaw/pull/2172)).
+
+## 0.27.0-beta.3 (2026-09-12)
+
+Follow-up beta to 0.27.0-beta.2. Sessions now live in one versioned storage envelope with a managed temporary directory per process, system skills ship inside the daemon binary, and shell authorization completes in one place. Slack Socket Mode no longer drops silently, and `netclaw skill sync` runs an external source pass on demand.
+
+### Unified session storage
+
+- **One versioned storage envelope per session.** Work files, attachment staging, artifacts, temporary files, worktrees, and logs now live under a single versioned layout ([#2090](https://github.com/netclaw-dev/netclaw/pull/2090)).
+- **Each process gets its own managed temporary directory** through the standard temporary environment variables ([#2090](https://github.com/netclaw-dev/netclaw/pull/2090)).
+- **Child runs inherit parent roots and restrictions.** Successful `spawn_agent` results return child run, log, and artifact paths. Legacy cross-run raw logs require explicit authority; child summaries and shared artifacts remain available ([#2090](https://github.com/netclaw-dev/netclaw/pull/2090)).
+- **Session context announces `worktree_dir`.** Agents compose the existing shell and working-directory tools for Git worktrees ([#2090](https://github.com/netclaw-dev/netclaw/pull/2090)).
+- **File authority stays explicit.** Netclaw validates attachment destinations before directory creation or file copy, and it denies linked and write-protected destinations ([#2145](https://github.com/netclaw-dev/netclaw/pull/2145)). Implicit session file roots follow the audience ([#2143](https://github.com/netclaw-dev/netclaw/pull/2143)), and allowed and denied path results stay separate ([#2144](https://github.com/netclaw-dev/netclaw/pull/2144)).
+- **Tools read within their authority.** Public and Team file tools keep access to their current session and exact legacy log; other sessions need explicit configured roots. The current session envelope and configured trusted roots feed ordinary file and shell authority, and audience and operation permissions still apply. Authorized structured file reads can inspect `netclaw.json`; secret stores and control-plane state stay protected.
+- **Personal access does not change.** Personal file access, existing paths, and session resumption behave as before.
+
+Existing sessions keep their current paths. Netclaw does not move or rename their data.
+
+> **Downgrade note:** A pre-feature binary cannot resume a session that has a versioned storage binding.
+
+### System skills ship inside the daemon
+
+- **System skills restore from the installed binary.** Startup replaces only the managed `.system` tree and keeps user skills unchanged ([#2138](https://github.com/netclaw-dev/netclaw/pull/2138)).
+- **`netclaw skill sync` starts an external source pass immediately.** The command does not save configuration. Concurrent requests receive the same pass result, Ctrl+C ends only the caller wait, and a partial failure returns exit code 1 ([#2140](https://github.com/netclaw-dev/netclaw/pull/2140)).
+- **The legacy hosted system-skill feed retires.** Binary releases no longer publish it, and maintainers can use the standalone `publish_skills` workflow for legacy updates. `netclaw doctor --fix` removes the retired `SkillSync.DisableSystemSkillSync` property. Private skill feeds remain supported and independent from system skills ([#2138](https://github.com/netclaw-dev/netclaw/pull/2138)).
+
+### Shell authorization
+
+- **One component completes shell authorization.** `ShellPolicyCoordinator` is the only completion path, and closed authorized, tool-validation, and stopped results replace the nullable coordinator tuple ([#2152](https://github.com/netclaw-dev/netclaw/pull/2152)).
+- **Collected shell corrections.** A shell request returns correction facts only when a safer native tool covers the same operation, and a session and its delegated agent return the same response ([#2112](https://github.com/netclaw-dev/netclaw/pull/2112), [#2114](https://github.com/netclaw-dev/netclaw/pull/2114), [#2117](https://github.com/netclaw-dev/netclaw/pull/2117)).
+- **Netclaw rechecks shell authority at shared process startup** ([#2122](https://github.com/netclaw-dev/netclaw/pull/2122)).
+- **Tool denial guidance applies only to the current user turn** ([#2101](https://github.com/netclaw-dev/netclaw/pull/2101)).
+
+### Reliability fixes
+
+- **Host pairing works across exposure modes.** Local pairing commands use a host key-ring proof, and valid codes survive recoverable exchange failures ([#2093](https://github.com/netclaw-dev/netclaw/pull/2093)).
+- **Slack Socket Mode stops dropping silently.** SlackNet 0.18.0 fixes the silent disconnect ([#2151](https://github.com/netclaw-dev/netclaw/pull/2151)).
+- **Exact repeated tool cycles stop** ([#2105](https://github.com/netclaw-dev/netclaw/pull/2105)).
+
+### Internal
+
+- Tool result contracts separate receipt, child run, and Git cases ([#2146](https://github.com/netclaw-dev/netclaw/pull/2146)); the obsolete scalar correction exception API is gone ([#2125](https://github.com/netclaw-dev/netclaw/pull/2125))
+- Slack reconnect and local control redirect tests use explicit completion signals instead of timing ([#2127](https://github.com/netclaw-dev/netclaw/pull/2127), [#2165](https://github.com/netclaw-dev/netclaw/pull/2165))
+- Isolated background launch evals precede the runtime fix ([#2124](https://github.com/netclaw-dev/netclaw/pull/2124))
+
+### Dependency Updates
+
+- **Bump Anthropic** — 12.44.0 → 12.46.0 ([#2113](https://github.com/netclaw-dev/netclaw/pull/2113))
+- **Bump Microsoft.ML.OnnxRuntime** — 1.27.0 → 1.29.0 ([#2108](https://github.com/netclaw-dev/netclaw/pull/2108))
+- **Bump Microsoft.AspNetCore and Microsoft.OpenApi** — 10.0.12 / 2.12.2 ([#2150](https://github.com/netclaw-dev/netclaw/pull/2150))
+- **Bump SkiaSharp** — 4.151.1 → 4.152.0 ([#2120](https://github.com/netclaw-dev/netclaw/pull/2120))
+- **Bump HtmlAgilityPack** — 1.12.4 → 1.13.0 ([#2104](https://github.com/netclaw-dev/netclaw/pull/2104))
+- **Bump Google.Protobuf** — 3.35.1 → 3.36.1 ([#2103](https://github.com/netclaw-dev/netclaw/pull/2103))
+- **Bump Mattermost.NET** — 5.0.7 → 5.0.10 ([#2107](https://github.com/netclaw-dev/netclaw/pull/2107))
+- **Bump Aspire.Hosting.AppHost** — 13.4.6 → 13.5.3 ([#2098](https://github.com/netclaw-dev/netclaw/pull/2098)); **CommunityToolkit.Aspire.Hosting.Ollama** 13.4.0 → 13.5.0 ([#2100](https://github.com/netclaw-dev/netclaw/pull/2100))
+- **Bump Microsoft.SourceLink.GitHub** — 10.0.400 → 10.0.401 ([#2119](https://github.com/netclaw-dev/netclaw/pull/2119)); **Microsoft.NET.Test.Sdk** 18.9.0 → 18.10.0 ([#2130](https://github.com/netclaw-dev/netclaw/pull/2130))
+- **Bump rolfbjarne/autoformat** — 0.5 → 0.6 ([#1899](https://github.com/netclaw-dev/netclaw/pull/1899))
+
 ## 0.27.0-beta.2 (2026-08-30)
 
 Follow-up beta to 0.27.0-beta.1. Slack replies now render with Slack's own Markdown blocks and tables, Socket Mode connections are supervised and self-heal, MCP auth failures stop firing false alarms, and a full reset no longer deletes the binaries it resets from.
@@ -49,7 +269,6 @@ A new `Netclaw.Embeddings` assembly gives every cross-session memory a local emb
 ### Small fixes
 
 - Fixed release-note parsing so version metadata resolves cleanly ([#2067](https://github.com/netclaw-dev/netclaw/pull/2067)).
-
 > **Upgrade note:** embeddings default to enabled. Expect roughly 800 MB total RSS on the reference configuration, and plan for model access on first start. Operators can disable embeddings or pre-provision the models for offline use.
 
 ## 0.26.0 (2026-08-26)

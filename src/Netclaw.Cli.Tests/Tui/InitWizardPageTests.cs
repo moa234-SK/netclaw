@@ -149,6 +149,118 @@ public sealed class InitWizardPageTests : IDisposable
         Assert.Equal("https://api.ghe.example.com", vm.ProviderStep.VendorOptions["GitHubApiBase"]);
     }
 
+    [Fact]
+    public async Task OpenAiCompatibleInputs_AcceptTypedOptionalApiKey()
+    {
+        var (_, app, vm) = CreateHeadlessApp(out var input);
+
+        foreach (var _ in _registry.KnownTypeKeys.TakeWhile(type => type != "openai-compatible"))
+            input.EnqueueKey(ConsoleKey.DownArrow);
+        input.EnqueueKey(ConsoleKey.Enter);
+        foreach (var _ in _registry.Get("openai-compatible").DefaultEndpoint)
+            input.EnqueueKey(ConsoleKey.RightArrow);
+        foreach (var _ in _registry.Get("openai-compatible").DefaultEndpoint)
+            input.EnqueueKey(ConsoleKey.Backspace);
+        input.EnqueuePaste("http://gateway.example.com");
+        input.EnqueueKey(ConsoleKey.Enter);
+        input.EnqueuePaste("sk-gateway-key");
+        input.EnqueueKey(ConsoleKey.Enter);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var run = app.RunAsync(cts.Token);
+        try
+        {
+            await WaitForConditionAsync(
+                () => vm.ProviderStep.ProbeCompletion?.IsCompleted == true,
+                cts.Token);
+
+            Assert.Equal("openai-compatible", vm.ProviderStep.SelectedProviderType);
+            Assert.Equal("http://gateway.example.com", vm.ProviderStep.EndpointInput);
+            Assert.Equal(AuthMethod.ApiKey, vm.ProviderStep.SelectedAuthMethod);
+            Assert.Equal("sk-gateway-key", vm.ProviderStep.ApiKeyInput);
+            Assert.NotNull(_fakeProbe.LastEntry);
+            Assert.Equal(AuthMethod.ApiKey, _fakeProbe.LastEntry.AuthMethod);
+            Assert.Equal("sk-gateway-key", _fakeProbe.LastEntry.ApiKey?.Value);
+        }
+        finally
+        {
+            input.EnqueueKey(ConsoleKey.Q, control: true);
+            await run.WaitAsync(cts.Token);
+        }
+    }
+
+    [Theory]
+    [InlineData("ollama", "Enter the URL of your Ollama server, for example http://localhost:11434. Press Enter to accept.")]
+    [InlineData("openai-compatible", "Enter the base URL of your server, with or without /v1. Press Enter to accept.")]
+    public async Task EndpointStep_ShowsEndpointHintAndTypingAppendsToTheDefault(string providerType, string expectedHint)
+    {
+        var (terminal, app, vm) = HeadlessTerminaFixture.Create<InitWizardPage, InitWizardViewModel>(
+            "/init", _ => new InitWizardPage(), CreateViewModel, out var input);
+        var defaultEndpoint = _registry.Get(providerType).DefaultEndpoint;
+
+        foreach (var _ in _registry.KnownTypeKeys.TakeWhile(type => type != providerType))
+            input.EnqueueKey(ConsoleKey.DownArrow);
+        input.EnqueueKey(ConsoleKey.Enter);
+        input.EnqueueString("/x");
+        input.EnqueueKey(ConsoleKey.Q, control: true);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await app.RunAsync(cts.Token);
+
+        Assert.True(terminal.Contains(expectedHint));
+        Assert.False(terminal.Contains("Enter your API key"));
+        Assert.True(terminal.Contains(defaultEndpoint + "/x"),
+            "Typing into the pre-filled endpoint must append to the default, not insert before it");
+        Assert.Equal(providerType, vm.ProviderStep.SelectedProviderType);
+    }
+
+    [Fact]
+    public async Task ApiKeyStep_DoesNotShowTheEndpointHint()
+    {
+        var (terminal, app, vm) = HeadlessTerminaFixture.Create<InitWizardPage, InitWizardViewModel>(
+            "/init", _ => new InitWizardPage(), CreateViewModel, out var input);
+
+        foreach (var _ in _registry.KnownTypeKeys.TakeWhile(type => type != "anthropic"))
+            input.EnqueueKey(ConsoleKey.DownArrow);
+        input.EnqueueKey(ConsoleKey.Enter); // provider
+        input.EnqueueKey(ConsoleKey.Enter); // "API Key" authentication
+        input.EnqueueKey(ConsoleKey.Q, control: true);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await app.RunAsync(cts.Token);
+
+        Assert.Equal("anthropic", vm.ProviderStep.SelectedProviderType);
+        Assert.True(terminal.Contains("Enter your API key"));
+        Assert.False(terminal.Contains("base URL of your server"));
+        Assert.False(terminal.Contains("Ollama server"));
+    }
+
+    /// <summary>
+    /// Every pre-filled wizard text input must put the cursor at the end, so the first
+    /// keystroke appends to the default rather than inserting in front of it. Each row
+    /// confirms <paramref name="enters"/> earlier sub-steps, then types into the seeded input.
+    /// </summary>
+    [Theory]
+    [InlineData(0, "Netclaw")]
+    [InlineData(3, "{timezone}")]
+    public async Task IdentityInputs_AppendTypedTextToTheSeed(int enters, string seed)
+    {
+        // The timezone default is the scheduler-accepted id, which on Windows
+        // differs from TimeZoneInfo.Local.Id (IANA vs Windows naming).
+        seed = seed.Replace("{timezone}", IdentityStepViewModel.DefaultTimezone);
+        var (terminal, app, vm) = CreateHeadlessApp(out var input);
+
+        AdvanceToStep(vm, WizardStepIds.Identity);
+        for (var i = 0; i < enters; i++)
+            input.EnqueueKey(ConsoleKey.Enter);
+        input.EnqueueString("ZZ");
+        input.EnqueueKey(ConsoleKey.Q, control: true);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await app.RunAsync(cts.Token);
+
+        Assert.True(terminal.Contains(seed + "ZZ"), $"Typed text must append to '{seed}'");
+    }
 
     // ── Config integrity: wizard choices must match written config ──────────
 
@@ -286,13 +398,22 @@ public sealed class InitWizardPageTests : IDisposable
         Assert.Equal(stepId, vm.Orchestrator.CurrentStep?.StepId);
     }
 
+    private static async Task WaitForConditionAsync(Func<bool> predicate, CancellationToken ct)
+    {
+        while (!predicate())
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.Yield();
+        }
+    }
+
     // Resolving TerminaApplication triggers NavigateTo("/init"), which calls the
     // factory below and wires the page to the ViewModel.
     private (VirtualTerminal Terminal, TerminaApplication App, InitWizardViewModel Vm)
         CreateHeadlessApp(out VirtualInputSource input)
         => HeadlessTerminaFixture.Create<InitWizardPage, InitWizardViewModel>(
             "/init",
-            () => new InitWizardPage(),
+            _ => new InitWizardPage(),
             CreateViewModel,
             out input);
 

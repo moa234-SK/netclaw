@@ -530,11 +530,13 @@ public sealed class MattermostConversationActorTests(ITestOutputHelper output) :
                 AllowedChannelIds = ["ch-1"]
             },
             DefaultChannelId: null,
+            ChannelRegistry: TestChannelRegistries.MattermostWithProcessingRenderer(
+                replyClient ?? new UnconfiguredMattermostReplyClient()),
             ReplyClient: replyClient ?? new UnconfiguredMattermostReplyClient(),
             ContentScanner: new NullContentScanner(),
             AudienceProfiles: TestMattermostGatewayDeps.DefaultAudienceProfiles,
             ModelCapabilities: TestMattermostGatewayDeps.DefaultVisionCapableModel,
-            Paths: TestMattermostGatewayDeps.NewTestPaths(),
+                        StorageResolver: Netclaw.Actors.Protocol.TestSessionStorageResolver.Instance,
             BotUsername: botUsername,
             SessionPropsFactory: sessionPropsFactory);
     }

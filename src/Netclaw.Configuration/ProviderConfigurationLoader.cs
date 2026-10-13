@@ -20,16 +20,42 @@ public static class ProviderConfigurationLoader
         var providers = new Dictionary<string, ProviderEntry>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var providerSection in section.GetChildren())
+            providers[providerSection.Key] = LoadEntry(providerSection);
+
+        return providers;
+    }
+
+    private static ProviderEntry LoadEntry(IConfigurationSection providerSection)
+    {
+        try
         {
             // Typed binding invokes SensitiveStringTypeConverter on ApiKey / OAuth tokens,
             // which decrypts ENC: ciphertext from secrets.json. VendorOptions is excluded
             // from binding via its internal setter (see ProviderEntry) and populated here.
             var entry = providerSection.Get<ProviderEntry>() ?? new ProviderEntry();
+            var authSection = providerSection.GetSection(nameof(ProviderEntry.AuthMethod));
+            ApplyLegacyAuthentication(entry, authSection.Exists());
             entry.VendorOptions = BindVendorOptions(providerSection.GetSection(nameof(ProviderEntry.VendorOptions)));
-            providers[providerSection.Key] = entry;
+            return entry;
         }
+        catch (Exception ex) when (ex is InvalidOperationException or FormatException)
+        {
+            // Names the provider: the binder and the VendorOptions check do not always do.
+            throw new ModelConfigurationException($"Providers:{providerSection.Key} is invalid: {ex.Message}");
+        }
+    }
 
-        return providers;
+    /// <summary>
+    /// Maps the old OpenAI-compatible key-presence contract to an explicit authentication method.
+    /// </summary>
+    public static void ApplyLegacyAuthentication(ProviderEntry entry, bool authMethodConfigured)
+    {
+        if (!authMethodConfigured
+            && string.Equals(entry.Type, "openai-compatible", StringComparison.OrdinalIgnoreCase)
+            && !entry.ApiKey.IsNullOrEmpty())
+        {
+            entry.AuthMethod = AuthMethod.ApiKey;
+        }
     }
 
     private static JsonObject? BindVendorOptions(IConfigurationSection section)

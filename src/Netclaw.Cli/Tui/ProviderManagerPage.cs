@@ -3,6 +3,7 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
+using Netclaw.Cli.Config;
 using Netclaw.Configuration;
 using Netclaw.Providers;
 using Netclaw.Providers.OAuth;
@@ -24,10 +25,12 @@ namespace Netclaw.Cli.Tui;
 /// </summary>
 public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
 {
+    private readonly IAnsiTerminal _terminal;
     private readonly IClipboardService? _clipboardService;
 
-    public ProviderManagerPage(IClipboardService? clipboardService = null)
+    public ProviderManagerPage(IAnsiTerminal terminal, IClipboardService? clipboardService = null)
     {
+        _terminal = terminal;
         _clipboardService = clipboardService;
     }
 
@@ -92,7 +95,7 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
                     ProviderManagerState.AddGitHubCopilotEnterpriseHost => BuildGitHubCopilotEnterpriseHostView(),
                     ProviderManagerState.AddGitHubCopilotEnterpriseApiBase => BuildGitHubCopilotEnterpriseApiBaseView(),
                     ProviderManagerState.AddCredentials => BuildCredentialsView(),
-                    ProviderManagerState.AddCredentialsEndpoint => BuildCredentialsEndpointView(),
+                    ProviderManagerState.AddOptionalApiKey => BuildOptionalApiKeyView(),
                     ProviderManagerState.AddOAuthDeviceFlow => BuildOAuthDeviceFlowView(),
                     ProviderManagerState.AddBrowserOAuthFlow => BuildBrowserOAuthFlowView(),
                     ProviderManagerState.AddValidating => BuildValidatingView(),
@@ -100,7 +103,7 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
                     ProviderManagerState.Details => BuildDetailsView(),
                     ProviderManagerState.RenameProvider => BuildRenameView(),
                     ProviderManagerState.FixCredentials => BuildFixCredentialsView(),
-                    ProviderManagerState.FixApiKey => BuildFixApiKeyView(),
+                    ProviderManagerState.FixSelectOptionalApiKeyUpdate => BuildFixOptionalApiKeyUpdateView(),
                     ProviderManagerState.RemoveConfirm => BuildRemoveConfirmView(),
                     _ => Layouts.Empty()
                 };
@@ -163,6 +166,12 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
                         " [\u2191/\u2193] Navigate  [Enter] Select  [Esc] Back  [Ctrl+Q] Quit",
                     ProviderManagerState.AddName =>
                         " [Enter] Continue  [Esc] Cancel  [Ctrl+Q] Quit",
+                    ProviderManagerState.AddOptionalApiKey =>
+                        ViewModel.IsFixFlow
+                            ? " [Enter] Continue  [Esc] Back  [Ctrl+Q] Quit"
+                            : " [Enter] Continue (blank skips the key)  [Esc] Back  [Ctrl+Q] Quit",
+                    ProviderManagerState.FixSelectOptionalApiKeyUpdate =>
+                        " [\u2191/\u2193] Navigate  [Enter] Select  [Esc] Back  [Ctrl+Q] Quit",
                     ProviderManagerState.AddGitHubCopilotAuthHost =>
                         " [\u2191/\u2193] Navigate  [Enter] Select  [Esc] Back  [Ctrl+Q] Quit",
                     ProviderManagerState.AddGitHubCopilotEnterpriseHost =>
@@ -229,6 +238,8 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
         IsConfigured = false
     };
 
+    private static string ProviderLabel(ProviderDisplayItem p) => $"{p.ConfiguredName} ({p.DisplayName})";
+
     private ILayoutNode BuildProviderListView()
     {
         // Keep the list typed so keybindings can read the live HighlightedItem
@@ -237,9 +248,21 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
         // matched by reference.
         var items = ViewModel.DisplayProviders.ToList();
 
+        // Size the Provider column to the longest label (capped, so a long type label
+        // like OpenAI-compatible cannot crowd out Endpoint) and give Endpoint the rest.
+        // Auth (12) and a 24-column Endpoint floor are reserved out of the terminal
+        // width, and the list's selection prefix and panel border take the remainder.
+        const int AuthWidth = 12;
+        const int MinEndpointWidth = 24;
+        const int ChromeWidth = 12;
+        var providerWidth = NetclawTuiChrome.FitColumnWidth(
+            items.Select(static p => p.IsConfigured ? ProviderLabel(p) : p.DisplayName),
+            "Provider",
+            Math.Min(NetclawTuiChrome.MaxProviderColumnWidth, _terminal.Width - ChromeWidth - AuthWidth - MinEndpointWidth));
+
         _providerList = Layouts.SelectionList(
                 items.Concat(new[] { AddNewProviderItem }),
-                static p =>
+                p =>
                 {
                     if (ReferenceEquals(p, AddNewProviderItem))
                         return AddNewProviderSentinel;
@@ -254,11 +277,10 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
                             _ => " "
                         };
 
-                        var nameLabel = $"{p.ConfiguredName} ({p.DisplayName})";
-                        return $"{statusChar} {nameLabel,-36} {p.DisplayAuth,-12} {p.DisplayEndpoint}";
+                        return $"{statusChar} {NetclawTuiChrome.FitColumn(ProviderLabel(p), providerWidth)} {p.DisplayAuth,-AuthWidth} {p.DisplayEndpoint}";
                     }
 
-                    return $"  {p.DisplayName,-36} {"(not configured)",-12}";
+                    return $"  {NetclawTuiChrome.FitColumn(p.DisplayName, providerWidth)} {"(not configured)",-AuthWidth}";
                 })
             .WithMode(SelectionMode.Single)
             .WithHighlightColors(Color.Black, Color.Cyan);
@@ -289,7 +311,7 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
             .DisposeWith(_stepSubs);
 
         return Layouts.Vertical()
-            .WithChild(new TextNode($"  {"",2}{"Provider",-36} {"Auth",-12} Endpoint")
+            .WithChild(new TextNode($"  {"",3}{NetclawTuiChrome.FitColumn("Provider", providerWidth)} {"Auth",-AuthWidth} Endpoint")
                 .WithForeground(Color.White).Bold())
             .WithChild(_providerList.WithFillHeight());
     }
@@ -334,11 +356,7 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
         children.WithChild(new TextNode("").Height(1));
 
         _nameInput = new TextInputNode().WithPlaceholder($"my-{providerType}");
-        _nameInput.Text = ViewModel.NewProviderName ?? string.Empty;
-        // Termina's Text setter leaves the cursor at position 0. Synthesize
-        // End so the user can immediately edit the suffix instead of having
-        // their first keystroke insert before the pre-filled name.
-        _nameInput.HandleInput(new ConsoleKeyInfo('\0', ConsoleKey.End, shift: false, alt: false, control: false));
+        NetclawTuiChrome.SeedTextInput(_nameInput, ViewModel.NewProviderName);
         _nameInput.OnFocused();
         _lastFocusedInput = _nameInput;
 
@@ -442,7 +460,7 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
         _githubCopilotHostInput = new TextInputNode()
             .WithPlaceholder("https://ghe.example.com");
         if (!string.IsNullOrWhiteSpace(ViewModel.NewGitHubCopilotHost))
-            _githubCopilotHostInput.Text = ViewModel.NewGitHubCopilotHost;
+            NetclawTuiChrome.SeedTextInput(_githubCopilotHostInput, ViewModel.NewGitHubCopilotHost);
         _githubCopilotHostInput.OnFocused();
         _lastFocusedInput = _githubCopilotHostInput;
 
@@ -480,7 +498,7 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
         _githubCopilotApiBaseInput = new TextInputNode()
             .WithPlaceholder(placeholder);
         if (!string.IsNullOrWhiteSpace(ViewModel.NewGitHubCopilotApiBase))
-            _githubCopilotApiBaseInput.Text = ViewModel.NewGitHubCopilotApiBase;
+            NetclawTuiChrome.SeedTextInput(_githubCopilotApiBaseInput, ViewModel.NewGitHubCopilotApiBase);
         _githubCopilotApiBaseInput.OnFocused();
         _lastFocusedInput = _githubCopilotApiBaseInput;
 
@@ -536,8 +554,10 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
                     .WithForeground(Color.Gray));
             }
         }
-        else if (descriptor.Auth is EndpointOnlyAuth)
+        else if (descriptor.Auth.IsCredentialOptional())
         {
+            var offersOptionalKey = descriptor.Auth.OffersOptionalApiKey();
+
             children.WithChild(new TextNode("").Height(1));
             children.WithChild(new TextNode($"  Endpoint (default: {descriptor.DefaultEndpoint}):")
                 .WithForeground(Color.White));
@@ -551,100 +571,80 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
                 .Subscribe(text =>
                 {
                     ViewModel.NewEndpoint = string.IsNullOrWhiteSpace(text) ? null : text;
-                    ViewModel.SubmitCredentials();
+
+                    if (offersOptionalKey)
+                        ViewModel.AdvanceToOptionalApiKey();
+                    else
+                        ViewModel.SubmitCredentials();
                 })
                 .DisposeWith(_stepSubs);
 
             children.WithChild(NetclawTuiChrome.BuildTextInputPanel(_endpointInput, "Endpoint"));
 
             children.WithChild(new TextNode("").Height(1));
-            children.WithChild(new TextNode($"  {descriptor.DisplayName} runs locally. No authentication required.")
+            children.WithChild(new TextNode(offersOptionalKey
+                    ? $"  {descriptor.DisplayName} runs locally. Authentication is optional."
+                    : $"  {descriptor.DisplayName} runs locally. No authentication required.")
                 .WithForeground(Color.Gray));
-        }
-        else if (descriptor.Auth is EndpointOrApiKeyAuth)
-        {
-            // Optional-auth endpoint. "No auth" entered the endpoint here directly;
-            // "API Key" renders the key input (endpoint was collected one stage earlier).
-            children.WithChild(new TextNode("").Height(1));
-
-            if (ViewModel.NewAuthMethod == AuthMethod.None)
-            {
-                children.WithChild(new TextNode($"  Endpoint (default: {descriptor.DefaultEndpoint}):")
-                    .WithForeground(Color.White));
-
-                _endpointInput = new TextInputNode()
-                    .WithPlaceholder(descriptor.DefaultEndpoint);
-                _endpointInput.OnFocused();
-                _lastFocusedInput = _endpointInput;
-
-                _endpointInput.Submitted
-                    .Subscribe(text =>
-                    {
-                        ViewModel.NewEndpoint = string.IsNullOrWhiteSpace(text) ? null : text;
-                        ViewModel.SubmitCredentials();
-                    })
-                    .DisposeWith(_stepSubs);
-
-                children.WithChild(NetclawTuiChrome.BuildTextInputPanel(_endpointInput, "Endpoint"));
-
-                children.WithChild(new TextNode("").Height(1));
-                children.WithChild(new TextNode("  No auth selected. Your endpoint must be reachable without a key.")
-                    .WithForeground(Color.Gray));
-            }
-            else
-            {
-                children.WithChild(new TextNode("  API Key:").WithForeground(Color.White));
-
-                _apiKeyInput = new TextInputNode()
-                    .AsPassword()
-                    .WithPlaceholder($"Enter {providerType} API key...");
-                _apiKeyInput.OnFocused();
-                _lastFocusedInput = _apiKeyInput;
-
-                _apiKeyInput.Submitted
-                    .Subscribe(text =>
-                    {
-                        ViewModel.NewApiKey = text;
-                        ViewModel.SubmitCredentials();
-                    })
-                    .DisposeWith(_stepSubs);
-
-                children.WithChild(NetclawTuiChrome.BuildTextInputPanel(_apiKeyInput, "API Key"));
-
-                children.WithChild(new TextNode("").Height(1));
-                children.WithChild(new TextNode("  The key is sent as a Bearer token and stored in secrets.json.")
-                    .WithForeground(Color.Gray));
-            }
         }
 
         return children;
     }
 
-    private ILayoutNode BuildCredentialsEndpointView()
+    /// <summary>
+    /// Optional Bearer key prompt for <see cref="OptionalApiKeyAuth"/> providers.
+    /// Shared by the add flow (which writes <c>NewApiKey</c>) and the fix flow
+    /// (which writes <c>FixApiKey</c>), because those flows persist through
+    /// different view-model paths.
+    /// </summary>
+    private ILayoutNode BuildOptionalApiKeyView()
     {
+        var isFixFlow = ViewModel.IsFixFlow;
+        var providerType = isFixFlow
+            ? ViewModel.DetailProvider?.ProviderType
+            : ViewModel.NewProviderType;
+        var descriptor = ViewModel.Registry.Get(providerType ?? "unknown");
         var children = Layouts.Vertical();
-        var providerType = ViewModel.NewProviderType ?? "unknown";
-        var descriptor = ViewModel.Registry.Get(providerType);
 
-        children.WithChild(new TextNode($"  Provider: {descriptor.DisplayName} (name: {ViewModel.NewProviderName})")
-            .WithForeground(Color.White));
-        children.WithChild(new TextNode("").Height(1));
-        children.WithChild(new TextNode($"  Endpoint (default: {descriptor.DefaultEndpoint}):")
-            .WithForeground(Color.White));
+        children.WithChild(new TextNode("  API key (optional):").WithForeground(Color.White));
 
-        _endpointInput = new TextInputNode()
-            .WithPlaceholder(descriptor.DefaultEndpoint);
-        _endpointInput.OnFocused();
-        _lastFocusedInput = _endpointInput;
+        _apiKeyInput = new TextInputNode()
+            .AsPassword()
+            .WithPlaceholder(isFixFlow
+                ? "Enter the replacement API key..."
+                : "Leave blank for no authentication...");
+        NetclawTuiChrome.SeedTextInput(_apiKeyInput, isFixFlow ? ViewModel.FixApiKey : ViewModel.NewApiKey);
+        _apiKeyInput.OnFocused();
+        _lastFocusedInput = _apiKeyInput;
 
-        _endpointInput.Submitted
-            .Subscribe(text => ViewModel.SubmitEndpointCredential(text))
+        // Unlike the required-key path there is no IsNullOrWhiteSpace filter:
+        // a blank submit is the meaningful "run without a credential" answer.
+        _apiKeyInput.Submitted
+            .Subscribe(text =>
+            {
+                if (isFixFlow)
+                {
+                    ViewModel.FixApiKey = text;
+                    ViewModel.SubmitFixCredentials();
+                }
+                else
+                {
+                    ViewModel.NewApiKey = string.IsNullOrWhiteSpace(text) ? null : text;
+                    ViewModel.SubmitOptionalApiKey();
+                }
+            })
             .DisposeWith(_stepSubs);
 
-        children.WithChild(NetclawTuiChrome.BuildTextInputPanel(_endpointInput, "Endpoint"));
+        children.WithChild(NetclawTuiChrome.BuildTextInputPanel(_apiKeyInput, "API Key"));
 
         children.WithChild(new TextNode("").Height(1));
-        children.WithChild(new TextNode("  Next: enter the API key sent as a Bearer token to this endpoint.")
+        children.WithChild(new TextNode($"  Only needed when the {descriptor.DisplayName} endpoint")
+            .WithForeground(Color.Gray));
+        children.WithChild(new TextNode(isFixFlow
+                ? "  sits behind an authenticated gateway."
+                : "  sits behind an authenticated gateway. Press [Enter] to skip.")
+            .WithForeground(Color.Gray));
+        children.WithChild(new TextNode("  A supplied key is sent as a Bearer token and stored in secrets.json.")
             .WithForeground(Color.Gray));
 
         return children;
@@ -853,11 +853,7 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
         children.WithChild(new TextNode("").Height(1));
 
         _renameInput = new TextInputNode().WithPlaceholder(item.ConfiguredName ?? "");
-        _renameInput.Text = ViewModel.RenameNewName ?? item.ConfiguredName ?? string.Empty;
-        // Termina's Text setter leaves the cursor at position 0. Synthesize
-        // End so the user can immediately edit the suffix instead of having
-        // their first keystroke insert before the pre-filled name.
-        _renameInput.HandleInput(new ConsoleKeyInfo('\0', ConsoleKey.End, shift: false, alt: false, control: false));
+        NetclawTuiChrome.SeedTextInput(_renameInput, ViewModel.RenameNewName ?? item.ConfiguredName);
         _renameInput.OnFocused();
         _lastFocusedInput = _renameInput;
 
@@ -870,7 +866,7 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
         children.WithChild(new TextNode("").Height(1));
         children.WithChild(new TextNode("  Renames the provider and cascades the change to any model")
             .WithForeground(Color.Gray));
-        children.WithChild(new TextNode("  role(s) that reference it. Restart the daemon for changes to take effect.")
+        children.WithChild(new TextNode($"  role(s) that reference it. {ConfigFileHelper.DaemonAppliesChange}")
             .WithForeground(Color.Gray));
 
         return children;
@@ -921,26 +917,44 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
             children.WithChild(new TextNode("").Height(1));
             children.WithChild(reAuthList);
         }
-        else if (descriptor.Auth is EndpointOnlyAuth or EndpointOrApiKeyAuth)
+        else if (descriptor.Auth.IsCredentialOptional())
         {
+            // Credential-optional providers edit the endpoint first.
+            // An explicit choice controls any stored optional key.
+            var offersOptionalKey = descriptor.Auth.OffersOptionalApiKey();
+
             children.WithChild(new TextNode("").Height(1));
             children.WithChild(new TextNode("  Endpoint:").WithForeground(Color.White));
 
             _endpointInput = new TextInputNode()
                 .WithPlaceholder(item.Entry?.Endpoint ?? descriptor.DefaultEndpoint);
+            if (!string.Equals(ViewModel.FixEndpoint, item.Entry?.Endpoint, StringComparison.Ordinal))
+            {
+                NetclawTuiChrome.SeedTextInput(_endpointInput, ViewModel.FixEndpoint);
+            }
             _endpointInput.OnFocused();
             _lastFocusedInput = _endpointInput;
 
             _endpointInput.Submitted
-                .Subscribe(text => ViewModel.SubmitFixEndpoint(text))
+                .Subscribe(text =>
+                {
+                    ViewModel.FixEndpoint = string.IsNullOrWhiteSpace(text)
+                        ? item.Entry?.Endpoint
+                        : text;
+
+                    if (offersOptionalKey)
+                        ViewModel.AdvanceToFixOptionalApiKeyUpdate();
+                    else
+                        ViewModel.SubmitFixCredentials();
+                })
                 .DisposeWith(_stepSubs);
 
             children.WithChild(NetclawTuiChrome.BuildTextInputPanel(_endpointInput, "Endpoint"));
 
-            if (descriptor.Auth is EndpointOrApiKeyAuth && item.Entry?.AuthMethod == AuthMethod.ApiKey)
+            if (offersOptionalKey && item.Entry is not null && !item.Entry.ApiKey.IsNullOrEmpty())
             {
                 children.WithChild(new TextNode("").Height(1));
-                children.WithChild(new TextNode("  Next: enter the replacement API key for this endpoint.")
+                children.WithChild(new TextNode("  An API key is stored for this provider.")
                     .WithForeground(Color.Gray));
             }
         }
@@ -977,33 +991,45 @@ public sealed class ProviderManagerPage : ReactivePage<ProviderManagerViewModel>
         return children;
     }
 
-    private ILayoutNode BuildFixApiKeyView()
+    private ILayoutNode BuildFixOptionalApiKeyUpdateView()
     {
         var item = ViewModel.DetailProvider;
         if (item is null)
             return Layouts.Empty();
 
-        var children = Layouts.Vertical();
-        children.WithChild(new TextNode($"  New API key for: {item.ConfiguredName} ({item.DisplayName})")
-            .WithForeground(Color.White).Bold());
-        children.WithChild(new TextNode("").Height(1));
+        var hasStoredKey = item.Entry is { } entry && !entry.ApiKey.IsNullOrEmpty();
+        var options = hasStoredKey
+            ? new List<string> { "Keep current API key", "Replace API key", "Remove API key" }
+            : new List<string> { "Use no authentication", "Add API key" };
 
-        _apiKeyInput = new TextInputNode()
-            .AsPassword()
-            .WithPlaceholder($"Enter new {item.DisplayName} API key...");
-        _apiKeyInput.OnFocused();
-        _lastFocusedInput = _apiKeyInput;
+        var children = Layouts.Vertical()
+            .WithChild(new TextNode("  Select the API-key update:").WithForeground(Color.White));
 
-        _apiKeyInput.Submitted
-            .Subscribe(text =>
+        var updateList = Layouts.SelectionList(options)
+            .WithMode(SelectionMode.Single)
+            .WithHighlightColors(Color.Black, Color.Cyan);
+        updateList.OnFocused();
+        _lastFocusedList = updateList;
+
+        updateList.SelectionConfirmed
+            .Subscribe(selected =>
             {
-                ViewModel.FixApiKey = text;
-                ViewModel.SubmitFixCredentials();
+                if (selected.Count == 0)
+                    return;
+
+                var update = selected[0] switch
+                {
+                    "Keep current API key" => OptionalApiKeyUpdate.KeepCurrent,
+                    "Replace API key" or "Add API key" => OptionalApiKeyUpdate.Replace,
+                    "Remove API key" or "Use no authentication" => OptionalApiKeyUpdate.Remove,
+                    _ => throw new InvalidOperationException("The optional API-key choice is invalid.")
+                };
+                ViewModel.SelectFixOptionalApiKeyUpdate(update);
             })
             .DisposeWith(_stepSubs);
 
-        children.WithChild(NetclawTuiChrome.BuildTextInputPanel(_apiKeyInput, "API Key"));
-
+        children.WithChild(new TextNode("").Height(1));
+        children.WithChild(updateList);
         return children;
     }
 

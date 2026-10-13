@@ -225,6 +225,9 @@ public sealed class AcsPolicyApplier
         return modules;
     }
 
+    // Best-effort rollback: a policy directory locked by another process must
+    // not crash the daemon. The next successful apply replaces the directory.
+    [SlopwatchSuppress("SW003", "Best-effort rollback of the previous policy directory; the next successful apply replaces it, so a locked directory must not crash the daemon.")]
     private static void RestoreBackup(string policyDirectory, string backupDirectory)
     {
         try
@@ -241,6 +244,7 @@ public sealed class AcsPolicyApplier
         }
     }
 
+    [SlopwatchSuppress("SW003", "Best-effort cleanup of staging and backup directories; the next apply uses new guids, so a locked leftover must not crash the daemon.")]
     private static void TryDeleteDirectory(string? directory)
     {
         if (directory is null)
@@ -262,4 +266,15 @@ public sealed class AcsPolicyApplier
         _logger.LogWarning("Panel policy set rejected: {Error}", error);
         return new AcsPolicyApplyResult(false, error);
     }
+}
+
+/// <summary>
+/// Supplies source-level Slopwatch suppressions without a runtime package dependency.
+/// </summary>
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = true)]
+internal sealed class SlopwatchSuppressAttribute(string ruleId, string reason) : Attribute
+{
+    public string RuleId { get; } = ruleId;
+
+    public string Reason { get; } = reason;
 }

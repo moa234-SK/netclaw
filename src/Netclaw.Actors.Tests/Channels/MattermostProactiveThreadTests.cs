@@ -329,11 +329,13 @@ public sealed class MattermostProactiveThreadActorTests(ITestOutputHelper output
             TimeProvider: TimeProvider.System,
             Options: options,
             DefaultChannelId: null,
+            ChannelRegistry: TestChannelRegistries.MattermostWithProcessingRenderer(
+                new UnconfiguredMattermostReplyClient()),
             ReplyClient: new UnconfiguredMattermostReplyClient(),
             ContentScanner: new NullContentScanner(),
             AudienceProfiles: TestMattermostGatewayDeps.DefaultAudienceProfiles,
             ModelCapabilities: TestMattermostGatewayDeps.DefaultVisionCapableModel,
-            Paths: TestMattermostGatewayDeps.NewTestPaths(),
+                        StorageResolver: Netclaw.Actors.Protocol.TestSessionStorageResolver.Instance,
             SessionPropsFactory: (_, _, _, _) => Props.Create(() => new ForwardActor(TestActor)));
 
         return Sys.ActorOf(

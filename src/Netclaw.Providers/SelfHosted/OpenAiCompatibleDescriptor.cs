@@ -3,7 +3,6 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
-using System.Net.Http.Headers;
 using System.Text.Json;
 using Netclaw.Configuration;
 
@@ -29,30 +28,38 @@ public sealed class OpenAiCompatibleDescriptor : IProviderDescriptor
     // endpoint via OpenAiCompatibleEndpoint.RelativeModelsPath because a
     // base that already pins a version (…/v4) must not get another "/v1".
     public string ModelListingPath => "/v1/models";
-    public IProviderAuth Auth { get; } = new EndpointOrApiKeyAuth();
+    // Endpoint-only by default, but an operator may supply a Bearer key for
+    // gateways that sit in front of a protected vLLM / llama.cpp / SGLang
+    // endpoint. The clients send the key when the operator selects API-key auth.
+    // This declaration lets each setup surface collect the optional key.
+    public IProviderAuth Auth { get; } = new OptionalApiKeyAuth();
 
     public Task<ProviderProbeResult> ProbeAsync(
         ProviderEntry entry, CancellationToken ct = default)
     {
+        // Same endpoint normalisation as chat: the configured endpoint may or may not
+        // end in /v1, so the models path comes from OpenAiCompatibleEndpoint rather
+        // than being appended to the raw string.
+        var endpoint = OpenAiCompatibleEndpoint.FromBaseUrl(
+            string.IsNullOrWhiteSpace(entry.Endpoint) ? DefaultEndpoint : entry.Endpoint);
+
+        // Fail loud on malformed vendor headers before any wire work: the
+        // operator configured them for every request kind, so a probe must
+        // not send one without them.
         if (!OpenAiCompatibleRequestHeaders.TryResolve(entry, out var requestHeaders, out var headerError))
             return Task.FromResult(new ProviderProbeResult(false, headerError, []));
-
-        var effectiveBase = string.IsNullOrWhiteSpace(entry.Endpoint)
-            ? DefaultEndpoint
-            : entry.Endpoint;
-        var listingPath = OpenAiCompatibleEndpoint.RelativeModelsPath(effectiveBase);
 
         return ProbeHelpers.ExecuteProbeAsync(
             _httpClient,
             TypeKey,
             DefaultEndpoint,
-            listingPath,
-            entry.Endpoint,
+            endpoint.ModelsPath,
+            endpoint.BaseUri.GetLeftPart(UriPartial.Authority),
             request =>
             {
-                var apiKey = entry.ApiKey?.Value;
-                if (!string.IsNullOrWhiteSpace(apiKey))
-                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                OpenAiCompatibleHttp.ApplyBearerAuth(
+                    request,
+                    entry.AuthMethod is AuthMethod.ApiKey ? entry.ApiKey?.Value : null);
                 OpenAiCompatibleRequestHeaders.Apply(request, requestHeaders);
             },
             ParseModels,

@@ -11,7 +11,6 @@ on:
       - master
       - dev
       - main
-      - feature/*
   pull_request:
     branches:
       - master
@@ -75,7 +74,13 @@ jobs:
         # 30-min job cap) and is diagnosable from the CI log + the uploaded dump instead of a silent
         # timeout. The full dump carries every thread's stack — needed to confirm the suspected
         # macOS/ARM64 weak-memory-ordering hang in the TUI view-models.
-        run: dotnet test -c Release --blame-hang-timeout 300s --blame-hang-dump-type full --results-directory ./TestResults
+        run: dotnet test -c Release --filter "Category!=NativeShell" --blame-hang-timeout 300s --blame-hang-dump-type full --results-directory ./TestResults
+
+      - name: "dotnet test (native shell, serial)"
+        if: runner.os == 'Windows'
+        shell: bash
+        # The native PowerShell test needs an isolated Windows host.
+        run: dotnet test -c Release --no-build --filter "Category=NativeShell" --blame-hang-timeout 300s --blame-hang-dump-type full --results-directory ./TestResults
 
       # Diagnostic: surface the blame Sequence file (names the stuck test) in the CI log so a
       # platform-specific hang can be pinpointed even without downloading the dump artifact.
@@ -88,6 +93,19 @@ jobs:
             for f in $seq; do echo "===== HANG SEQUENCE: $f ====="; cat "$f"; echo; done
           else
             echo "No blame Sequence file — no test hang detected."
+          fi
+
+      # The VSTest adapter shows only "Test Assembly Cleanup Failure" for the temp-leak gate.
+      # The gate also writes its report next to the test assembly. Print it here.
+      - name: "Show test temp leaks (if a test leaked)"
+        if: always()
+        shell: bash
+        run: |
+          reports=$(find ./src ./tests -name 'test-temp-leaks.txt' 2>/dev/null || true)
+          if [ -n "$reports" ]; then
+            for f in $reports; do echo "===== TEST TEMP LEAKS: $f ====="; cat "$f"; echo; done
+          else
+            echo "No test temp leak report."
           fi
 
       # Upload the hang dump + sequence file so a dedicated agent can open the dump (dotnet-dump
@@ -128,6 +146,73 @@ jobs:
         run: bash scripts/smoke/cli-smoke.sh
         env:
           NETCLAW_CLI: ./install-test/netclaw
+
+  mutation-gates:
+    # One job definition for every focused Stryker gate. Each matrix group shares
+    # one checkout, SDK install, and tool restore. To add a gate, add its script
+    # name (scripts/run-<name>-mutations.sh) to the lightest group. The groups
+    # are balanced by measured gate time (about 13 to 14 minutes each) so each
+    # one finishes well inside the job timeout and before the Windows test job.
+    name: Mutation Gates (${{ matrix.group }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: shell-analysis
+            gates: shell-command-analysis tool-authorizer-order mcp-artifact-admission
+          - group: shell-assignment-and-paths
+            gates: shell-assignment shell-config-read path-access
+          - group: verb-chain-and-reminder
+            gates: exact-verb-chain reminder-execution literal-twin
+          - group: approval-and-authorization
+            gates: tool-authorization approval-directory skill-manage-guard no-program
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: "Install .NET SDK"
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: "./global.json"
+
+      - name: "Restore .NET tools"
+        run: dotnet tool restore
+
+      # Run every gate in the group, even after a failure, so one run reports
+      # all failed gates. The step fails if any gate fails.
+      - name: "Run mutation gates"
+        env:
+          GATES: ${{ matrix.gates }}
+        run: |
+          failed=()
+          for gate in $GATES; do
+            echo "::group::$gate"
+            if "./scripts/run-${gate}-mutations.sh"; then
+              echo "- \`$gate\`: passed" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- \`$gate\`: FAILED" >> "$GITHUB_STEP_SUMMARY"
+              failed+=("$gate")
+            fi
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} > 0 )); then
+            echo "::error::Mutation gates failed: ${failed[*]}"
+            exit 1
+          fi
+
+      - name: "Upload mutation reports"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-reports-${{ matrix.group }}
+          path: ./artifacts/stryker
+          if-no-files-found: ignore
+          retention-days: 14
 
   copyright-headers:
     name: Copyright Headers
@@ -215,6 +300,72 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: ./scripts/smoke/install-smoke.ps1
+
+  eval-oracles:
+    name: Eval Oracle Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install eval assertion dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq sqlite3
+      - name: Check eval assertions and fixture protocol
+        run: |
+          bash -n evals/run-evals.sh
+          bash -n evals/run-background-evals.sh
+          bash -n evals/cycle_evals.sh
+          python3 -m unittest discover -s evals -p test_background_evals.py -v
+          python3 -m unittest discover -s evals -p test_cycle_evals.py -v
+          python3 -m unittest discover -s evals -p test_cli_detector_evals.py -v
+          python3 -m unittest discover -s evals -p test_spill_steer_evals.py -v
+
+  approval-outcome-direction:
+    name: Approval Outcome Direction
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # The check reads the review snapshot at the base revision with git show,
+      # so it needs the base history.
+      - name: "Checkout"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: "Self-tests"
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+      # An allowed case must stay allowed, and a denied case must stay denied.
+      # See TOOLING.md "Outcome Direction Check".
+      - name: "Check approval outcome direction"
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request)
+              python3 scripts/check-approval-outcome-direction.py --base-ref "origin/$PR_BASE_REF" ;;
+            merge_group)
+              python3 scripts/check-approval-outcome-direction.py --base-rev "$MERGE_GROUP_BASE_SHA" ;;
+            push)
+              if [[ "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+                echo "New branch push: compare with the merge base of origin/dev."
+                python3 scripts/check-approval-outcome-direction.py --base-ref origin/dev
+              elif ! git merge-base --is-ancestor "$PUSH_BEFORE_SHA" HEAD 2>/dev/null; then
+                # A force push (for example, GitHub rebasing a stacked PR) replaces
+                # the history. The previous head is then not in this clone.
+                echo "Force push: $PUSH_BEFORE_SHA is not an ancestor of HEAD. Compare with the merge base of origin/dev."
+                python3 scripts/check-approval-outcome-direction.py --base-ref origin/dev
+              else
+                python3 scripts/check-approval-outcome-direction.py --base-rev "$PUSH_BEFORE_SHA"
+              fi ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 2 ;;
+          esac
 
   semver-conformance:
     name: SemVer Conformance

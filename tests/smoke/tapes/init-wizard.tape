@@ -34,6 +34,10 @@ Backspace 32
 Type "__SMOKE_LLM_ENDPOINT__"
 Enter
 
+# OpenAI-compatible endpoints can use an optional Bearer key.
+Wait+Screen@10s /API key \(optional\)/
+Enter
+
 # Wait for connection probe + model discovery. The success message
 # auto-advances to the model list quickly enough that vhs can miss it;
 # wait directly for the model selection header instead.
@@ -70,8 +74,8 @@ Enter
 # They contact the smoke provider, write config, validate, and start the daemon.
 # On a clean bootstrap, once validation passes the wizard launches chat
 # automatically — there is no Enter gate / post-flight summary to confirm.
-# Anchor on a health item that renders during the run (it stays on screen
-# through the daemon-start poll), then wait for the chat screen to take over.
+# Anchor on a health item that remains through the daemon-start poll.
+# The session message proves that the chat screen took control.
 Wait+Screen@60s /Configuration written/
-Wait+Screen@60s /Ready  \|  netclaw-smoke-tool-model/
+Wait+Screen@60s /System: Session started\./
 Ctrl+Q

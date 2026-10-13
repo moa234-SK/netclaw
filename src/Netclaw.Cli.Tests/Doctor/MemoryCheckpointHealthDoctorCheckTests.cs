@@ -3,6 +3,7 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
+using Netclaw.Tests.Utilities;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Netclaw.Actors.Memory;
@@ -12,15 +13,19 @@ using Xunit;
 
 namespace Netclaw.Cli.Tests.Doctor;
 
-public sealed class MemoryCheckpointHealthDoctorCheckTests
+public sealed class MemoryCheckpointHealthDoctorCheckTests : IDisposable
 {
+    private readonly DisposableTempDir _temp = new();
+
+    public void Dispose() => _temp.Dispose();
+
     [Fact]
     public async Task Passes_WhenSqliteMemoryQueueIsSmall()
     {
         var paths = CreateTempPaths();
         WriteMemoryProvider(paths, "sqlite");
 
-        var store = new SQLiteMemoryStore(paths.MemorySqliteDbPath, TimeProvider.System);
+        var store = new SQLiteMemoryStore(paths.SqliteDbPath, TimeProvider.System);
         await store.InitializeAsync(TestContext.Current.CancellationToken);
         await store.EnqueueCheckpointAsync(new SQLiteMemoryCheckpoint(
             CheckpointId: "cp-1",
@@ -34,7 +39,7 @@ public sealed class MemoryCheckpointHealthDoctorCheckTests
             CreatedAtMs: TimeProvider.System.GetUtcNow().ToUnixTimeMilliseconds(),
             UpdatedAtMs: TimeProvider.System.GetUtcNow().ToUnixTimeMilliseconds()), TestContext.Current.CancellationToken);
 
-        await ForceWalCheckpointAsync(paths.MemorySqliteDbPath, TestContext.Current.CancellationToken);
+        await ForceWalCheckpointAsync(paths.SqliteDbPath, TestContext.Current.CancellationToken);
 
         var check = new MemoryCheckpointHealthDoctorCheck(paths);
         var result = await check.RunAsync(TestContext.Current.CancellationToken);
@@ -49,7 +54,7 @@ public sealed class MemoryCheckpointHealthDoctorCheckTests
         var paths = CreateTempPaths();
         WriteMemoryProvider(paths, "sqlite");
 
-        var store = new SQLiteMemoryStore(paths.MemorySqliteDbPath, TimeProvider.System);
+        var store = new SQLiteMemoryStore(paths.SqliteDbPath, TimeProvider.System);
         await store.InitializeAsync(TestContext.Current.CancellationToken);
 
         var now = TimeProvider.System.GetUtcNow().ToUnixTimeMilliseconds();
@@ -68,7 +73,7 @@ public sealed class MemoryCheckpointHealthDoctorCheckTests
                 UpdatedAtMs: now), TestContext.Current.CancellationToken);
         }
 
-        await ForceWalCheckpointAsync(paths.MemorySqliteDbPath, TestContext.Current.CancellationToken);
+        await ForceWalCheckpointAsync(paths.SqliteDbPath, TestContext.Current.CancellationToken);
 
         var check = new MemoryCheckpointHealthDoctorCheck(paths);
         var result = await check.RunAsync(TestContext.Current.CancellationToken);
@@ -77,9 +82,9 @@ public sealed class MemoryCheckpointHealthDoctorCheckTests
         Assert.Contains("pending checkpoints", result.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static NetclawPaths CreateTempPaths()
+    private NetclawPaths CreateTempPaths()
     {
-        var basePath = Path.Combine(Path.GetTempPath(), "netclaw-tests", Guid.NewGuid().ToString("N"));
+        var basePath = Path.Combine(_temp.Path, Guid.NewGuid().ToString("N"));
         var paths = new NetclawPaths(basePath);
         paths.EnsureDirectoriesExist();
         return paths;

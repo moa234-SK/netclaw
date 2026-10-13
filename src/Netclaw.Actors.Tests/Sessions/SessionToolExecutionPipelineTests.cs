@@ -12,22 +12,54 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Time.Testing;
+using Netclaw.Actors.Authorization.Consent;
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Sessions;
 using Netclaw.Actors.Sessions.Pipelines;
 using Netclaw.Actors.Tests.Sessions.Pipelines;
 using Netclaw.Actors.Tools;
+using Netclaw.Actors.Tests.Tools;
+using Netclaw.Actors.Tests.Memory;
 using Netclaw.Configuration;
+using Netclaw.Security;
+using Netclaw.Security.Authorization.Consent;
 using Netclaw.Tests.Utilities;
 using Netclaw.Tools;
+using ShellSyntaxTree;
 using Xunit;
 using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Tests.Sessions;
 
-public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) : TestKit(output: output)
+public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) : TestKit(output: output), IAsyncDisposable
 {
+    // The native-tool correction test makes the pipeline create a managed
+    // temporary directory inside its session directory.
+    private readonly DisposableTempDir _temp = new();
+
+    // TestKit stops the actor system only after AfterAllAsync returns. An actor can
+    // still write into the directory until then. Delete the directory after TestKit
+    // has disposed, and not in AfterAllAsync.
+    async ValueTask IAsyncDisposable.DisposeAsync()
+    {
+        try
+        {
+            await base.DisposeAsync();
+        }
+        finally
+        {
+            _temp.Dispose();
+        }
+    }
+
+    private static readonly string ManagedTemporarySessionDirectory = Path.GetFullPath(
+        Path.Combine(Path.GetTempPath(), "netclaw-test-sessions", "example"));
+    private static readonly string TestManagedTemporaryDirectory = Path.Combine(
+        ManagedTemporarySessionDirectory,
+        "tmp",
+        "parent");
+
     protected override void ConfigureServices(HostBuilderContext context, IServiceCollection services)
     {
     }
@@ -63,7 +95,10 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
             turnContext,
             new SessionToolRunEnvironment
             {
-                SessionDirectory = Path.GetTempPath(),
+                Storage = SessionStoragePaths.CreateLegacy(
+                    Path.GetTempPath(),
+                    Path.Combine(Path.GetTempPath(), "netclaw-test-session-logs"),
+                    "test-session"),
                 InlineOutputBudget = new InlineOutputBudget(4096),
                 SpawnChildActor = static (_, _, _) => Task.FromResult<object>(new object())
             })
@@ -124,7 +159,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
             TimeSpan.FromSeconds(2),
             cancellationToken: TestContext.Current.CancellationToken);
 
-        approvalChannel.Complete(approvalRequest.CallId, ApprovalDecision.ApprovedOnce);
+        approvalChannel.Complete(approvalRequest.CallId, ConsentAnswer.Once.Instance);
 
         var completed = await probe.ExpectMsgAsync<ToolExecutionCompleted>(
             TimeSpan.FromSeconds(3),
@@ -133,7 +168,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
         Assert.Single(completed.ToolResults);
-        Assert.Equal("approved-and-ran", completed.ToolResults[0].Content);
+        Assert.Equal("approved-and-ran\n[approval: once]", completed.ToolResults[0].Content);
         Assert.True(AuthorizationAttemptId.TryParse(approvalRequest.AuthorizationAttemptId, out var attemptId));
         Assert.Equal(attemptId, completed.AuthorizationAttemptIds["call-1"]);
         Assert.Equal([attemptId, attemptId], executor.AttemptIds);
@@ -173,7 +208,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         var approvalRequest = await approvalRequestTcs.Task.WaitAsync(
             TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
 
-        approvalChannel.Complete(approvalRequest.CallId, ApprovalDecision.ApprovedAlways);
+        approvalChannel.Complete(approvalRequest.CallId, new ConsentAnswer.Grant(GrantScopeKind.Folder));
 
         var completed = await probe.ExpectMsgAsync<ToolExecutionCompleted>(
             TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
@@ -181,91 +216,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
         var result = Assert.Single(completed.ToolResults);
-        Assert.Equal("ran-with-bypass", result.Content);
-    }
-
-    [Fact]
-    public async Task Source_less_approval_required_turn_fails_closed_without_prompt()
-    {
-        var executor = new ApprovalThenSuccessExecutor();
-        var approvalChannel = new ApprovalChannel();
-        var probe = CreateTestProbe("source-less-approval-probe");
-        var approvals = new List<ToolInteractionRequest>();
-
-        var toolCalls = new List<FunctionCallContent>
-        {
-            new("call-no-source", "shell_execute", new Dictionary<string, object?>
-            {
-                ["command"] = "git push origin dev"
-            })
-        };
-
-        var pipelineTask = new SessionToolPipelineTestFixture(
-                executor, toolCalls, new SessionId("D1/source-less-approval-test"), probe.Ref)
-            .WithTimeout(TimeSpan.FromSeconds(1))
-            .WithApprovals(
-                approvalChannel,
-                request => approvals.Add(request.Request),
-                Timeout.InfiniteTimeSpan)
-            .ExecuteAsync(TestContext.Current.CancellationToken);
-
-        var completed = await probe.ExpectMsgAsync<ToolExecutionCompleted>(
-            TimeSpan.FromSeconds(3),
-            cancellationToken: TestContext.Current.CancellationToken);
-
-        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
-
-        var result = Assert.Single(completed.ToolResults);
-        Assert.Contains("no interactive approval requester is available", result.Content);
-        Assert.Empty(approvals);
-        Assert.True(AuthorizationAttemptId.TryParse(
-            completed.AuthorizationAttemptIds["call-no-source"].Value,
-            out _));
-    }
-
-    [Fact]
-    public async Task Undeclared_project_scope_returns_agent_correction_without_user_prompt()
-    {
-        var executor = new ProjectScopeDeclarationRequiredExecutor("/home/user/repos/project");
-        var probe = CreateTestProbe("project-scope-correction-probe");
-        var approvals = new List<ToolInteractionRequest>();
-        var sessionId = new SessionId("D1/project-scope-correction");
-        var toolCalls = new List<FunctionCallContent>
-        {
-            new("call-1", "shell_execute", new Dictionary<string, object?>
-            {
-                ["command"] = "head -40 src/file.cs"
-            })
-        };
-
-        var pipelineTask = new SessionToolPipelineTestFixture(executor, toolCalls, sessionId, probe.Ref)
-            .WithTurnContext(InteractiveTurnContext(sessionId))
-            .WithSetWorkingDirectoryAvailable()
-            .WithApprovals(
-                new ApprovalChannel(),
-                request => approvals.Add(request.Request),
-                Timeout.InfiniteTimeSpan)
-            .ExecuteAsync(TestContext.Current.CancellationToken);
-
-        var completed = await probe.ExpectMsgAsync<ToolExecutionCompleted>(
-            TimeSpan.FromSeconds(3),
-            cancellationToken: TestContext.Current.CancellationToken);
-        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
-
-        var result = Assert.Single(completed.ToolResults);
-        Assert.Equal(
-            "Tool execution deferred: working_directory_not_declared\n" +
-            "Project directory: '/home/user/repos/project'.\n" +
-            "Next action: call set_working_directory with an allowed project directory for this task, then retry the failed tool call.",
-            result.Content);
-        Assert.Equal(
-            ToolRemediationCode.SetWorkingDirectory,
-            completed.ToolReceipts["call-1"].RemediationCode);
-        Assert.Empty(approvals);
-        Assert.Equal(1, executor.Attempts);
-        Assert.True(AuthorizationAttemptId.TryParse(
-            completed.AuthorizationAttemptIds["call-1"].Value,
-            out _));
+        Assert.Equal("ran-with-bypass\n[approval: always in this folder]", result.Content);
     }
 
     [Theory]
@@ -339,7 +290,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
             "Next action: call the native Netclaw tool named in this result directly instead of shell_execute.",
             result.Message.Content);
         Assert.Equal(ToolInvocationOutcomeCategory.RecoverableCorrection, result.Receipt?.Category);
-        Assert.Equal(ToolRemediationCode.UseNativeTool, result.Receipt?.RemediationCode);
+        Assert.Equal(ToolRemediationCode.UseNativeTool, Assert.IsType<ToolInvocationReceipt.Correction>(result.Receipt).RemediationCode);
         Assert.Equal("file_read", result.ExposureRequest?.ToolName.Value);
         Assert.True(AuthorizationAttemptId.TryParse(result.AuthorizationAttemptId.Value, out _));
         Assert.Empty(approvals);
@@ -348,6 +299,144 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         await jobManagerProbe.ExpectNoMsgAsync(
             TimeSpan.FromMilliseconds(200),
             cancellationToken: TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Native_and_temporary_collection_returns_one_model_response()
+    {
+        var executor = CreateApprovalGatedShellExecutor();
+        var probe = CreateTestProbe("native-temporary-collection");
+        var nativePath = Path.Combine(Path.GetTempPath(), "netclaw-p3-output.txt");
+        var call = new FunctionCallContent(
+            "call-native-temporary-collection",
+            "shell_execute",
+            new Dictionary<string, object?>
+            {
+                ["Command"] = $"file_write --path {nativePath}",
+                ["WorkingDirectory"] = Path.GetTempPath(),
+                ["_rationale"] = "Write disposable output with the native tool."
+            });
+
+        var pipelineTask = new SessionToolPipelineTestFixture(
+                executor,
+                [call],
+                new SessionId("D1/native-temporary-collection"),
+                probe.Ref)
+            .InSessionDirectory(_temp.Path)
+            .WithTurnContext(InteractiveTurnContext(new SessionId("D1/native-temporary-collection")))
+            .WithApprovals(new ApprovalChannel(), _ => throw new InvalidOperationException("The collection must not prompt."), Timeout.InfiniteTimeSpan)
+            .ExecuteAsync(TestContext.Current.CancellationToken);
+
+        var completed = await probe.ExpectMsgAsync<ToolExecutionCompleted>(
+            TimeSpan.FromSeconds(3),
+            cancellationToken: TestContext.Current.CancellationToken);
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+
+        var result = Assert.Single(completed.ToolResults);
+        Assert.Equal(
+            "Shell execution stopped because 'file_write' is a native Netclaw tool.\n" +
+            $"Managed temporary directory: '{Path.Combine(_temp.Path, "tmp", "parent")}'.\n" +
+            "Next action: call the native Netclaw tool named in this result directly instead of shell_execute.",
+            result.Content);
+        Assert.Equal(ToolRemediationCode.UseNativeTool, Assert.IsType<ToolInvocationReceipt.Correction>(completed.ToolReceipts["call-native-temporary-collection"]).RemediationCode);
+        Assert.Equal("file_write", Assert.Single(completed.ToolExposureRequests).Value.ToolName.Value);
+        Assert.Empty(completed.ManagedTemporaryCorrectionChanges);
+    }
+
+    [Fact]
+    public async Task Native_file_read_response_keeps_the_existing_path_without_temporary_advice()
+    {
+        // The native reader must keep the requested source path.
+        // Managed temporary advice would redirect the read to a different file.
+        var executor = CreateApprovalGatedShellExecutor();
+        var probe = CreateTestProbe("native-read-without-temporary");
+        var call = new FunctionCallContent(
+            "call-native-read-without-temporary",
+            ShellTool.ToolName,
+            new Dictionary<string, object?>
+            {
+                ["Command"] = $"file_read --path {Path.Combine(Path.GetTempPath(), "existing-report.txt")}",
+                ["WorkingDirectory"] = Path.GetTempPath(),
+                ["_rationale"] = "Read the requested diagnostic report with the native tool."
+            });
+
+        var pipelineTask = new SessionToolPipelineTestFixture(
+                executor,
+                [call],
+                new SessionId("D1/native-read-without-temporary"),
+                probe.Ref)
+            .WithTurnContext(InteractiveTurnContext(new SessionId("D1/native-read-without-temporary")))
+            .WithApprovals(new ApprovalChannel(), _ => throw new InvalidOperationException("The correction must not prompt."), Timeout.InfiniteTimeSpan)
+            .ExecuteAsync(TestContext.Current.CancellationToken);
+
+        var completed = await probe.ExpectMsgAsync<ToolExecutionCompleted>(
+            TimeSpan.FromSeconds(3),
+            cancellationToken: TestContext.Current.CancellationToken);
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+
+        var result = Assert.Single(completed.ToolResults);
+        Assert.Equal(
+            "Shell execution stopped because 'file_read' is a native Netclaw tool.\n" +
+            "Next action: call the native Netclaw tool named in this result directly instead of shell_execute.",
+            result.Content);
+        Assert.DoesNotContain("Managed temporary directory", result.Content, StringComparison.Ordinal);
+        Assert.Equal(ToolRemediationCode.UseNativeTool, Assert.IsType<ToolInvocationReceipt.Correction>(completed.ToolReceipts["call-native-read-without-temporary"]).RemediationCode);
+        Assert.Equal("file_read", Assert.Single(completed.ToolExposureRequests).Value.ToolName.Value);
+    }
+
+    [Theory]
+    [InlineData(ShellTool.ToolName)]
+    [InlineData(FileWriteTool.ToolName)]
+    public async Task Temporary_only_policy_result_uses_the_common_correction_delivery(
+        string toolName)
+    {
+        var executor = CreateApprovalGatedShellExecutor();
+        var probe = CreateTestProbe("temporary-only-policy-result");
+        var sessionId = new SessionId("D1/temporary-only-policy-result");
+        var arguments = toolName == ShellTool.ToolName
+            ? new Dictionary<string, object?>
+            {
+                ["Command"] = "gh api repos/example/project",
+                ["WorkingDirectory"] = Path.GetTempPath(),
+                ["_rationale"] = "Inspect a disposable diagnostic artifact."
+            }
+            : new Dictionary<string, object?>
+            {
+                ["Path"] = Path.Combine(Path.GetTempPath(), "netclaw-structured-output.txt"),
+                ["Content"] = "unused",
+                ["_rationale"] = "Write a disposable diagnostic artifact."
+            };
+        var call = new FunctionCallContent(
+            $"call-temporary-only-{toolName}",
+            toolName,
+            arguments);
+
+        var pipelineTask = new SessionToolPipelineTestFixture(executor, [call], sessionId, probe.Ref)
+            .WithTurnContext(InteractiveTurnContext(sessionId))
+            .InSessionDirectory(ManagedTemporarySessionDirectory)
+            .WithApprovals(
+                new ApprovalChannel(),
+                _ => throw new InvalidOperationException("The correction must not prompt."),
+                Timeout.InfiniteTimeSpan)
+            .ExecuteAsync(TestContext.Current.CancellationToken);
+
+        var completed = await probe.ExpectMsgAsync<ToolExecutionCompleted>(
+            TimeSpan.FromSeconds(3),
+            cancellationToken: TestContext.Current.CancellationToken);
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+
+        var result = Assert.Single(completed.ToolResults);
+        Assert.Equal(
+            "Tool execution deferred: use_managed_temporary_directory\n" +
+            $"Managed temporary directory: '{TestManagedTemporaryDirectory}'.\n" +
+            "Next action: use the managed temporary directory from this result for disposable files, or retry unchanged for exact platform paths.",
+            result.Content);
+        Assert.Equal(
+            ToolRemediationCode.UseManagedTemporaryDirectory,
+            Assert.IsType<ToolInvocationReceipt.Correction>(completed.ToolReceipts[call.CallId]).RemediationCode);
+        Assert.IsType<ManagedTemporaryCorrectionChange.Arm>(
+            Assert.Single(completed.ManagedTemporaryCorrectionChanges));
+        Assert.Empty(completed.ToolExposureRequests);
     }
 
     [Fact]
@@ -381,7 +470,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
             "Error: invalid_context: No project or session directory is available.\n" +
             "Next action: call set_working_directory with an allowed project directory for this task, then retry the failed tool call.",
             completed.Result.Message.Content);
-        Assert.Equal(ToolRemediationCode.SetWorkingDirectory, completed.Result.Receipt?.RemediationCode);
+        Assert.Equal(ToolRemediationCode.SetWorkingDirectory, Assert.IsType<ToolInvocationReceipt.Correction>(completed.Result.Receipt).RemediationCode);
     }
 
     [Fact]
@@ -414,19 +503,19 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
     [Fact]
     public async Task Parallel_platform_temp_calls_all_return_corrections_before_prompt()
     {
-        var executor = new ScratchCorrectionRequiredExecutor();
-        var probe = CreateTestProbe("scratch-parallel-correction-probe");
+        var executor = new ManagedTemporaryCorrectionRequiredExecutor();
+        var probe = CreateTestProbe("managed-temporary-parallel-correction-probe");
         var approvals = new List<ToolInteractionRequest>();
-        var sessionId = new SessionId("D1/scratch-parallel-correction");
+        var sessionId = new SessionId("D1/managed-temporary-parallel-correction");
         var calls = new List<FunctionCallContent>
         {
-            ScratchCall("scratch-1"),
-            ScratchCall("scratch-2")
+            PlatformTemporaryCall("managed-temporary-1"),
+            PlatformTemporaryCall("managed-temporary-2")
         };
 
         var pipelineTask = new SessionToolPipelineTestFixture(executor, calls, sessionId, probe.Ref)
             .WithTurnContext(InteractiveTurnContext(sessionId))
-            .InSessionDirectory("/home/user/.netclaw/sessions/example")
+            .InSessionDirectory(ManagedTemporarySessionDirectory)
             .WithApprovals(
                 new ApprovalChannel(),
                 request => approvals.Add(request.Request),
@@ -441,37 +530,37 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         Assert.Equal(2, completed.ToolResults.Count);
         Assert.All(completed.ToolResults, result =>
             Assert.Equal(
-                "Tool execution deferred: shared_temporary_directory\n" +
-                "Session scratch directory: '/home/user/.netclaw/sessions/example'.\n" +
-                "Next action: use the session scratch directory from this result for disposable files, or retry unchanged for exact platform paths.",
+                "Tool execution deferred: use_managed_temporary_directory\n" +
+                $"Managed temporary directory: '{TestManagedTemporaryDirectory}'.\n" +
+                "Next action: use the managed temporary directory from this result for disposable files, or retry unchanged for exact platform paths.",
                 result.Content));
         Assert.All(completed.ToolReceipts.Values, receipt =>
-            Assert.Equal(ToolRemediationCode.UseSessionScratch, receipt.RemediationCode));
-        Assert.Equal(2, completed.ScratchCorrectionChanges.Count);
-        Assert.All(completed.ScratchCorrectionChanges,
-            change => Assert.IsType<SessionScratchCorrectionChange.Arm>(change));
+            Assert.Equal(ToolRemediationCode.UseManagedTemporaryDirectory, Assert.IsType<ToolInvocationReceipt.Correction>(receipt).RemediationCode));
+        Assert.Equal(2, completed.ManagedTemporaryCorrectionChanges.Count);
+        Assert.All(completed.ManagedTemporaryCorrectionChanges,
+            change => Assert.IsType<ManagedTemporaryCorrectionChange.Arm>(change));
         Assert.Empty(approvals);
     }
 
     [Fact]
     public async Task Later_exact_retry_consumes_key_and_offers_once_or_deny()
     {
-        var key = ScratchCorrectionRequiredExecutor.Key;
-        var executor = new ScratchRetryApprovalExecutor();
+        var key = ManagedTemporaryCorrectionRequiredExecutor.Key;
+        var executor = new ManagedTemporaryRetryApprovalExecutor();
         var approvalChannel = new ApprovalChannel();
-        var probe = CreateTestProbe("scratch-retry-probe");
+        var probe = CreateTestProbe("managed-temporary-retry-probe");
         var approvalRequest = new TaskCompletionSource<ToolInteractionRequest>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        var sessionId = new SessionId("D1/scratch-retry");
+        var sessionId = new SessionId("D1/managed-temporary-retry");
 
         var pipelineTask = new SessionToolPipelineTestFixture(
                 executor,
-                [ScratchCall("scratch-retry")],
+                [PlatformTemporaryCall("managed-temporary-retry")],
                 sessionId,
                 probe.Ref)
             .WithTurnContext(InteractiveTurnContext(sessionId))
-            .InSessionDirectory(key.SessionDirectory)
-            .WithScratchCorrections(key)
+            .InSessionDirectory(key.Target.ManagedTemporaryDirectory)
+            .WithManagedTemporaryCorrections(key)
             .WithApprovals(
                 approvalChannel,
                 request => approvalRequest.TrySetResult(request.Request),
@@ -483,23 +572,22 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
             TestContext.Current.CancellationToken);
         Assert.Equal([ApprovalOptionKeys.ApproveOnce, ApprovalOptionKeys.Deny],
             request.Options.Select(option => option.Key.Value));
-        approvalChannel.Complete(request.CallId, ApprovalDecision.Denied);
+        approvalChannel.Complete(request.CallId, ConsentAnswer.Denied);
 
         var completed = await probe.ExpectMsgAsync<ToolExecutionCompleted>(
             TimeSpan.FromSeconds(3),
             cancellationToken: TestContext.Current.CancellationToken);
         await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
-        Assert.True(executor.RetryMarked);
-        var change = Assert.Single(completed.ScratchCorrectionChanges);
-        Assert.Equal(key, Assert.IsType<SessionScratchCorrectionChange.Consume>(change).Key);
+        var change = Assert.Single(completed.ManagedTemporaryCorrectionChanges);
+        Assert.Equal(key, Assert.IsType<ManagedTemporaryCorrectionChange.Consume>(change).Key);
     }
 
     [Fact]
-    public void Scratch_retry_key_is_consumed_once()
+    public void Managed_temporary_retry_key_is_consumed_once()
     {
-        var key = ScratchCorrectionRequiredExecutor.Key;
-        var dispatch = new SessionScratchCorrectionDispatch([key]);
+        var key = ManagedTemporaryCorrectionRequiredExecutor.Key;
+        var dispatch = new ManagedTemporaryCorrectionDispatch([key]);
 
         Assert.True(dispatch.TryConsume(key.Call, out var consumed));
         Assert.Equal(key, consumed);
@@ -507,25 +595,24 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
     }
 
     [Theory]
-    [InlineData("different-command", true, "/tmp", false, 5)]
-    [InlineData("gh api repos/example/project", false, null, false, 5)]
-    [InlineData("gh api repos/example/project", true, "/var/tmp", false, 5)]
-    [InlineData("gh api repos/example/project", true, "/tmp", true, 5)]
-    [InlineData("gh api repos/example/project", true, "/tmp", false, 30)]
-    public void Execution_change_does_not_consume_scratch_retry_key(
+    [InlineData("different-command", "/tmp", false, 5)]
+    [InlineData("gh api repos/example/project", null, false, 5)]
+    [InlineData("gh api repos/example/project", "/var/tmp", false, 5)]
+    [InlineData("gh api repos/example/project", "/tmp", true, 5)]
+    [InlineData("gh api repos/example/project", "/tmp", false, 30)]
+    public void Execution_change_does_not_consume_managed_temporary_retry_key(
         string command,
-        bool hasExplicitWorkingDirectory,
         string? workingDirectory,
         bool background,
         int timeoutSeconds)
     {
-        var key = ScratchCorrectionRequiredExecutor.Key;
-        var dispatch = new SessionScratchCorrectionDispatch([key]);
-        var changedCall = key.Call with
+        var key = ManagedTemporaryCorrectionRequiredExecutor.Key;
+        var dispatch = new ManagedTemporaryCorrectionDispatch([key]);
+        var originalCall = Assert.IsType<ManagedTemporaryCallSemantics.ShellCall>(key.Call);
+        var changedCall = originalCall with
         {
             Command = command,
-            HasExplicitWorkingDirectory = hasExplicitWorkingDirectory,
-            ExplicitWorkingDirectory = workingDirectory,
+            WorkingDirectory = workingDirectory,
             Background = background,
             Timeout = TimeSpan.FromSeconds(timeoutSeconds)
         };
@@ -534,14 +621,14 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
     }
 
     [Fact]
-    public void Rationale_is_not_part_of_scratch_retry_semantics()
+    public void Rationale_is_not_part_of_managed_temporary_retry_semantics()
     {
-        var call = ScratchCall("scratch-rationale");
-        var first = SessionToolExecutionPipeline.BuildSessionScratchCallSemantics(
+        var call = PlatformTemporaryCall("managed-temporary-rationale");
+        var first = ManagedTemporaryCorrection.BuildCallSemantics(
             call,
             new ToolCallMeta { Rationale = "first explanation" },
             TimeSpan.FromSeconds(5));
-        var second = SessionToolExecutionPipeline.BuildSessionScratchCallSemantics(
+        var second = ManagedTemporaryCorrection.BuildCallSemantics(
             call,
             new ToolCallMeta { Rationale = "different explanation" },
             TimeSpan.FromSeconds(5));
@@ -550,39 +637,40 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
     }
 
     [Fact]
-    public void Shell_change_does_not_consume_scratch_retry_key()
+    public void Shell_change_does_not_consume_managed_temporary_retry_key()
     {
-        var key = ScratchCorrectionRequiredExecutor.Key;
-        var dispatch = new SessionScratchCorrectionDispatch([key]);
+        var key = ManagedTemporaryCorrectionRequiredExecutor.Key;
+        var dispatch = new ManagedTemporaryCorrectionDispatch([key]);
+        var originalCall = Assert.IsType<ManagedTemporaryCallSemantics.ShellCall>(key.Call);
 
         Assert.False(dispatch.TryConsume(
-            key.Call with { Shell = ApprovalShell.PowerShell },
+            originalCall with { Shell = ApprovalShell.PowerShell },
             out _));
     }
 
     [Fact]
-    public void Scratch_correction_state_clears_lifecycle_authority()
+    public void Managed_temporary_correction_state_clears_lifecycle_authority()
     {
-        var key = ScratchCorrectionRequiredExecutor.Key;
-        var state = new SessionScratchCorrectionState();
-        state.Apply(new SessionScratchCorrectionChange.Arm(key));
+        var key = ManagedTemporaryCorrectionRequiredExecutor.Key;
+        var state = new ManagedTemporaryCorrectionState();
+        state.Apply(new ManagedTemporaryCorrectionChange.Arm(key));
         state.Clear();
 
         Assert.False(state.Snapshot().TryConsume(key.Call, out _));
     }
 
     [Fact]
-    public void Scratch_correction_state_removes_consumed_key_after_history_commit()
+    public void Managed_temporary_correction_state_removes_consumed_key_after_history_commit()
     {
-        var key = ScratchCorrectionRequiredExecutor.Key;
-        var state = new SessionScratchCorrectionState();
-        state.Apply(new SessionScratchCorrectionChange.Arm(key));
-        state.Apply(new SessionScratchCorrectionChange.Consume(key));
+        var key = ManagedTemporaryCorrectionRequiredExecutor.Key;
+        var state = new ManagedTemporaryCorrectionState();
+        state.Apply(new ManagedTemporaryCorrectionChange.Arm(key));
+        state.Apply(new ManagedTemporaryCorrectionChange.Consume(key));
 
         Assert.False(state.Snapshot().TryConsume(key.Call, out _));
     }
 
-    private static FunctionCallContent ScratchCall(string callId)
+    private static FunctionCallContent PlatformTemporaryCall(string callId)
         => new(callId, ShellTool.ToolName, new Dictionary<string, object?>
         {
             ["Command"] = "gh api repos/example/project",
@@ -655,7 +743,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         await AwaitAssertAsync(() =>
         {
             var firstRequest = Assert.Single(approvals);
-            approvalChannel.Complete(firstRequest.CallId, ApprovalDecision.ApprovedOnce);
+            approvalChannel.Complete(firstRequest.CallId, ConsentAnswer.Once.Instance);
         }, duration: TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
 
         var completed = await probe.ExpectMsgAsync<ToolExecutionCompleted>(
@@ -665,7 +753,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
         Assert.Single(completed.ToolResults);
-        Assert.Equal("approved-and-ran", completed.ToolResults[0].Content);
+        Assert.Equal("approved-and-ran\n[approval: once]", completed.ToolResults[0].Content);
         Assert.Single(approvals);
     }
 
@@ -706,7 +794,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
 
         Assert.Equal(cwd, approvalRequest.Cwd);
 
-        approvalChannel.Complete(approvalRequest.CallId, ApprovalDecision.ApprovedAlways);
+        approvalChannel.Complete(approvalRequest.CallId, new ConsentAnswer.Grant(GrantScopeKind.Folder));
         await probe.ExpectMsgAsync<ToolExecutionCompleted>(
             TimeSpan.FromSeconds(3),
             cancellationToken: TestContext.Current.CancellationToken);
@@ -745,12 +833,40 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
 
         await executionCts.CancelAsync();
 
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken));
+        Assert.True(pipelineTask.IsCanceled);
+        Assert.False(approvalChannel.Complete(approvalRequest.CallId, ConsentAnswer.Once.Instance));
+        Assert.False(probe.HasMessages);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Approval_dispatch_failure_remains_a_failure_without_caller_cancellation(bool isTimeout)
+    {
+        var probe = CreateTestProbe("approval-dispatch-failure");
+        var sessionId = new SessionId("D1/approval-dispatch-failure");
+        Exception failure = isTimeout
+            ? new TimeoutException("Approval dispatch timed out.")
+            : new OperationCanceledException("Approval dispatch canceled independently.");
+        using var executionCts = new CancellationTokenSource();
+
+        var pipelineTask = new SessionToolPipelineTestFixture(
+                new ApprovalThenSuccessExecutor(),
+                [new FunctionCallContent("call-dispatch", "shell_execute",
+                    new Dictionary<string, object?> { ["command"] = "git status" })],
+                sessionId, probe.Ref)
+            .WithTurnContext(InteractiveTurnContext(sessionId))
+            .WithApprovals(new ApprovalChannel(), _ => throw failure, Timeout.InfiniteTimeSpan)
+            .ExecuteAsync(executionCts.Token);
+
         var failed = await probe.ExpectMsgAsync<ToolExecutionFailed>(
-            TimeSpan.FromSeconds(3),
-            cancellationToken: TestContext.Current.CancellationToken);
-        Assert.IsType<TimeoutException>(failed.Cause);
-        Assert.False(approvalChannel.Complete(approvalRequest.CallId, ApprovalDecision.ApprovedOnce));
+            TimeSpan.FromSeconds(3), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Same(failure, failed.Cause);
         await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+        Assert.False(pipelineTask.IsCanceled);
+        await executionCts.CancelAsync();
     }
 
     [Fact]
@@ -882,10 +998,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
     [Fact]
     public async Task Self_monitoring_tool_is_bounded_only_by_caller_cancellation()
     {
-        // A self-monitoring tool that never completes is ended ONLY by caller (turn/
-        // user) cancellation — no parent watchdog exists. The cancel must surface as a
-        // failed batch (ToolExecutionFailed), NOT as a tool-result error fed back to the
-        // model as if the sub-agent had failed.
+        // Parent cancellation stops the task without a synthetic tool result or timeout.
         var executor = new SelfMonitoringStreamingExecutor();
         var probe = CreateTestProbe("self-monitoring-cancel-probe");
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
@@ -903,11 +1016,10 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
 
         cts.Cancel();
 
-        var failed = await probe.ExpectMsgAsync<ToolExecutionFailed>(
-            TimeSpan.FromSeconds(3),
-            cancellationToken: TestContext.Current.CancellationToken);
-        Assert.IsType<TimeoutException>(failed.Cause);
-        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            pipelineTask.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken));
+        Assert.True(pipelineTask.IsCanceled);
+        Assert.False(probe.HasMessages);
     }
 
     [Fact]
@@ -1223,34 +1335,6 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         }
     }
 
-    private sealed class ProjectScopeDeclarationRequiredExecutor(string directory) : IToolExecutor
-    {
-        public int Attempts { get; private set; }
-
-        public Task AuthorizeAsync(
-            FunctionCallContent toolCall,
-            ToolExecutionContext? context = null,
-            CancellationToken ct = default)
-            => ExecuteAsync(toolCall, context, ct);
-
-        public Task<string> ExecuteAsync(
-            FunctionCallContent toolCall,
-            ToolExecutionContext? context = null,
-            CancellationToken ct = default)
-        {
-            Attempts++;
-            throw new ToolApprovalRequiredException(new ToolApprovalContext(
-                ToolName: toolCall.Name,
-                DisplayText: "head -40 src/file.cs",
-                Patterns: ["head"],
-                CandidateVerbs: ["head"],
-                Options: [])
-            {
-                SuggestedProjectDirectory = directory
-            });
-        }
-    }
-
     private sealed class CorrectiveReceiptExecutor : IToolExecutor
     {
         public Task AuthorizeAsync(
@@ -1266,9 +1350,7 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         {
             var requiredContext = context
                 ?? throw new InvalidOperationException("Execution context is required.");
-            requiredContext.Outputs.TryComplete(new ToolInvocationReceipt(
-                ToolInvocationOutcomeCategory.RecoverableCorrection,
-                remediationCode: ToolRemediationCode.SetWorkingDirectory));
+            requiredContext.Outputs.TryComplete(new ToolInvocationReceipt.Correction(ToolRemediationCode.SetWorkingDirectory));
             return Task.FromResult("Error: invalid_context: No project or session directory is available.");
         }
     }
@@ -1278,6 +1360,13 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
         public int AuthorizationAttempts { get; private set; }
 
         public int ExecutionBoundaryAttempts { get; private set; }
+
+        public Task<ShellProcessLaunch> PrepareShellLaunchAsync(
+            FunctionCallContent toolCall, ToolExecutionContext context, CancellationToken ct)
+        {
+            AuthorizationAttempts++;
+            throw CreateCorrection();
+        }
 
         public Task AuthorizeAsync(
             FunctionCallContent toolCall,
@@ -1297,22 +1386,54 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
             throw CreateCorrection();
         }
 
-        private static ToolAgentCorrectionRequiredException CreateCorrection()
-            => new(new ToolAgentCorrection.NativeToolSuggested(new ToolName("file_read")));
+        private static ToolCorrectionRequiredException CreateCorrection()
+            => new(new ToolCorrectionCollection(
+                [new ToolCorrection.NativeToolSuggested(new ToolName("file_read"))]));
     }
 
-    private sealed class ScratchCorrectionRequiredExecutor : IToolExecutor
+    private static DispatchingToolExecutor CreateApprovalGatedShellExecutor()
     {
-        internal static SessionScratchCorrectionKey Key { get; } = new(
-            new SessionScratchCallSemantics(
-                ApprovalShell.Bash,
-                "gh api repos/example/project",
-                HasExplicitWorkingDirectory: true,
-                ExplicitWorkingDirectory: "/tmp",
+        var environment = TestShellEnvironment.Current;
+        var config = new ToolConfig { ShellMode = ShellExecutionMode.HostAllowed };
+        config.AudienceProfiles.Personal.ApprovalPolicy = new ToolApprovalConfig
+        {
+            ToolOverrides = new Dictionary<string, ToolApprovalMode>(StringComparer.Ordinal)
+            {
+                [ShellTool.ToolName] = ToolApprovalMode.Approval,
+                [FileWriteTool.ToolName] = ToolApprovalMode.Approval
+            }
+        };
+        var commandPolicy = new ShellCommandPolicy(environment);
+        var pathPolicy = new ToolPathPolicy(environment, []);
+        var registry = new ToolRegistry();
+        registry.WithFirstPartyTools(TestToolAccessPolicy.Create(config, commandPolicy, pathPolicy));
+        var policy = new ToolAccessPolicy(
+            new NetclawPaths(),
+            config,
+            new EffectivePolicyDefaults(
+                DeploymentPosture.Personal,
+                TrustAudience.Personal,
+                ShellExecutionMode.HostAllowed,
+                UsedStrictFallback: false),
+            commandPolicy,
+            pathPolicy);
+        return new DispatchingToolExecutor(registry, policy, approvalService: null);
+    }
+
+    private sealed class ManagedTemporaryCorrectionRequiredExecutor : IToolExecutor
+    {
+        private const string Command = "gh api repos/example/project";
+
+        internal static ManagedTemporaryCorrectionKey Key { get; } = new(
+            new ManagedTemporaryCallSemantics.ShellCall(
+                Shell: ApprovalShell.Bash,
+                Command: Command,
+                WorkingDirectory: "/tmp",
                 Background: false,
                 Timeout: TimeSpan.FromSeconds(5)),
-            TemporaryRoot: "/tmp",
-            SessionDirectory: "/home/user/.netclaw/sessions/example");
+            new ManagedTemporaryCorrectionTarget(
+                TestManagedTemporaryDirectory,
+                "/tmp"));
 
         public Task AuthorizeAsync(
             FunctionCallContent toolCall,
@@ -1324,31 +1445,14 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
             FunctionCallContent toolCall,
             ToolExecutionContext? context = null,
             CancellationToken ct = default)
-            => throw new ToolApprovalRequiredException(new ToolApprovalContext(
-                ToolName: toolCall.Name,
-                DisplayText: Key.Call.Command,
-                Patterns: ["gh api"],
-                CandidateVerbs: ["gh api"],
-                Options: [])
-            {
-                AgentCorrection = new ToolAgentCorrection.SessionScratchSuggested(
-                    Key.SessionDirectory,
-                    Key.TemporaryRoot,
-                    Key.Call.Shell)
-            });
+            => throw new ToolCorrectionRequiredException(
+                new ToolCorrectionCollection([new ToolCorrection.ManagedTemporaryDirectorySuggested(Key.Target)]));
     }
 
-    private sealed class ScratchRetryApprovalExecutor
-        : IToolExecutor, ISessionScratchRetryAwareExecutor
+    private sealed class ManagedTemporaryRetryApprovalExecutor
+        : IToolExecutor, IApprovalShellProvider
     {
         public ApprovalShell Shell => ApprovalShell.Bash;
-
-        public bool RetryMarked { get; private set; }
-
-        public void MarkSessionScratchRetry(
-            ToolExecutionContext context,
-            ToolAgentCorrection.SessionScratchSuggested correction)
-            => RetryMarked = true;
 
         public Task AuthorizeAsync(
             FunctionCallContent toolCall,
@@ -1361,7 +1465,8 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
             ToolExecutionContext? context = null,
             CancellationToken ct = default)
         {
-            var options = RetryMarked
+            var retryMarked = context?.Approval.ManagedTemporaryRetry is not null;
+            var options = retryMarked
                 ? new ToolApprovalOption[]
                 {
                     new(ApprovalOptionKeys.ApproveOnceKey, ApprovalOptionKeys.ApproveOnceLabel),
@@ -1376,9 +1481,9 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
                 Options: options,
                 Cwd: "/tmp")
             {
-                IsSessionScratchRetry = RetryMarked,
-                SessionScratchDirectory = ScratchCorrectionRequiredExecutor.Key.SessionDirectory,
-                PlatformTemporaryRoot = ScratchCorrectionRequiredExecutor.Key.TemporaryRoot
+                IsManagedTemporaryRetry = retryMarked,
+                ManagedTemporaryDirectory = ManagedTemporaryCorrectionRequiredExecutor.Key.Target.ManagedTemporaryDirectory,
+                PlatformTemporaryRoot = ManagedTemporaryCorrectionRequiredExecutor.Key.Target.PlatformTemporaryRoot
             });
         }
     }
@@ -1399,8 +1504,9 @@ public sealed class SessionToolExecutionPipelineTests(ITestOutputHelper output) 
             // approved scope, not just ApprovedOnce.
             var approval = context?.Approval;
             if (approval is not null
-                && string.Equals(approval.OneTimeApprovedToolName, toolCall.Name, StringComparison.Ordinal)
-                && Patterns.All(approval.OneTimeApprovedPatterns.Contains))
+                && approval.OneTimeConsent is { } consent
+                && string.Equals(consent.ToolName, toolCall.Name, StringComparison.Ordinal)
+                && Patterns.All(consent.Keys.Contains))
             {
                 return Task.FromResult("ran-with-bypass");
             }

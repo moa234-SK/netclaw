@@ -48,7 +48,7 @@ public sealed class OpenAiCompatibleAuthTests : IDisposable
     {
         var descriptor = _registry.Get("openai-compatible");
 
-        var auth = Assert.IsType<EndpointOrApiKeyAuth>(descriptor.Auth);
+        var auth = Assert.IsType<OptionalApiKeyAuth>(descriptor.Auth);
         Assert.Equal([AuthMethod.None, AuthMethod.ApiKey], auth.SupportedAuthMethods);
     }
 
@@ -87,14 +87,16 @@ public sealed class OpenAiCompatibleAuthTests : IDisposable
     // ── Provider manager state machine ──
 
     [Fact]
-    public void AdvanceAfterName_OpenAiCompatible_GoesToAuthSelect()
+    public void AdvanceAfterName_OpenAiCompatible_SkipsAuthSelect()
     {
         using var vm = CreateManagerVm();
         vm.StartAddForType("openai-compatible");
 
         vm.AdvanceAfterName();
 
-        Assert.Equal(ProviderManagerState.AddSelectAuth, vm.CurrentState.Value);
+        // Credential-optional providers skip the auth picker: the endpoint
+        // view is next, and the key choice happens there (blank = no auth).
+        Assert.Equal(ProviderManagerState.AddCredentials, vm.CurrentState.Value);
     }
 
     [Fact]
@@ -110,60 +112,16 @@ public sealed class OpenAiCompatibleAuthTests : IDisposable
     }
 
     [Fact]
-    public void SelectAuthMethod_OpenAiCompatibleApiKey_GoesToEndpointStage()
-    {
-        using var vm = CreateManagerVm();
-        vm.StartAddForType("openai-compatible");
-        vm.AdvanceAfterName();
-
-        vm.SelectAuthMethod(AuthMethod.ApiKey);
-
-        Assert.Equal(ProviderManagerState.AddCredentialsEndpoint, vm.CurrentState.Value);
-    }
-
-    [Fact]
-    public void SubmitEndpointCredential_SetsEndpointAndAdvancesToKeyStage()
-    {
-        using var vm = CreateManagerVm();
-        vm.StartAddForType("openai-compatible");
-        vm.SelectAuthMethod(AuthMethod.ApiKey);
-
-        vm.SubmitEndpointCredential("http://gpu.lan:8000");
-
-        Assert.Equal("http://gpu.lan:8000", vm.NewEndpoint);
-        Assert.Equal(ProviderManagerState.AddCredentials, vm.CurrentState.Value);
-    }
-
-    [Fact]
-    public void SubmitCredentials_OpenAiCompatibleApiKeyWithEmptyKey_BlocksBeforeProbe()
-    {
-        // Fake-failure gate: declaring ApiKey without a key must block before
-        // any probe or persistence happens.
-        using var vm = CreateManagerVm();
-        vm.StartAddForType("openai-compatible");
-        vm.SelectAuthMethod(AuthMethod.ApiKey);
-        vm.SubmitEndpointCredential("http://gpu.lan:8000");
-        vm.NewApiKey = null;
-
-        vm.SubmitCredentials();
-
-        Assert.Equal(ProviderManagerState.AddCredentials, vm.CurrentState.Value);
-        Assert.Equal(0, _fakeProbe.ProbeCallCount);
-        Assert.Contains("API key is required", vm.StatusMessage.Value);
-        Assert.False(File.Exists(_paths.NetclawConfigPath));
-    }
-
-    [Fact]
     public async Task AddFlow_OpenAiCompatibleApiKey_PersistsMethodAndEncryptedSecret()
     {
         using var vm = CreateManagerVm();
         vm.StartAddForType("openai-compatible");
         vm.AdvanceAfterName();
-        vm.SelectAuthMethod(AuthMethod.ApiKey);
-        vm.SubmitEndpointCredential("http://gpu.lan:8000");
-        vm.NewApiKey = "sk-gateway-key";
+        vm.NewEndpoint = "http://gpu.lan:8000";
+        vm.SubmitEndpoint();
 
-        vm.SubmitCredentials();
+        vm.NewApiKey = "sk-gateway-key";
+        vm.SubmitOptionalApiKey();
         await vm.ProbeCompletion!.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.Equal(ProviderManagerState.AddComplete, vm.CurrentState.Value);
@@ -220,6 +178,7 @@ public sealed class OpenAiCompatibleAuthTests : IDisposable
         vm.StartFixCredentials(vm.DetailProvider);
         vm.FixApiKey = null;
         vm.FixEndpoint = "http://gpu.lan:8001";
+        vm.SelectFixOptionalApiKeyUpdate(OptionalApiKeyUpdate.Remove);
 
         vm.SubmitFixCredentials();
         await vm.ProbeCompletion!.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
@@ -231,35 +190,23 @@ public sealed class OpenAiCompatibleAuthTests : IDisposable
     }
 
     [Fact]
-    public void SubmitFixCredentials_OpenAiCompatibleApiKeyEntryWithEmptyKey_Blocks()
+    public void SubmitFixCredentials_OpenAiCompatibleReplaceWithEmptyKey_Blocks()
     {
+        // Fake-failure gate: choosing Replace without a key must block before
+        // any probe or persistence happens.
         WriteConfigProvider("my-vllm", "openai-compatible", authMethod: "ApiKey");
         using var vm = CreateManagerVm();
         vm.RefreshDisplayProviders();
         vm.DetailProvider = vm.DisplayProviders.Single(p => p.ConfiguredName == "my-vllm");
         vm.StartFixCredentials(vm.DetailProvider);
         vm.FixApiKey = null;
+        vm.AdvanceToFixOptionalApiKeyUpdate();
+        vm.SelectFixOptionalApiKeyUpdate(OptionalApiKeyUpdate.Replace);
 
         vm.SubmitFixCredentials();
 
-        Assert.Equal(ProviderManagerState.FixCredentials, vm.CurrentState.Value);
         Assert.Equal(0, _fakeProbe.ProbeCallCount);
         Assert.Contains("API key is required", vm.StatusMessage.Value);
-    }
-
-    [Fact]
-    public void SubmitFixEndpoint_ApiKeyEntry_AdvancesToKeyStage()
-    {
-        WriteConfigProvider("my-vllm", "openai-compatible", authMethod: "ApiKey");
-        using var vm = CreateManagerVm();
-        vm.RefreshDisplayProviders();
-        vm.DetailProvider = vm.DisplayProviders.Single(p => p.ConfiguredName == "my-vllm");
-        vm.StartFixCredentials(vm.DetailProvider);
-
-        vm.SubmitFixEndpoint("http://gpu.lan:8001");
-
-        Assert.Equal(ProviderManagerState.FixApiKey, vm.CurrentState.Value);
-        Assert.Equal("http://gpu.lan:8001", vm.FixEndpoint);
     }
 
     // ── Wizard ──
@@ -412,13 +359,11 @@ public sealed class OpenAiCompatibleAuthTests : IDisposable
             // type row -> name step; accept generated name.
             input.EnqueueKey(ConsoleKey.Enter);
             input.EnqueueKey(ConsoleKey.Enter);
-            // auth picker: "No auth (local endpoint)" is first, "API Key" second.
-            input.EnqueueKey(ConsoleKey.DownArrow);
-            input.EnqueueKey(ConsoleKey.Enter);
-            // endpoint stage.
+            // credential-optional provider: the auth picker is skipped and the
+            // endpoint stage renders next.
             input.EnqueuePaste("http://gpu.lan:8000");
             input.EnqueueKey(ConsoleKey.Enter);
-            // key stage.
+            // optional key stage (blank = no auth; typed = Bearer key).
             input.EnqueuePaste("sk-gateway-key");
             input.EnqueueKey(ConsoleKey.Enter);
 
@@ -492,7 +437,7 @@ public sealed class OpenAiCompatibleAuthTests : IDisposable
         {
             builder.RegisterRoute<ProviderManagerPage, ProviderManagerViewModel>(
                 "/provider",
-                _ => new ProviderManagerPage(),
+                sp => new ProviderManagerPage(sp.GetRequiredService<IAnsiTerminal>()),
                 _ =>
                 {
                     capturedVm = new ProviderManagerViewModel(_paths, _registry, _fakeProbe);

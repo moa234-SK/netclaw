@@ -7,6 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Memory;
+using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Sessions;
 using Netclaw.Actors.Skills;
 using Netclaw.Actors.SubAgents;
@@ -26,6 +27,8 @@ internal static class LlmSessionTestExtensions
             ShellExecutionEnvironment.CreateBash(ShellPlatform.Linux));
         services.TryAddSingleton<IGitWorkingContextInspector, GitWorkingContextInspector>();
         services.TryAddSingleton<IWorkingContextSnapshotProvider, WorkingContextSnapshotProvider>();
+        services.TryAddSingleton<ISessionStorageResolver>(sp =>
+            new Netclaw.Actors.Protocol.TestSessionStorageResolver(sp.GetRequiredService<NetclawPaths>()));
         services.TryAddSingleton(sp => new SessionServices(
             sp.GetRequiredService<IChatClientProvider>(),
             sp.GetRequiredService<ISystemPromptProvider>(),
@@ -34,7 +37,8 @@ internal static class LlmSessionTestExtensions
             sp.GetRequiredService<TimeProvider>(),
             sp.GetRequiredService<NetclawPaths>(),
             sp.GetService<Netclaw.Actors.Protocol.ISessionInterventionStateReader>()
-                ?? new Netclaw.Actors.Protocol.ActiveSessionInterventionStateReader()));
+                ?? new Netclaw.Actors.Protocol.ActiveSessionInterventionStateReader(),
+            sp.GetRequiredService<ISessionStorageResolver>()));
 
         services.TryAddSingleton(sp => new SessionMemoryServices(
             sp.GetService<IMemoryExtractor>() ?? NullMemoryExtractor.Instance,

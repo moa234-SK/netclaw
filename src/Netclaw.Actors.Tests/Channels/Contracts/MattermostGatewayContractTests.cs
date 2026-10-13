@@ -33,17 +33,19 @@ public sealed class MattermostGatewayContractTests(ITestOutputHelper output)
             ? new MattermostChannelId(options.DefaultChannelId)
             : (MattermostChannelId?)null;
 
+        var gatewayReplyClient = new RecordingMattermostReplyClient();
         var deps = new MattermostGatewayDependencies(
             Pipeline: new FailingSessionPipeline(new InvalidOperationException("not used")),
             IngressGate: null,
             TimeProvider: TimeProvider.System,
             Options: mattermostOptions,
             DefaultChannelId: defaultChannelId,
-            ReplyClient: new RecordingMattermostReplyClient(),
+            ChannelRegistry: TestChannelRegistries.MattermostWithProcessingRenderer(gatewayReplyClient),
+            ReplyClient: gatewayReplyClient,
             ContentScanner: new NullContentScanner(),
             AudienceProfiles: TestMattermostGatewayDeps.DefaultAudienceProfiles,
             ModelCapabilities: TestMattermostGatewayDeps.DefaultVisionCapableModel,
-            Paths: TestMattermostGatewayDeps.NewTestPaths(),
+                        StorageResolver: Netclaw.Actors.Protocol.TestSessionStorageResolver.Instance,
             SessionPropsFactory: (sid, chId, rootPostId, d) =>
                 Props.Create(() => new ForwardActor(TestActor)));
 

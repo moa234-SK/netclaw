@@ -6,6 +6,7 @@
 using Akka.Actor;
 using Akka.Event;
 using Microsoft.Extensions.AI;
+using Netclaw.Actors.Authorization.Consent;
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Sessions;
@@ -44,9 +45,9 @@ internal sealed class SessionToolPipelineTestFixture(
     private ModelModality _modelInputModalities = ModelModality.Text;
     private IReadOnlyDictionary<string, IReadOnlyList<string>> _oneTimeApprovalPreSeed
         = new Dictionary<string, IReadOnlyList<string>>();
-    private IReadOnlyDictionary<string, ApprovalDecision> _decisionOverrides
-        = new Dictionary<string, ApprovalDecision>();
-    private IReadOnlyList<SessionScratchCorrectionKey> _scratchCorrectionKeys = [];
+    private IReadOnlyDictionary<string, RefusalKind> _decisionOverrides
+        = new Dictionary<string, RefusalKind>();
+    private IReadOnlyList<ManagedTemporaryCorrectionKey> _managedTemporaryCorrectionKeys = [];
     private ILoggingAdapter _logger = NoLogger.Instance;
 
     public SessionToolPipelineTestFixture From(MessageSource source)
@@ -157,17 +158,17 @@ internal sealed class SessionToolPipelineTestFixture(
 
     public SessionToolPipelineTestFixture RedrivingApprovals(
         IReadOnlyDictionary<string, IReadOnlyList<string>> preSeed,
-        IReadOnlyDictionary<string, ApprovalDecision> overrides)
+        IReadOnlyDictionary<string, RefusalKind> overrides)
     {
         _oneTimeApprovalPreSeed = preSeed;
         _decisionOverrides = overrides;
         return this;
     }
 
-    public SessionToolPipelineTestFixture WithScratchCorrections(
-        params SessionScratchCorrectionKey[] keys)
+    public SessionToolPipelineTestFixture WithManagedTemporaryCorrections(
+        params ManagedTemporaryCorrectionKey[] keys)
     {
-        _scratchCorrectionKeys = Array.AsReadOnly(keys.ToArray());
+        _managedTemporaryCorrectionKeys = Array.AsReadOnly(keys.ToArray());
         return this;
     }
 
@@ -179,7 +180,10 @@ internal sealed class SessionToolPipelineTestFixture(
             _source);
         var runEnvironment = new SessionToolRunEnvironment
         {
-            SessionDirectory = _sessionDirectory,
+            Storage = SessionStoragePaths.CreateLegacy(
+                _sessionDirectory,
+                Path.Combine(Path.GetTempPath(), "netclaw-test-session-logs"),
+                "test-session"),
             InlineOutputBudget = _inlineOutputBudget,
             ModelInputModalities = _modelInputModalities,
             SpawnChildActor = _spawnChildActor,
@@ -206,7 +210,7 @@ internal sealed class SessionToolPipelineTestFixture(
             StreamResults = _streamResults,
             OneTimeApprovalPreSeed = _oneTimeApprovalPreSeed,
             DecisionOverrides = _decisionOverrides,
-            ScratchCorrections = new SessionScratchCorrectionDispatch(_scratchCorrectionKeys),
+            ManagedTemporaryCorrections = new ManagedTemporaryCorrectionDispatch(_managedTemporaryCorrectionKeys),
             CancellationToken = cancellationToken
         };
 

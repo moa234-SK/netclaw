@@ -25,6 +25,7 @@ public sealed class MattermostChannelHealthContractTests(ITestOutputHelper outpu
             Sys,
             new FailingSessionPipeline(new InvalidOperationException("not used")),
             new SessionIngressGate(),
+            TestChannelRegistries.MattermostWithProcessingRenderer(new RecordingMattermostReplyClient()),
             _gateway,
             new RecordingMattermostReplyClient(),
             new NullContentScanner(),
@@ -46,7 +47,7 @@ public sealed class MattermostChannelHealthContractTests(ITestOutputHelper outpu
                 AudienceProfiles = TestMattermostGatewayDeps.DefaultAudienceProfiles
             },
             TestMattermostGatewayDeps.DefaultVisionCapableModel,
-            TestMattermostGatewayDeps.NewTestPaths());
+            Netclaw.Actors.Protocol.TestSessionStorageResolver.Instance);
     }
 
     protected override Task SetTransportStateAsync(bool connected, bool ready, string? healthDetail)

@@ -10,6 +10,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Netclaw.Cli.Config;
 using Netclaw.Cli.Daemon;
 using Netclaw.Cli.Json;
+using Netclaw.Cli.Model;
 using Netclaw.Cli.Tui;
 using Netclaw.Cli.Tui.Sections;
 using Netclaw.Configuration;
@@ -24,8 +25,7 @@ namespace Netclaw.Cli.Tui.Wizard.Steps;
 /// Wizard step for selecting and configuring the LLM provider.
 /// Sub-steps: 0=provider selection, 1=auth method, 2=credentials, 3=validation,
 /// 4=model selection, 5=OAuth device flow, 6=OAuth browser flow,
-/// 7=GitHub Copilot host mode, 8=GitHub Enterprise host, 9=GitHub Enterprise API base,
-/// 10=API key entry after endpoint (optional-auth OpenAI-compatible).
+/// 7=GitHub Copilot host mode, 8=GitHub Enterprise host, 9=GitHub Enterprise API base.
 /// </summary>
 public sealed class ProviderStepViewModel : IWizardStepViewModel, ISectionEditor
 {
@@ -88,7 +88,11 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel, ISectionEditor
     {
         0 => "  Select your LLM provider. Ollama runs locally (no auth required).",
         1 => "  Choose how to authenticate with this provider.",
-        2 => "  Enter your API key. It will be stored in secrets.json.",
+        2 => !SelectedProviderTakesEndpoint
+            ? "  Enter your API key. It will be stored in secrets.json."
+            : SelectedProviderType == "ollama"
+                ? $"  Enter the URL of your Ollama server, for example {SelectedProviderDefaultEndpoint}. Press Enter to accept."
+                : "  Enter the base URL of your server, with or without /v1. Press Enter to accept.",
         3 => "  Validating connection and discovering available models...",
         4 => "  Select the model to use for conversations.",
         5 => "  Complete the authorization in your browser.",
@@ -96,9 +100,31 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel, ISectionEditor
         7 => "  Choose whether GitHub Copilot should authenticate through GitHub.com or GitHub Enterprise.",
         8 => "  Enter the GitHub Enterprise web host used for OAuth.",
         9 => "  Enter the GitHub Enterprise API base, or leave blank to use the derived default.",
-        10 => "  Enter the API key for your endpoint. It will be stored in secrets.json.",
+        10 => "  Enter an API key if the endpoint requires one, or press Enter to skip.",
         _ => ""
     };
+
+    /// <summary>
+    /// True when sub-step 2 asks for a server URL (credential-optional providers such
+    /// as Ollama and OpenAI-compatible) rather than an API key.
+    /// </summary>
+    private bool SelectedProviderTakesEndpoint =>
+        !string.IsNullOrWhiteSpace(SelectedProviderType)
+        && _registry.TryGet(SelectedProviderType!, out var descriptor)
+        && descriptor.Auth.IsCredentialOptional();
+
+    private string SelectedProviderDefaultEndpoint => _registry.Get(SelectedProviderType!).DefaultEndpoint;
+
+    /// <summary>
+    /// True when the selected provider accepts an optional Bearer key in addition
+    /// to running credential-free. Drives the sub-step 10 prompt and its
+    /// back-navigation, so those surfaces stop matching on the concrete
+    /// endpoint-only auth type.
+    /// </summary>
+    private bool SelectedProviderOffersOptionalApiKey =>
+        !string.IsNullOrWhiteSpace(SelectedProviderType)
+        && _registry.TryGet(SelectedProviderType!, out var descriptor)
+        && descriptor.Auth.OffersOptionalApiKey();
 
     /// <summary>
     /// Set the sub-step directly (used by the View for non-linear transitions like
@@ -146,7 +172,7 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel, ISectionEditor
             case 9: // GitHub Enterprise API base → GitHub Enterprise host
                 _currentSubStep = 8;
                 return true;
-            case 10: // Optional API key after endpoint → endpoint input
+            case 10: // Optional API key → endpoint
                 _currentSubStep = 2;
                 return true;
             case 4: // Model selection → credentials
@@ -155,6 +181,9 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel, ISectionEditor
                     AuthMethod.OAuthDevice when GitHubCopilotSetupFlow.IsGitHubCopilot(SelectedProviderType) => 7,
                     AuthMethod.OAuthDevice => 5,
                     AuthMethod.OAuthPkce => 6,
+                    // Optional-key providers land back on the key prompt, not the
+                    // endpoint: that is the last input before validation.
+                    _ when SelectedProviderOffersOptionalApiKey => 10,
                     _ => 2,
                 };
                 return true;
@@ -164,6 +193,7 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel, ISectionEditor
                 {
                     AuthMethod.OAuthPkce => 6,
                     AuthMethod.OAuthDevice => 5,
+                    _ when SelectedProviderOffersOptionalApiKey => 10,
                     _ => 2
                 };
                 return true;
@@ -454,7 +484,7 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel, ISectionEditor
             AuthMethod = SelectedAuthMethod,
             Endpoint = !string.IsNullOrWhiteSpace(EndpointInput)
                 ? EndpointInput
-                : _registry.TryGet(providerName, out var desc) && desc.Auth is EndpointOnlyAuth or EndpointOrApiKeyAuth
+                : _registry.TryGet(providerName, out var desc) && desc.Auth.IsCredentialOptional()
                     ? desc.DefaultEndpoint
                     : null,
             VendorOptions = VendorOptions,
@@ -612,21 +642,17 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel, ISectionEditor
     }
 
     private static string? ReadExistingProviderType(WizardContext context)
-    {
-        if (context.ExistingConfig is null
-            || !ConfigFileHelper.TryGetPathValue(context.ExistingConfig, "Models.Main.Provider", out var provider)
-            || provider is not string providerText)
-        {
-            return null;
-        }
-
-        return providerText;
-    }
+        => ReadExistingMain(context)?.Provider is { Length: > 0 } provider ? provider : null;
 
     private static string? ReadExistingModelId(WizardContext context)
+        => ReadExistingMain(context)?.ModelId is { Length: > 0 } modelId ? modelId : null;
+
+    // Same resolver as `netclaw model list`, so both the Definitions/Roles and legacy inline shapes prefill.
+    // An unresolvable Models section prefills nothing; the wizard rewrites it.
+    private static ModelReference? ReadExistingMain(WizardContext context)
         => context.ExistingConfig is not null
-           && ConfigFileHelper.TryGetPathValue(context.ExistingConfig, "Models.Main.ModelId", out var model)
-            ? model as string
+           && ModelCommand.TryLoadModelSelection(context.ExistingConfig, out var models, out _)
+            ? models?.Main
             : null;
 
     private Dictionary<string, object> BuildProvidersDictionary(ProviderStepViewModel vm, string providerType)
@@ -662,7 +688,7 @@ public sealed class ProviderStepViewModel : IWizardStepViewModel, ISectionEditor
 
         var endpoint = !string.IsNullOrWhiteSpace(vm.EndpointInput)
             ? vm.EndpointInput
-            : _registry.TryGet(providerType, out var descriptor) && descriptor.Auth is EndpointOnlyAuth or EndpointOrApiKeyAuth
+            : _registry.TryGet(providerType, out var descriptor) && descriptor.Auth.IsCredentialOptional()
                 ? descriptor.DefaultEndpoint
                 : null;
 

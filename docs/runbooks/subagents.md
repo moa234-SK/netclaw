@@ -238,17 +238,29 @@ The `tools:` frontmatter field is advisory metadata only. It may be useful when
 sharing definitions with other agent systems, but Netclaw does not use it as a
 runtime whitelist.
 
-Spawned subagents inherit the parent session's `session_dir` and current
-`project_dir` as read-only grounding. That means file tools resolve against the
-same session directory snapshot, and project-scoped instructions are loaded from
-the inherited project root for future runs.
+Spawned subagents inherit the parent session's current `project_dir`.
+Each child receives its own `temp_dir`, `artifact_dir`, and `log_path`.
+The child also receives the session `session_dir` as its workspace base.
+Project instructions come from the inherited project root.
+
+A successful `spawn_agent` result returns the child run identifier.
+It also returns the exact child log path and artifact directory.
+The parent can inspect that log with `file_read`, `file_list`, or `file_search`.
+The parent must not use a shell search to discover the log.
+
+Example: The parent passes the returned log path to `file_read`.
+
+Counterexample: The parent does not search a global log tree for the child.
 
 If a subagent hits an approval-gated tool, the prompt is routed through the
 parent session's approval channel and requester context. Human approval time does
 not count as subagent inactivity or parent `spawn_agent` tool inactivity; both
-watchdogs resume after the approval wait settles. If no parent approval bridge or
-requester authority context is available, the gated tool fails closed as a failed
-subagent run and is not executed. Subagent approval waits are live-only: if the
+watchdogs resume after the approval wait settles. If no parent approval bridge
+is available (an unattended parent), the authorizer denies the gated tool with
+`approval_required_unattended`. The tool does not run, and the subagent gets the
+denial as a tool result (decision D2). If the bridge has no requester
+authority context, the gated tool fails closed as a failed subagent run and is
+not executed. Subagent approval waits are live-only: if the
 daemon or parent session restarts before the user responds, the stale prompt is
 expired and the interrupted parent `spawn_agent` call is closed before the next
 turn continues.

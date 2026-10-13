@@ -22,6 +22,8 @@ namespace Netclaw.Cli.Daemon;
 /// </summary>
 public sealed class DaemonApi
 {
+    internal const string LocalControlHttpClientName = "Netclaw.LocalControl";
+
     private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan LongTimeout = TimeSpan.FromSeconds(30);
 
@@ -66,11 +68,56 @@ public sealed class DaemonApi
         return DaemonControlPlaneEndpointResolver.ResolveFallbackEndpoint(daemonConfig);
     }
 
+    internal static string ResolveLocalControlEndpoint(NetclawPaths paths)
+        => ResolveDaemonConfigEndpoint(paths) ?? DefaultEndpoint;
+
+    internal static SocketsHttpHandler CreateLocalControlHttpHandler()
+        => new()
+        {
+            AllowAutoRedirect = false,
+            UseProxy = false,
+        };
+
     /// <summary>
     /// The resolved daemon base endpoint (e.g. <c>http://127.0.0.1:5199</c>).
     /// Useful for display messages and SignalR hub URL construction.
     /// </summary>
     public string Endpoint => _endpoint;
+
+    internal string LocalControlEndpoint => ResolveLocalControlEndpoint(_paths);
+
+    internal async Task<PairingCodeRequestResult> RequestPairingCodeAsync(
+        string proof,
+        CancellationToken ct = default)
+    {
+        using var cts = CreateTimeoutCts(DefaultTimeout, ct);
+        var client = _factory.CreateClient(LocalControlHttpClientName);
+        using var response = await client.PostAsJsonAsync(
+            $"{LocalControlEndpoint}/api/local-control/v1/pairing-code",
+            new LocalControlPairingCodeRequest(proof),
+            JsonDefaults.Api,
+            cts.Token);
+
+        var stream = await response.Content.ReadAsStreamAsync(cts.Token);
+        if (response.IsSuccessStatusCode)
+        {
+            var result = await JsonSerializer.DeserializeAsync<PairingCodeResultDto>(stream, JsonDefaults.Api, cts.Token);
+            return new PairingCodeRequestResult(response.StatusCode, result, null);
+        }
+
+        PairingCodeErrorResponse? error = null;
+        try
+        {
+            error = await JsonSerializer.DeserializeAsync<PairingCodeErrorResponse>(stream, JsonDefaults.Api, cts.Token);
+        }
+        catch (JsonException)
+        {
+            error = new PairingCodeErrorResponse(
+                response.ReasonPhrase ?? "The daemon returned an invalid error response.");
+        }
+
+        return new PairingCodeRequestResult(response.StatusCode, null, error?.Error);
+    }
 
     // ── Status ────────────────────────────────────────────────────────
 
@@ -157,6 +204,22 @@ public sealed class DaemonApi
         response.EnsureSuccessStatusCode();
         var stream = await response.Content.ReadAsStreamAsync(cts.Token);
         return await JsonSerializer.DeserializeAsync<SkillInventory.Response>(stream, JsonDefaults.Api, cts.Token);
+    }
+
+    /// <summary>
+    /// Runs the daemon-owned skill sync pass. This request has no client timeout.
+    /// A source pass can exceed normal status request limits. The caller controls
+    /// only its wait through <paramref name="ct"/>.
+    /// </summary>
+    public async Task<SkillSyncResult.Response?> SyncSkillsAsync(CancellationToken ct = default)
+    {
+        var client = CreateHttpClient();
+        client.Timeout = Timeout.InfiniteTimeSpan;
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{_endpoint}/api/skills/sync");
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        response.EnsureSuccessStatusCode();
+        var stream = await response.Content.ReadAsStreamAsync(ct);
+        return await JsonSerializer.DeserializeAsync<SkillSyncResult.Response>(stream, JsonDefaults.Api, ct);
     }
 
     // ── Reminders ─────────────────────────────────────────────────────
@@ -402,11 +465,37 @@ public sealed class DaemonApi
     /// reads the just-written <c>Daemon</c> section (and still honors an explicit
     /// <c>NETCLAW_DAEMON_ENDPOINT</c> / paired client endpoint when one is set).
     /// </remarks>
-    public async Task<DaemonReadiness> ProbeReadinessAsync(CancellationToken ct = default)
+    public Task<DaemonReadiness> ProbeReadinessAsync(CancellationToken ct = default)
+        => ProbeReadinessAsync(ResolveEndpoint(_paths), ct);
+
+    /// <summary>
+    /// Probes the daemon this home runs for <c>netclaw daemon status</c>: a plain anonymous GET of
+    /// <c>/api/health/ready</c> at the endpoint <see cref="ResolveLocalControlEndpoint"/> yields
+    /// (ignoring <c>NETCLAW_DAEMON_ENDPOINT</c> and any paired remote endpoint). It builds no host
+    /// and no authenticated client, so it reads no secrets or keys, and it never throws: any failure
+    /// reports not ready.
+    /// </summary>
+    internal static async Task<(bool Ready, string Endpoint)> ProbeLocalReadinessAsync(
+        NetclawPaths paths, CancellationToken ct = default)
+    {
+        var endpoint = DefaultEndpoint;
+        try
+        {
+            endpoint = ResolveLocalControlEndpoint(paths);
+            using var http = new HttpClient(CreateLocalControlHttpHandler()) { Timeout = DefaultTimeout };
+            using var response = await http.GetAsync($"{endpoint}/api/health/ready", ct);
+            return (response.IsSuccessStatusCode, endpoint);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            return (false, endpoint);
+        }
+    }
+
+    private async Task<DaemonReadiness> ProbeReadinessAsync(string endpoint, CancellationToken ct)
     {
         using var cts = CreateTimeoutCts(DefaultTimeout, ct);
         var client = CreateHttpClient();
-        var endpoint = ResolveEndpoint(_paths);
         using var response = await client.GetAsync($"{endpoint}/api/health/ready", cts.Token);
         if (!response.IsSuccessStatusCode)
             return new DaemonReadiness(false, null);
@@ -442,3 +531,12 @@ public sealed class DaemonApi
         return client;
     }
 }
+
+internal sealed record LocalControlPairingCodeRequest(string Proof);
+
+internal sealed record PairingCodeErrorResponse(string Error);
+
+internal sealed record PairingCodeRequestResult(
+    HttpStatusCode StatusCode,
+    PairingCodeResultDto? Result,
+    string? Error);

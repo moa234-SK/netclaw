@@ -78,7 +78,12 @@ public class AcsEndToEndTests : IDisposable
     {
         var scope = new ToolRunScope
         {
-            Session = new ToolSessionScope.Bound("slack/C123/T456", null),
+            Session = new ToolSessionScope.Bound(
+                "slack/C123/T456",
+                SessionStoragePaths.CreateLegacy(
+                    Path.Combine(AppContext.BaseDirectory, "netclaw-governance-e2e-workspace"),
+                    Path.Combine(AppContext.BaseDirectory, "netclaw-governance-e2e-logs"),
+                    "test-session")),
             Audience = TrustAudience.Personal,
             InlineOutputBudget = InlineOutputBudget.Default,
             InteractiveApproval = new InteractiveApprovalCapability.Unavailable(),

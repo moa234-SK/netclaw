@@ -3,6 +3,7 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
+using Netclaw.Tests.Utilities;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
@@ -20,8 +21,12 @@ namespace Netclaw.Cli.Tests.Doctor;
 /// graph (linked from <c>Netclaw.Embeddings.Tests/Fixtures</c>) instead of the real allowlist —
 /// no network access anywhere in these tests.
 /// </summary>
-public sealed class MemoryEmbeddingDoctorCheckTests
+public sealed class MemoryEmbeddingDoctorCheckTests : IDisposable
 {
+    private readonly DisposableTempDir _temp = new();
+
+    public void Dispose() => _temp.Dispose();
+
     private const string ModelId = "tiny-fixture";
     private static string FixturesDir => Path.Combine(AppContext.BaseDirectory, "Fixtures");
 
@@ -36,6 +41,21 @@ public sealed class MemoryEmbeddingDoctorCheckTests
 
         Assert.Equal(DoctorSeverity.Pass, result.Severity);
         Assert.Contains("disabled", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Errors_when_model_id_is_not_in_the_allowlist()
+    {
+        var paths = CreateTempPaths();
+        var config = WriteConfig(paths, enabled: true, autoDownload: true, modelId: "not-a-real-model");
+        var check = new MemoryEmbeddingDoctorCheck(paths, config, FixtureAllowlist());
+
+        var result = await check.RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(DoctorSeverity.Error, result.Severity);
+        Assert.Contains("Unknown embedding model id 'not-a-real-model'", result.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("download", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(ModelId, result.Remediation, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -73,7 +93,7 @@ public sealed class MemoryEmbeddingDoctorCheckTests
         var config = WriteConfig(paths, enabled: true);
         PrePlaceValidModelFiles(paths);
 
-        var store = new SQLiteMemoryStore(paths.MemorySqliteDbPath, TimeProvider.System);
+        var store = new SQLiteMemoryStore(paths.SqliteDbPath, TimeProvider.System);
         await store.InitializeAsync(TestContext.Current.CancellationToken);
         await SeedDocumentAsync(store, "doc-unembedded", "Unembedded", "never embedded");
 
@@ -91,7 +111,7 @@ public sealed class MemoryEmbeddingDoctorCheckTests
         var config = WriteConfig(paths, enabled: true);
         PrePlaceValidModelFiles(paths);
 
-        var store = new SQLiteMemoryStore(paths.MemorySqliteDbPath, TimeProvider.System);
+        var store = new SQLiteMemoryStore(paths.SqliteDbPath, TimeProvider.System);
         await store.InitializeAsync(TestContext.Current.CancellationToken);
         await SeedDocumentAsync(store, "doc-1", "Doc", "body");
         var hash = MemoryContentHasher.ComputeHash("Doc", "body");
@@ -112,7 +132,7 @@ public sealed class MemoryEmbeddingDoctorCheckTests
         var config = WriteConfig(paths, enabled: true);
         PrePlaceValidModelFiles(paths);
 
-        var store = new SQLiteMemoryStore(paths.MemorySqliteDbPath, TimeProvider.System);
+        var store = new SQLiteMemoryStore(paths.SqliteDbPath, TimeProvider.System);
         await store.InitializeAsync(TestContext.Current.CancellationToken);
         await SeedDocumentAsync(store, "doc-1", "Doc", "body");
         var hash = MemoryContentHasher.ComputeHash("Doc", "body");
@@ -125,15 +145,15 @@ public sealed class MemoryEmbeddingDoctorCheckTests
         Assert.Contains("healthy", result.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static NetclawPaths CreateTempPaths()
+    private NetclawPaths CreateTempPaths()
     {
-        var basePath = Path.Combine(Path.GetTempPath(), "netclaw-embedding-doctor-tests", Guid.NewGuid().ToString("N"));
+        var basePath = Path.Combine(_temp.Path, Guid.NewGuid().ToString("N"));
         var paths = new NetclawPaths(basePath);
         paths.EnsureDirectoriesExist();
         return paths;
     }
 
-    private static IConfiguration WriteConfig(NetclawPaths paths, bool enabled, bool autoDownload = true)
+    private static IConfiguration WriteConfig(NetclawPaths paths, bool enabled, bool autoDownload = true, string modelId = ModelId)
     {
         var config = new Dictionary<string, object>
         {
@@ -142,7 +162,7 @@ public sealed class MemoryEmbeddingDoctorCheckTests
                 ["Embeddings"] = new Dictionary<string, object>
                 {
                     ["Enabled"] = enabled,
-                    ["ModelId"] = ModelId,
+                    ["ModelId"] = modelId,
                     ["AutoDownload"] = autoDownload,
                 }
             }
@@ -218,7 +238,7 @@ public sealed class MemoryEmbeddingDoctorCheckTests
         var config = WriteConfig(paths, enabled: true);
         PrePlaceValidModelFiles(paths);
 
-        var store = new SQLiteMemoryStore(paths.MemorySqliteDbPath, TimeProvider.System);
+        var store = new SQLiteMemoryStore(paths.SqliteDbPath, TimeProvider.System);
         await store.InitializeAsync(TestContext.Current.CancellationToken);
         await SeedDocumentAsync(store, "doc-1", "Doc", "body");
         var hash = MemoryContentHasher.ComputeHash("Doc", "body");
@@ -239,7 +259,7 @@ public sealed class MemoryEmbeddingDoctorCheckTests
         var config = WriteConfig(paths, enabled: true);
         PrePlaceValidModelFiles(paths);
 
-        var store = new SQLiteMemoryStore(paths.MemorySqliteDbPath, TimeProvider.System);
+        var store = new SQLiteMemoryStore(paths.SqliteDbPath, TimeProvider.System);
         await store.InitializeAsync(TestContext.Current.CancellationToken);
         await SeedDocumentAsync(store, "doc-1", "Doc", "body");
         var hash = MemoryContentHasher.ComputeHash("Doc", "body");

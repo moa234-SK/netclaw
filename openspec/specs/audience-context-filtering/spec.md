@@ -13,6 +13,7 @@ and working-context blocks, file-access denial messaging, implicit file roots,
 and audience derivation, with secure-by-default behavior and no default-audience
 fallback.
 ## Requirements
+
 ### Requirement: Context layer audience filtering
 
 The context layer system SHALL accept a `TrustAudience` parameter on `IContextLayerProvider.GetContextLayer()`. Each context layer implementation SHALL use the audience to determine what content to return. The `ContextAssemblyInput` record SHALL include a `TrustAudience Audience` field. When a feature is disabled deployment-wide, the corresponding context layer SHALL also return empty even for non-Public audiences. The skill context layer SHALL use separate Team and Personal index values when source permissions differ.
@@ -102,34 +103,21 @@ The working context block, including project directory, recent files, Git worktr
 ### Requirement: File access error message sanitization
 
 File access denial messages for Public-audience sessions SHALL NOT include
-the list of allowed root paths or mention the session directory as an allowed
-root. Team and Personal audiences SHALL continue to receive verbose error
-messages including allowed roots.
+the list of trusted roots or identify the session directory as a trusted root.
+Team and Personal audiences SHALL continue to receive verbose error messages
+that include trusted roots.
 
 #### Scenario: Public file access denial omits roots
 
-- **WHEN** a Public-audience session attempts to read a file outside allowed roots
-- **THEN** the error message does not reveal any allowed root
+- **WHEN** a Public-audience session attempts to read a file outside trusted roots
+- **THEN** the error message does not reveal any trusted root
 - **AND** no root paths are listed in the error
 - **AND** the session directory is not named or implied in the error
 
 #### Scenario: Team file access denial includes roots
 
-- **WHEN** a Team-audience session attempts to read a file outside allowed roots
-- **THEN** the error message includes the list of allowed root paths
-
-### Requirement: Public audience has no implicit internal file roots
-
-Public file access SHALL NOT implicitly include identity, skills, or workspaces
-roots through global/default file-root configuration.
-
-#### Scenario: Public file access is session-scoped only
-
-- **GIVEN** a Public-audience session with default file access configuration
-- **WHEN** it resolves implicit readable roots
-- **THEN** the resolved roots include only session-scoped locations
-- **AND** identity, skills, and workspaces roots are absent unless explicitly
-  configured for a non-Public audience
+- **WHEN** a Team-audience session attempts to read a file outside trusted roots
+- **THEN** the error message includes the list of trusted root paths
 
 ### Requirement: Audience derivation has no default-audience fallback
 
@@ -153,4 +141,3 @@ fail loudly rather than adopt a default audience.
 - **WHEN** the pipeline derives the effective audience
 - **THEN** the derived audience reflects the Personal source audience
 - **AND** no default-audience value participates in the derivation
-
