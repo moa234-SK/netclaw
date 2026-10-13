@@ -6,13 +6,8 @@
 using Microsoft.Extensions.DependencyInjection;
 using Netclaw.Configuration;
 using Netclaw.Configuration.Http;
-using Netclaw.Providers.Anthropic;
 using Netclaw.Providers.GitHubCopilot;
 using Netclaw.Providers.OAuth;
-using Netclaw.Providers.OpenAi;
-using Netclaw.Providers.OpenRouter;
-using Netclaw.Providers.SelfHosted;
-using Netclaw.Providers.Zai;
 
 namespace Netclaw.Providers;
 

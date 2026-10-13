@@ -121,12 +121,4 @@ public sealed class OpenAiCompatibleCapabilityResolver : IModelCapabilityResolve
         }
         return null;
     }
-
-    private void ApplyAuth(HttpRequestMessage request)
-    {
-        if (!string.IsNullOrWhiteSpace(_endpoint.ApiKey))
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _endpoint.ApiKey);
-
-        OpenAiCompatibleRequestHeaders.Apply(request, _requestHeaders);
-    }
 }
