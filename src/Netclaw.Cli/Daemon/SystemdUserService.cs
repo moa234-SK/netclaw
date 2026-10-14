@@ -161,7 +161,8 @@ internal sealed class SystemdUserService(
         show.Success
             ? show.StandardOutput.Split('\n')
                 .FirstOrDefault(line => line.StartsWith(property + "=", StringComparison.Ordinal))
-                ?[(property.Length + 1)..].Trim()
+                ?[(property.Length + 1)..]
+                ?.Trim()
             : null;
 
     // `systemctl show -p Environment` prints `A=b "C=d e" NETCLAW_HOME=/x`.

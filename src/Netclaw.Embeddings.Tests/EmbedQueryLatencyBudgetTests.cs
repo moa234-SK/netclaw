@@ -78,7 +78,9 @@ public sealed class EmbedQueryLatencyBudgetTests : IAsyncLifetime
         Array.Sort(samples);
         var median = SampleCount % 2 == 0
             ? (samples[(SampleCount / 2) - 1] + samples[SampleCount / 2]) / 2.0
+#pragma warning disable CS0162 // Unreachable code detected
             : samples[SampleCount / 2];
+#pragma warning restore CS0162 // Unreachable code detected
 
         Assert.True(
             median < MedianBudgetMs,

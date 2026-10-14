@@ -30,6 +30,7 @@ using Netclaw.Actors.SubAgents;
 using Netclaw.Actors.Tools;
 using Netclaw.Channels;
 using Netclaw.Configuration;
+using Netclaw.Daemon.Config;
 using Netclaw.Governance;
 using Netclaw.Governance.AgentIntervention;
 using Netclaw.Governance.SessionIntervention;
@@ -243,6 +244,7 @@ static async Task RunDaemonAsync(
                     QueueLimit = 0,
                 }));
         PairingEndpointRouteBuilderExtensions.AddLocalControlRateLimitPolicy(options);
+        ConfigEndpointRouteBuilderExtensions.AddConfigWriteRateLimitPolicy(options);
         options.RejectionStatusCode = 429;
     });
     builder.Services.AddMattermostActionEndpointRateLimiting();
@@ -262,6 +264,7 @@ static async Task RunDaemonAsync(
     builder.Services.AddSingleton<ISessionStorageResolver, SqliteSessionStorageResolver>();
     builder.Services.AddSingleton<RestartManifestStore>();
     builder.Services.AddSingleton<RejectedConfigState>();
+    builder.Services.AddSingleton<ConfigDocumentService>();
     builder.Services.AddSingleton<DaemonRestartCoordinator>();
     builder.Services.AddSingleton<IDaemonRestartCoordinator>(sp => sp.GetRequiredService<DaemonRestartCoordinator>());
 
@@ -383,6 +386,8 @@ static async Task RunDaemonAsync(
     app.MapMattermostActionEndpoint();
 
     app.MapPairingEndpoints();
+
+    app.MapConfigEndpoints();
 
     app.MapMcpEndpoints();
 

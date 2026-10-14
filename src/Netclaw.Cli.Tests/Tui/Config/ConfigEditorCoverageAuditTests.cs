@@ -110,6 +110,19 @@ public sealed class ConfigEditorCoverageAuditTests : IDisposable
                         "src/Netclaw.Cli.Tests/Doctor/InboundWebhookRoutesDoctorCheckTests.cs",
                         "src/Netclaw.Daemon.Tests/Webhooks/WebhookRouteCatalogTests.cs"
                     ])),
+            ["registration"] = new(
+                nameof(RegistrationConfigViewModelTests),
+                StructuralValidationCoverage.Required(
+                    new ValidationConceptTest("uri", nameof(RegistrationConfigViewModelTests), nameof(RegistrationConfigViewModelTests.Save_rejects_invalid_base_url_before_persistence)),
+                    new ValidationConceptTest("cross-field", nameof(RegistrationConfigViewModelTests), nameof(RegistrationConfigViewModelTests.ToggleAutoPair_without_api_base_url_is_reverted_before_persistence)),
+                    new ValidationConceptTest("range", nameof(RegistrationConfigViewModelTests), nameof(RegistrationConfigViewModelTests.Save_rejects_out_of_range_heartbeat_interval_before_persistence))),
+                DynamicValidationCoverage.NotApplicable("Registration validates URLs, auto-pair coupling, and interval bounds locally through the shared RegistrationConfigValidator; no remote probe runs from this editor."),
+                null,
+                new RuntimeConsumerCoverage(
+                    "Daemon self-registration startup, heartbeats, and the registration doctor check consume Registration.*.",
+                    [
+                        "src/Netclaw.Cli.Tests/Tui/Config/RegistrationConfigViewModelTests.cs"
+                    ])),
             ["skill-sources"] = new(
                 nameof(SkillSourcesConfigViewModelTests),
                 StructuralValidationCoverage.Required(
@@ -243,6 +256,7 @@ public sealed class ConfigEditorCoverageAuditTests : IDisposable
             "enabled-features",
             "exposure-mode",
             "inbound-webhooks",
+            "registration",
             "retention",
             "search",
             "security-posture",

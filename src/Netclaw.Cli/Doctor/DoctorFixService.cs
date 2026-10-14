@@ -182,13 +182,7 @@ public sealed class DoctorFixService
     // not a file. A directory at a candidate name is not skipped, so the copy fails loudly
     // instead of the fix writing without a backup.
     internal static string NextBackupPath(string configPath, string name)
-    {
-        var candidate = $"{configPath}.{name}.bak";
-        for (var number = 2; File.Exists(candidate); number++)
-            candidate = $"{configPath}.{name}.{number}.bak";
-
-        return candidate;
-    }
+        => NetclawConfigFiles.NextBackupPath(configPath, name);
 
     private static void TryApplySchemaFixes(JsonObject config, List<string> appliedFixes)
     {

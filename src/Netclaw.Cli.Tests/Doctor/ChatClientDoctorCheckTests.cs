@@ -495,8 +495,8 @@ public sealed class ChatClientDoctorCheckTests : IDisposable
         var result = await check.RunAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal(DoctorSeverity.Error, result.Severity);
-        Assert.Contains("declares AuthMethod ApiKey", result.Message);
-        Assert.Contains("no ApiKey in secrets.json", result.Message);
+        Assert.Contains("provider 'my-vllm'", result.Message);
+        Assert.Contains("requires ApiKey in secrets.json", result.Message);
     }
 
     [Fact]

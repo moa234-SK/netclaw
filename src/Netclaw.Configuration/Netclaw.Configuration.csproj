@@ -16,6 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="JsonSchema.Net" />
     <PackageReference Include="Microsoft.AspNetCore.DataProtection" />
     <PackageReference Include="Microsoft.AspNetCore.DataProtection.Extensions" />
     <!-- Direct reference forces the transitive System.Security.Cryptography.Xml to 10.0.6 to patch

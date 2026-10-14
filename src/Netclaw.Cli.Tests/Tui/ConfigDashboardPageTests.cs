@@ -35,7 +35,8 @@ public sealed class ConfigDashboardPageTests : IDisposable
               "Models": {
                 "Definitions": { "opus": { "Provider": "anthropic", "ModelId": "claude-opus-4" } },
                 "Roles": { "Main": "opus" }
-              }
+              },
+              "Registration": { "Enabled": true, "BaseUrl": "https://panel.example.com" }
             }
             """);
 
@@ -50,7 +51,8 @@ public sealed class ConfigDashboardPageTests : IDisposable
             {
               "configVersion": 1,
               "Providers": { "anthropic": { "Type": "anthropic" } },
-              "Models": { "Main": { "Provider": "anthropic", "ModelId": "claude-legacy-3" } }
+              "Models": { "Main": { "Provider": "anthropic", "ModelId": "claude-legacy-3" } },
+              "Registration": { "Enabled": true, "BaseUrl": "https://panel.example.com" }
             }
             """);
 

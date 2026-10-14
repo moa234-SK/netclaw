@@ -627,7 +627,7 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
             approvalService: null,
             new StaticSystemPromptProvider("Read the supplied file."),
             new WorkingContextSnapshotProvider(new GitWorkingContextInspector(TimeProvider.System), NullLogger<WorkingContextSnapshotProvider>.Instance),
-            NullLogger<SubAgentSpawner>.Instance);
+            NullLogger<SubAgentSpawner>.Instance, NoOpToolInvocationGovernor.Instance);
         var probe = CreateTestProbe("authority-child");
         var parent = TestToolExecutionContext.CreateBoundWithStorage("slack/parent", storage, new TestToolExecutionContextOptions
         {

@@ -3,6 +3,7 @@
 //      Copyright (C) 2026 - 2026 Petabridge, LLC <https://petabridge.com>
 // </copyright>
 // -----------------------------------------------------------------------
+using Netclaw.Actors.Reminders;
 using Netclaw.Cli.Tui;
 using Netclaw.Cli.Tui.Wizard;
 using Netclaw.Cli.Tui.Wizard.Steps;
@@ -144,7 +145,10 @@ public sealed class IdentityStepViewModelTests : WizardStepTestBase
         using var step = new IdentityStepViewModel();
         Assert.Equal("Netclaw", step.AgentName);
         Assert.Null(step.CommunicationStyle);
-        Assert.Equal(TimeZoneInfo.Local.Id, step.UserTimezone);
+        // The wizard must offer exactly the scheduler's default zone rule — not the raw
+        // Windows zone name. On Windows the local id ("Egypt Standard Time") is not an
+        // IANA id, so DefaultId maps it ("Africa/Cairo"); on Linux/UTC both agree.
+        Assert.Equal(SchedulerTimeZones.DefaultId(TimeZoneInfo.Local), step.UserTimezone);
     }
 
     [Fact]

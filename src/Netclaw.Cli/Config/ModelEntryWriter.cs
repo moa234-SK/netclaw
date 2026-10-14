@@ -18,18 +18,8 @@ namespace Netclaw.Cli.Config;
 /// </summary>
 internal static class ModelEntryWriter
 {
-    private static readonly string[] LegacyEnvironmentPrefixes =
-    [
-        "NETCLAW_Models__Main__",
-        "NETCLAW_Models__Fallback__",
-        "NETCLAW_Models__Compaction__",
-    ];
-
     internal static string? FindLegacyEnvironmentOverride()
-        => Environment.GetEnvironmentVariables().Keys
-            .OfType<string>()
-            .FirstOrDefault(key => LegacyEnvironmentPrefixes.Any(prefix =>
-                key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)));
+        => NetclawConfigFiles.FindLegacyModelsEnvironmentOverride();
 
     internal static bool MigrateLegacy(Dictionary<string, object> modelsSection)
     {
@@ -44,16 +34,7 @@ internal static class ModelEntryWriter
     }
 
     internal static void ThrowIfLegacyEnvironmentOverride()
-    {
-        var legacyEnvironmentOverride = FindLegacyEnvironmentOverride();
-        if (legacyEnvironmentOverride is null)
-            return;
-
-        throw new ModelConfigurationException(
-            $"Cannot migrate Models while legacy environment override '{legacyEnvironmentOverride}' is set. " +
-            "Move model overrides to NETCLAW_Models__Definitions__<name>__* and " +
-            "NETCLAW_Models__Roles__* first.");
-    }
+        => NetclawConfigFiles.ThrowIfLegacyModelsEnvironmentOverride();
 
     internal static bool ClearRole(Dictionary<string, object> modelsSection, string roleKey)
     {

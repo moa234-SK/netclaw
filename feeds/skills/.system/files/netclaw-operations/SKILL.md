@@ -3,7 +3,7 @@ name: netclaw-operations
 description: "REQUIRED when the user asks about scheduling, reminders, cron jobs, timers, background jobs, diagnostics, troubleshooting, MCP tools, daemon health, identity updates, or Netclaw capabilities and self-maintenance."
 metadata:
   author: netclaw
-  version: "2.108.1"
+  version: "2.109.0"
 ---
 
 # Netclaw Operations
@@ -26,6 +26,7 @@ a reference file — load the one matching the user's intent with
 | Handle very large tool output | [Large tool output](#large-tool-output) |
 | Understand approval prompts | [Approval Prompts](#approval-prompts) |
 | Update identity / where facts go (identity vs memory) | [Identity](#identity) |
+| Read or change daemon config remotely over HTTP | [Config HTTP API](#config-http-api) |
 | Work on a project, switch projects | `skill_read_resource('netclaw-operations', 'references/projects.md')` |
 | Discover MCP / available tools | `skill_read_resource('netclaw-operations', 'references/tools.md')` |
 | Authorize or diagnose an HTTP/SSE MCP server | [MCP OAuth](#mcp-oauth) |
@@ -887,6 +888,31 @@ another folder first. Full rotation guidance:
 Add or switch model providers (including OAuth login) and configure search backends
 (e.g. SearXNG) via provider config. Full setup:
 `skill_read_resource('netclaw-operations', 'references/providers.md')`.
+
+## Config HTTP API
+
+The daemon exposes the whole `netclaw.json` document over HTTP (loopback or a
+paired device, operator authority required):
+
+- `GET /api/config` returns the document with every `secrets.json` leaf replaced
+  by the placeholder `__netclaw_secret__`. `redactedPaths` lists those paths and
+  `readOnlyPaths` lists the fields HTTP cannot change.
+- `PATCH /api/config` takes an RFC 7386 JSON merge patch over that document.
+  `null` deletes a key. Send the placeholder back to keep a stored secret, a new
+  string to rotate it (it lands encrypted in `secrets.json`, never in
+  `netclaw.json`).
+- `Daemon.Host`, `Daemon.ExposureMode`, and `Daemon.TrustedProxies` are
+  read-only over HTTP. Change them locally (CLI, TUI, or a file edit). A patch
+  that touches them returns `400` and writes nothing.
+- Validation runs before anything is written. An invalid patch returns `400`
+  with field-level errors and leaves both files untouched.
+- An accepted patch triggers a coordinated daemon restart. Poll
+  `/api/health/ready` and compare the `X-Netclaw-Generation` header to see when
+  the new config is live.
+
+Prefer the CLI or TUI when you are on the host: they use the same file pipeline.
+Use the HTTP API when you operate the daemon remotely. Never log or echo a
+secret value; the API returns placeholders for a reason.
 
 ## Tool Lists in Config
 

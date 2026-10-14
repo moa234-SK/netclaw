@@ -68,6 +68,7 @@ LIGHT_SCENARIOS=(
   mcp-setup
   skill-sync
   webhook-routes
+  config-api
 )
 FULL_SCENARIOS=("${LIGHT_SCENARIOS[@]}")
 

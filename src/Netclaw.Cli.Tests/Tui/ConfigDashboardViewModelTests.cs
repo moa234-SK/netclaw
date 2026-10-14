@@ -29,6 +29,7 @@ public sealed class ConfigDashboardViewModelTests
             "Search",
             "Browser Automation",
             "Telemetry & Alerting",
+            "Registration",
             "Security & Access",
             "Workspaces Directory",
             "Data Retention",
@@ -90,6 +91,7 @@ public sealed class ConfigDashboardViewModelTests
     [InlineData("Skill Sources", "/skill-sources")]
     [InlineData("Browser Automation", "/browser-automation")]
     [InlineData("Telemetry & Alerting", "/telemetry-alerting")]
+    [InlineData("Registration", "/registration")]
     [InlineData("Workspaces Directory", "/workspaces")]
     [InlineData("Data Retention", "/retention")]
     public void Task1_config_areas_route_to_dedicated_pages(string label, string expectedRoute)

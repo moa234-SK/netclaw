@@ -5,27 +5,26 @@
 // -----------------------------------------------------------------------
 using Netclaw.Cli.Doctor;
 using Netclaw.Configuration;
+using Netclaw.Tests.Utilities;
 using Xunit;
 
 namespace Netclaw.Cli.Tests.Doctor;
 
 public sealed class AcsPolicyDoctorCheckTests : IDisposable
 {
-    private readonly string _basePath;
+    private readonly DisposableTempDir _dir = new();
     private readonly NetclawPaths _paths;
 
     public AcsPolicyDoctorCheckTests()
     {
-        _basePath = Path.Combine(Path.GetTempPath(), "netclaw-tests", Guid.NewGuid().ToString("N"));
-        _paths = new NetclawPaths(_basePath);
+        // DisposableTempDir (not a hand-rolled GetTempPath prefix): the test run temp
+        // root fails the assembly when a test leaves any entry behind, including an
+        // empty parent folder a manual prefix scheme would orphan.
+        _paths = new NetclawPaths(_dir.Path);
         _paths.EnsureDirectoriesExist();
     }
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_basePath))
-            Directory.Delete(_basePath, recursive: true);
-    }
+    public void Dispose() => _dir.Dispose();
 
     private async Task WriteConfigAsync(string json)
         => await File.WriteAllTextAsync(_paths.NetclawConfigPath, json, TestContext.Current.CancellationToken);
