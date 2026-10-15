@@ -410,20 +410,20 @@ public sealed class MattermostSessionBindingContractTests(ITestOutputHelper outp
             new MattermostRootPostId("root-test"),
             deps), $"mm-session-store-{Interlocked.Increment(ref _actorCounter)}");
 
-        await AwaitAssertAsync(() => Assert.Single(_replyClient.Posts), cancellationToken: ct);
-
-        // The transport post is recorded before the actor associates the returned
-        // post id with the stored tokens (same persist-callback race the recovery
-        // test above documents), so poll the store instead of asserting once.
-        await AwaitAssertAsync(() =>
-        {
-            var actions = _replyClient.Posts[0].Attachments![0].Actions!;
-            foreach (var action in actions)
+        // The fake transport records the post before the binding calls
+        // AssociatePromptPostId. Waiting on the post alone reads PromptPostId while
+        // it is still null, so poll the whole association invariant instead.
+        await AwaitAssertAsync(
+            () =>
             {
-                Assert.True(store.TryGet(action.Context["action_token"], out var stored));
-                Assert.Equal("post-1", stored!.PromptPostId);
-                Assert.Equal("call-mm-association", stored.CallId);
-            }
-        }, cancellationToken: ct);
+                var post = Assert.Single(_replyClient.Posts);
+                foreach (var action in post.Attachments![0].Actions!)
+                {
+                    Assert.True(store.TryGet(action.Context["action_token"], out var stored));
+                    Assert.Equal("post-1", stored!.PromptPostId);
+                    Assert.Equal("call-mm-association", stored.CallId);
+                }
+            },
+            cancellationToken: ct);
     }
 }

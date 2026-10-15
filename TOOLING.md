@@ -30,13 +30,14 @@
 ## Focused Mutation Tests
 
 All focused gates run in one job definition, `mutation-gates` in `pr_validation.yml`, on each pull request and merge group. They do not run on `dev` pushes.
-The job has four Linux matrix groups that run in parallel with the normal test matrix.
-The groups hold about 13 to 14 minutes of gates each. The sum of all gates is about 59 minutes of runner time. The job timeout is 25 minutes.
+The job has five Linux matrix groups that run in parallel with the normal test matrix.
+The job timeout is 25 minutes.
 Each group runs its gates in sequence after one checkout and tool restore, and it reports every failed gate.
-To add a gate, add its script name (`scripts/run-<name>-mutations.sh`) to the lightest group. Do not add a new job.
+Add a gate to the lightest group when its measured cost fits the timeout and the Windows test duration.
+Use another group under the same job definition when no existing group has that capacity.
 
 Focused mutation tests prove that deterministic tests reject a specific unsafe
-change at a security or authority boundary. They do not measure general code
+change at a security, authority, or load-bearing reliability boundary. They do not measure general code
 coverage. They do not replace positive and negative behavior tests.
 
 ### Current Targets
@@ -61,6 +62,7 @@ coverage. They do not replace positive and negative behavior tests.
 | `ShellCommandAnalysis.IsPlainFileTarget` and `ToolAccessPolicy.ScreenNoProgramRedirects` | Owner decision (October 2026): a command that runs no program gets no prompt only when each redirect target is one plain file (`/dev/null` is the only path below `/dev/`, so `/dev/tcp` keeps a prompt); a redirect target that is not proved, an input redirect that the `file_read` rules refuse, and a `Deny` mode of the file tool deny the call | 20 killed | `./scripts/run-no-program-mutations.sh` |
 | `BashLiteralTwinSlices.Apply` and the denial check of `ToolAccessPolicy.ScreenScopedSlices` | Decision F1: the strictest literal twin result decides a call. The candidates of every twin replace the candidates of their source command, an unresolved source keeps its exact answer, twins without their source command fail loudly, and one denied twin denies the call | 9 killed | `./scripts/run-literal-twin-mutations.sh` |
 | `StreamCommitGate` | An attempt commits only at its first real output; id-bearing lifecycle updates are held, role-only keepalives pass through, and held updates are released on commit or clean completion | 8 killed | `./scripts/run-stream-commit-gate-mutations.sh` |
+| `ActiveToolBatchTracker.CanComplete`, `SessionToolWorkflow.ValidateResponse`, `SessionModelContext.IsCurrentInspection`, `SessionState.Apply(TurnRecorded, bool)`, `SessionExecutionLifetime.AcceptModelStop`, and `SessionExecutionLifetime.ObserveReapReply` | A batch waits for every result and task completion; another sender cannot approve a call; an old inspection cannot change a later call; terminal history adds the user exactly once; an old model stop cannot settle a new call; one accepted reap reply requests only one journal commit | 7 killed | `./scripts/run-tool-batch-readiness-mutations.sh` |
 
 Run the path-access check locally:
 
@@ -156,6 +158,53 @@ authority check.
 The local run took about 2 minutes after package restore. CI runs it in the
 `verb-chain-and-reminder` group of the `mutation-gates` job. Its report
 directory is `artifacts/stryker/stream-commit-gate`.
+
+### Session Reliability Gate
+
+Run the session reliability gate:
+
+```bash
+./scripts/run-tool-batch-readiness-mutations.sh
+```
+
+The script selects the `CanComplete` expression in `ActiveToolBatchTracker`.
+Stryker changes `ExecutionTaskCompleted && HasAllResults` to `ExecutionTaskCompleted || HasAllResults`.
+The linked `ActiveToolBatchTrackerTests` source kills this one mutant when the task completes before all results arrive.
+The script also selects the requester check in `SessionToolWorkflow.ValidateResponse`.
+Stryker removes `!` from the `ApprovalButtonValueCodec.CanApprove` result.
+The linked `SessionToolWorkflowRequesterTests` source kills this mutant when another sender answers a recovered prompt.
+The script also selects the generation equality in `SessionModelContext.IsCurrentInspection`.
+Stryker changes `generation == active` to `generation != active`.
+The linked `SessionModelContextStaleInspectionTests` source kills this mutant when an old reply cannot alter a later call.
+The script also selects the history choice in `SessionState.Apply(TurnRecorded, bool)`.
+Stryker forces each branch of `userAlreadyInHistory ? closed.History : closed.History.Add(evt.UserMessage)`.
+The linked `SessionStateTests` source kills both mutants when one branch duplicates a user or the other branch omits one.
+The script also selects the call-ID inequality in `SessionExecutionLifetime.AcceptModelStop`.
+Stryker changes `message.CallId != _modelCallId` to equality.
+The shared `SessionExecutionLifetimeStopIdentityTests` source kills this mutant when a stop reply has the wrong call ID.
+The script also selects the `true` literal in `SessionExecutionLifetime.ObserveReapReply`.
+Stryker changes `reap.AwaitingCommit = true` to `reap.AwaitingCommit = false`.
+The linked `SessionExecutionLifetimeStopPolicyTests` source kills this mutant when a duplicate reply arrives before journal commit.
+The script also selects the replay check in `SessionInputFlow.DrainBufferedBatch`.
+Stryker changes `!item.IsReplay` to `item.IsReplay`.
+The linked `SessionInputFlowTests` source kills this mutant when fresh buffered input must start a new turn.
+The linked `ProcessingWatchdogTests` source supplies the existing timer fake without an actor test host.
+The selectors reject missing or repeated source markers before Stryker starts.
+The gate requires one killed mutant in each single-expression span and two killed history mutants.
+It fails for no mutant, a survivor, or a compile error in a selected span.
+
+The combined local calibration took 1 minute 56 seconds with a warm build cache.
+The earlier readiness-only run took 5 minutes 44 seconds after tool restore.
+The three-target local run took 1 minute 46 seconds with a warm build cache.
+The five-mutant local run took 1 minute 47 seconds with a warm build cache.
+The six-mutant local run took 1 minute 58 seconds on the lifecycle draft with a warm build cache.
+The seven-mutant local run took 1 minute 48 seconds with a warm build cache.
+The eight-mutant combined local run took 2 minutes 6 seconds with a warm build cache.
+Hosted run `38448179312` took 15 to 21 minutes for the four existing matrix groups.
+Its Windows test took 16 minutes 6 seconds. A target in any of those four groups would extend that critical path.
+All seven targets run in one Stryker invocation in the existing `session-reliability` group.
+Hosted CI must measure the combined gate on a cold runner.
+Its report directory is `artifacts/stryker/tool-batch-readiness`.
 
 ### Tool Authorization Gate
 
@@ -614,7 +663,7 @@ Use this procedure:
 4. Configure Stryker for the smallest source span that contains the decision.
 5. Pin the expected mutant count and require each mutant to die.
 6. Record the target, claim, count, command, and measured cost in this section.
-7. Split the target into a parallel job if the total job approaches its timeout.
+7. Use another parallel matrix group if the total group approaches its timeout or exceeds the Windows test duration.
 
 Do not add a broad project scan. Broad scans can produce equivalent mutants,
 long runs, and invalid results from the current xUnit 3 adapter path.

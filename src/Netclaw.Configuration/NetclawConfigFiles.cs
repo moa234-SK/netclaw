@@ -35,6 +35,16 @@ public static class NetclawConfigFiles
         Converters = { EnumConverter },
     };
 
+    /// <summary>
+    /// Plain-dictionary reads of netclaw.json and secrets.json that never write the file back:
+    /// comments and trailing commas load, as they do for the daemon.
+    /// </summary>
+    public static readonly JsonSerializerOptions ConfigDictReadOptions = new()
+    {
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
+    };
+
     /// <summary>Plain indented output, matching the CLI's secrets-file formatting.</summary>
     public static readonly JsonSerializerOptions IndentedOptions = new()
     {
@@ -55,14 +65,16 @@ public static class NetclawConfigFiles
 
     /// <summary>
     /// Load a JSON file as a mutable dictionary. Returns a default skeleton if the file doesn't exist.
+    /// Comments and trailing commas are an error unless <paramref name="readOnly"/> is set: a caller
+    /// that writes the dictionary back would drop them. Read-only callers accept what the daemon accepts.
     /// </summary>
-    public static Dictionary<string, object> LoadJsonDict(string path)
+    public static Dictionary<string, object> LoadJsonDict(string path, bool readOnly = false)
     {
         if (!File.Exists(path))
             return new Dictionary<string, object> { ["configVersion"] = EmbeddedSchemaLoader.CurrentSchemaVersion };
 
         var text = File.ReadAllText(path);
-        return JsonSerializer.Deserialize<Dictionary<string, object>>(text)
+        return JsonSerializer.Deserialize<Dictionary<string, object>>(text, readOnly ? ConfigDictReadOptions : null)
                ?? new Dictionary<string, object> { ["configVersion"] = EmbeddedSchemaLoader.CurrentSchemaVersion };
     }
 
@@ -126,6 +138,19 @@ public static class NetclawConfigFiles
         }
 
         return string.Join('.', segments);
+    }
+
+    /// <summary>
+    /// Resolves a name typed by the operator to the spelling the file already has. Configuration
+    /// keys are read without case, so "Git" is the server "git". An exact match wins; a name that
+    /// matches nothing comes back unchanged.
+    /// </summary>
+    public static string ResolveName(IEnumerable<string> storedNames, string name)
+    {
+        var stored = storedNames.ToList();
+        return stored.Contains(name, StringComparer.Ordinal)
+            ? name
+            : stored.FirstOrDefault(key => string.Equals(key, name, StringComparison.OrdinalIgnoreCase)) ?? name;
     }
 
     /// <summary>
@@ -425,7 +450,8 @@ public static class NetclawConfigFiles
 
     public static bool SecretPresent(NetclawPaths paths, string path)
     {
-        var secrets = LoadJsonDict(paths.SecretsPath);
+        // Read-only: secrets.json may hold comments or trailing commas the daemon accepts.
+        var secrets = LoadJsonDict(paths.SecretsPath, readOnly: true);
         return PathPresent(secrets, path);
     }
 
@@ -445,7 +471,8 @@ public static class NetclawConfigFiles
     /// </summary>
     public static string? ReadDecryptedSecret(NetclawPaths paths, string path)
     {
-        var secrets = LoadJsonDict(paths.SecretsPath);
+        // Read-only: secrets.json may hold comments or trailing commas the daemon accepts.
+        var secrets = LoadJsonDict(paths.SecretsPath, readOnly: true);
         return TryGetPathValue(secrets, path, out var value)
             ? DecryptIfEncrypted(paths, value?.ToString())
             : null;

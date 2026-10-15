@@ -57,7 +57,6 @@ public sealed record SessionToolServices(
 /// for any session/test harness that has not wired up the embedding subsystem at all.
 /// </summary>
 public sealed record SessionMemoryServices(
-    IMemoryExtractor MemoryExtractor,
     IMemoryRecallCoordinator RecallCoordinator,
     IMemoryCheckpointSink CheckpointSink,
     SQLiteMemoryStore? MemoryStore,

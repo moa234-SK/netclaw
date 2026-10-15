@@ -49,8 +49,21 @@ internal static class ConfigFileHelper
     internal static string ResolveExistingKeyPath(Dictionary<string, object> root, string path)
         => NetclawConfigFiles.ResolveExistingKeyPath(root, path);
 
-    internal static Dictionary<string, object> LoadJsonDict(string path)
-        => NetclawConfigFiles.LoadJsonDict(path);
+    /// <summary>
+    /// Resolves a name typed by the operator to the spelling the file already has. Configuration
+    /// keys are read without case, so "Git" is the server "git". An exact match wins; a name that
+    /// matches nothing comes back unchanged.
+    /// </summary>
+    internal static string ResolveName(IEnumerable<string> storedNames, string name)
+        => NetclawConfigFiles.ResolveName(storedNames, name);
+
+    /// <summary>
+    /// Load a JSON file as a mutable dictionary. Returns a default skeleton if the file doesn't exist.
+    /// Comments and trailing commas are an error unless <paramref name="readOnly"/> is set: a caller
+    /// that writes the dictionary back would drop them. Read-only callers accept what the daemon accepts.
+    /// </summary>
+    internal static Dictionary<string, object> LoadJsonDict(string path, bool readOnly = false)
+        => NetclawConfigFiles.LoadJsonDict(path, readOnly);
 
     internal static Dictionary<string, object>? LoadJsonDictOrNull(string path)
         => NetclawConfigFiles.LoadJsonDictOrNull(path);

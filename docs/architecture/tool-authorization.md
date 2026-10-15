@@ -443,6 +443,17 @@ Negative example: the policy denies nothing. Every call then follows sections
 | Data | Configuration. The result is call-local. |
 | Rules | [TA-1](../../openspec/specs/tool-authorization/spec.md#requirement-ta-1-trust-context-is-explicit-and-fails-loud), [TA-2](../../openspec/specs/tool-authorization/spec.md#requirement-ta-2-schema-exposure-grants-no-authority), [TA-3](../../openspec/specs/tool-authorization/spec.md#requirement-ta-3-audience-profiles-admit-tools), [TA-4](../../openspec/specs/tool-authorization/spec.md#requirement-ta-4-consent-mode-and-shell-mode-resolve-per-audience-and-tool) |
 
+`LlmSessionActor` supplies its current `EffectiveTrustContext` to
+[`SessionModelContext`](../../src/Netclaw.Actors/Sessions/SessionModelContext.cs) when it prepares a model request.
+The context component calls `ToolAccessPolicy.FilterExposedTools` with that authority.
+It exposes no tools when a configured policy has no resolved trust context.
+`SessionInputFlow` owns the current actor-local authority and supplies an immutable snapshot to the actor.
+The actor supplies that authority to the context component. The context component owns request preparation and its transient inspection intent.
+The input owner builds and validates `InputAdmitted.TurnContext` before the actor persists the event.
+After the journal callback, the owner restores that stored context for the live turn.
+The actor sends the acknowledgment after the callback. The journal retains the original authority.
+Schema exposure grants no execution authority. The tool execution path still applies its authorization checks.
+
 Leaks today:
 
 - `ToolAccessPolicy` also parses shell text, runs hard deny, and builds the
@@ -546,6 +557,12 @@ Leaks today:
 | Must not know | Audience rules outside the root catalog, grants, shell syntax. |
 | Data | Call-local. Git repository facts are read from disk at each check. The protected path sets are process-local. |
 | Rules | [TA-6](../../openspec/specs/tool-authorization/spec.md#requirement-ta-6-path-access-decisions-own-file-tool-authority) |
+
+The session accepts a project-directory change through
+[`WorkingContextUpdater.AcceptToolResult`](../../src/Netclaw.Actors/Sessions/WorkingContextUpdater.cs).
+This rule requires a successful `set_working_directory` receipt with a declared project directory.
+Within the tool-result journal callback, the actor applies the accepted context and refreshes the prompt when the directory changes.
+`PathAccessPolicy` continues to decide path access for each later call.
 
 Leaks today:
 
@@ -670,7 +687,7 @@ Leaks today:
 | Item | Current state |
 | --- | --- |
 | Question | How does the operator see a request and answer it, now or after a restart? |
-| Classes | Approval part of [`LlmSessionActor`](../../src/Netclaw.Actors/Sessions/LlmSessionActor.cs), [`ToolApprovalState`](../../src/Netclaw.Actors/Sessions/ToolApprovalState.cs), [`IApprovalChannel`](../../src/Netclaw.Actors/Sessions/IApprovalChannel.cs), [`ParentSessionApprovalBridge`](../../src/Netclaw.Actors/Sessions/ParentSessionApprovalBridge.cs), [`IParentApprovalBridge`](../../src/Netclaw.Tools.Abstractions/IParentApprovalBridge.cs), the approval loop in [`SubAgentActor`](../../src/Netclaw.Actors/SubAgents/SubAgentActor.cs), [`ApprovalResponseFlow`](../../src/Netclaw.Channels/ApprovalResponseFlow.cs), [`PendingApprovalLookup`](../../src/Netclaw.Channels/PendingApprovalLookup.cs), [`ApprovalButtonValueCodec`](../../src/Netclaw.Actors/Protocol/ApprovalButtonValueCodec.cs), [`ApprovalOptionKeys`](../../src/Netclaw.Actors/Protocol/ApprovalOptionKeys.cs), the Slack, Discord, and Mattermost prompt builders |
+| Classes | Approval part of [`LlmSessionActor`](../../src/Netclaw.Actors/Sessions/LlmSessionActor.cs), [`SessionToolWorkflow`](../../src/Netclaw.Actors/Sessions/SessionToolWorkflow.cs), [`IApprovalChannel`](../../src/Netclaw.Actors/Sessions/IApprovalChannel.cs), [`ParentSessionApprovalBridge`](../../src/Netclaw.Actors/Sessions/ParentSessionApprovalBridge.cs), [`IParentApprovalBridge`](../../src/Netclaw.Tools.Abstractions/IParentApprovalBridge.cs), the approval loop in [`SubAgentActor`](../../src/Netclaw.Actors/SubAgents/SubAgentActor.cs), [`ApprovalResponseFlow`](../../src/Netclaw.Channels/ApprovalResponseFlow.cs), [`PendingApprovalLookup`](../../src/Netclaw.Channels/PendingApprovalLookup.cs), [`ApprovalButtonValueCodec`](../../src/Netclaw.Actors/Protocol/ApprovalButtonValueCodec.cs), [`ApprovalOptionKeys`](../../src/Netclaw.Actors/Protocol/ApprovalOptionKeys.cs), the Slack, Discord, and Mattermost prompt builders |
 | Published contract | Output `ToolInteractionRequest` and input `ToolInteractionResponse` ([`SessionProtocol.Outputs.cs`](../../src/Netclaw.Actors/Sessions/SessionProtocol.Outputs.cs)). Journal events `ToolApprovalRequested` and `ToolApprovalResolved`. Option key strings such as `approve_once`. |
 | Must not know | Policy rules. It renders the options that Consent offers. |
 | Data | Durable session journal. Actor-local state for an unanswered request. A subagent request is live-only. |
@@ -679,7 +696,20 @@ Leaks today:
 Leaks today:
 
 - Two layers check that the person who answers is the requester: the channel
-  (`PendingApprovalLookup`) and the session actor.
+  (`PendingApprovalLookup`) and the session workflow.
+
+`SessionToolWorkflow` owns the session-local approval records, live wait channel, active batch tracker, and temporary correction state.
+It validates the original requester and offered answer. It selects which unanswered calls can resume after recovery.
+`SessionInputFlow` retains the current turn context. The workflow retains the original authority for each unresolved prompt.
+[`SessionExecutionLifetime`](../../src/Netclaw.Actors/Sessions/Handlers/SessionExecutionLifetime.cs) decides whether a restart can stop the exact tool task.
+The workflow decides whether every unfinished tool call waits on a durable approval.
+The lifetime owner also validates the complete stored turn authority before a restart reminder or resumed turn.
+The actor passes the durable input records to that check. The input owner does not store another durable copy.
+The actor writes grants, persists events, and emits outputs. The lifetime owner owns task cancellation and stop completion.
+
+The workflow releases a claimed live wait only after the actor completes the required grant and journal steps.
+The journal retains durable parent-session approval requests so a UI answer can safely resume interrupted work.
+Live-only child prompts have no journal record and expire after restart.
 
 ### 3.7 Advice (support module)
 
@@ -708,7 +738,7 @@ time-of-use gap.
 
 ## 4. One call, end to end
 
-This sequence shows a shell call that needs consent. The upper branch shows a
+This sequence shows a parent-session shell call that needs durable consent. The upper branch shows a
 live answer. The lower branch shows an answer after the daemon restarts or the
 session passivates.
 
@@ -717,6 +747,7 @@ sequenceDiagram
     autonumber
     participant M as Model
     participant S as LlmSessionActor
+    participant W as SessionToolWorkflow
     participant P as SessionToolExecutionPipeline
     participant X as DispatchingToolExecutor
     participant G as ToolAuthorizer + ToolAccessPolicy
@@ -746,19 +777,23 @@ sequenceDiagram
         alt live answer
             O->>C: select option
             C->>S: ToolInteractionResponse
-            S->>S: check requester and offered option
+            S->>W: check requester and offered option
+            W-->>S: accepted answer with claimed live wait
             S->>T: record grant (chat, folder, repository, everywhere)
             S->>S: journal ToolApprovalResolved
-            S-->>P: answer
+            S->>W: apply committed answer
+            W-->>P: release the claimed wait
             P->>X: authorize again with one-time consent
         else answer after restart or passivation
             Note over S: Daemon restarts or session passivates.<br/>The journal keeps the unanswered request.
             O->>C: select option
             C->>S: ToolInteractionResponse (session recovers from journal)
-            S->>S: check requester and offered option
+            S->>W: check requester and offered option
             S->>T: record grant
             S->>S: journal ToolApprovalResolved
-            S->>P: re-drive the parked batch after all sibling answers
+            S->>W: select unanswered calls after all sibling answers
+            W-->>S: dispatch with original authority
+            S->>P: re-drive the selected calls
             P->>X: authorize again with one-time consent
         end
         X->>L: start
@@ -778,7 +813,7 @@ Facts behind the diagram (current code):
   (`HandleToolInteractionRequestDispatch` in `LlmSessionActor.cs`).
 - An unanswered request does not keep the session in memory. An answer
   rehydrates the session and re-drives the parked batch
-  (`HandleToolInteractionResponseWhenIdle`, `RedriveToolBatchForApproval`).
+  (`HandleToolInteractionResponseWhenIdle` and `SessionToolWorkflow.PlanRecoveredContinuation`).
 - No timer denies an unanswered request. The session and its subagents ask
   through one prompt, `ParentSessionApprovalBridge`, which waits with the
   session's approval timeout. The daemon sets that timeout to infinite. The

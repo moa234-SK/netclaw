@@ -149,7 +149,7 @@ catch (InvalidDataException ex)
     // duplicate key such as Models and models): also an operator error.
     StartupConfigurationFailure.Report(
         bootstrapPaths,
-        $"Cannot read netclaw.json or secrets.json: {ex.InnerException?.Message ?? ex.Message}",
+        DaemonConfigurationSources.DescribeLoadFailure(ex),
         Console.Error);
     Environment.ExitCode = 1;
 }
@@ -250,7 +250,7 @@ static async Task RunDaemonAsync(
     builder.Services.AddMattermostActionEndpointRateLimiting();
 
     // SignalR for remote clients (CLI thin client, Blazor ops console)
-    builder.Services.AddSignalR();
+    builder.Services.AddSessionHubSignalR();
     builder.Services.AddSingleton<SessionCatalogService>();
     builder.Services.AddSingleton<ISessionLifecycleObserver>(sp => sp.GetRequiredService<SessionCatalogService>());
     builder.Services.AddSingleton<ClaimsPrincipalMapper>();
@@ -879,8 +879,6 @@ static IReadOnlyList<string> ConfigureDaemonServices(
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<EmbeddingWarmupHostedService>());
     }
 
-    services.AddSingleton<IMemoryExtractor>(NullMemoryExtractor.Instance);
-
     services.AddDaemonToolExecutor(toolRegistry, toolAccessPolicy);
     // Operational notification webhooks
     var notificationsConfig = configuration.GetSection("Notifications")
@@ -1170,7 +1168,6 @@ static IReadOnlyList<string> ConfigureDaemonServices(
         sp.GetService<FileSubAgentDefinitionLoader>()));
 
     services.AddSingleton(sp => new SessionMemoryServices(
-        sp.GetService<IMemoryExtractor>() ?? NullMemoryExtractor.Instance,
         sp.GetService<IMemoryRecallCoordinator>() ?? NullMemoryRecallCoordinator.Instance,
         sp.GetService<IMemoryCheckpointSink>() ?? NullMemoryCheckpointSink.Instance,
         sp.GetService<SQLiteMemoryStore>(),
