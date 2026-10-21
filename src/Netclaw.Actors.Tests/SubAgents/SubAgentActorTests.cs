@@ -7,6 +7,7 @@ using Akka.Actor;
 using Akka.Event;
 using Akka.Hosting;
 using Akka.Hosting.TestKit;
+using System.Collections.Concurrent;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -30,38 +31,9 @@ using static Netclaw.Actors.SubAgents.SubAgentProtocol;
 
 namespace Netclaw.Actors.Tests.SubAgents;
 
-public class SubAgentActorTests : TestKit, IAsyncDisposable
+public class SubAgentActorTests : SubAgentActorTestBase
 {
     private const string ApprovalProbeToolName = "approval_probe";
-    private static readonly TimeSpan ApprovalAskTimeout = TimeSpan.FromSeconds(30);
-    public static bool IsPosix => !OperatingSystem.IsWindows();
-
-    // Each call owns a unique temp directory (issue #2266); teardown disposes them all.
-    private readonly List<TestSessionTempDirectory> _tempDirs = [];
-
-    private string TestPath(string category, string name)
-    {
-        var dir = TestSessionTempDirectory.Create($"netclaw-subagent-test-{category}-{name}-");
-        _tempDirs.Add(dir);
-        return dir.Path;
-    }
-
-    // TestKit stops the actor system only after AfterAllAsync returns, and it fails
-    // the test when AfterAllAsync takes more than 5 seconds. Delete the directories
-    // after TestKit has disposed, and not in AfterAllAsync.
-    async ValueTask IAsyncDisposable.DisposeAsync()
-    {
-        try
-        {
-            await base.DisposeAsync();
-        }
-        finally
-        {
-            foreach (var dir in _tempDirs)
-                await dir.DisposeAsync();
-            _tempDirs.Clear();
-        }
-    }
 
     private static FunctionCallContent CreateToolCall(string callId, string name)
         => CreateToolCall(callId, name, new Dictionary<string, object?>());
@@ -78,22 +50,40 @@ public class SubAgentActorTests : TestKit, IAsyncDisposable
         return new FunctionCallContent(callId, name, callArguments);
     }
 
-    public SubAgentActorTests(ITestOutputHelper output) : base(output: output) { }
+    public SubAgentActorTests(ITestOutputHelper output) : base(output) { }
 
     protected override void ConfigureAkka(AkkaConfigurationBuilder builder, IServiceProvider provider)
     {
         // No persistence or hosting needed — SubAgentActor is standalone
     }
 
-    private static SubAgentDefinition CreateDefinition(IReadOnlyList<INetclawTool>? tools = null)
+    [Fact]
+    public async Task Child_does_not_restart_work_while_parent_holds_terminal_commit()
     {
-        return new SubAgentDefinition
+        var client = new FakeChatClient();
+        var owner = CreateTestProbe("child-terminal-owner");
+        using var execution = new ChildRunExecution(new SubAgentRunId("terminal-ack-run"), owner.Ref);
+        var actor = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition(), client, PermissivePolicy()));
+        actor.Tell(new RunSubAgent
         {
-            Name = new AgentName("test-agent"),
-            SystemPrompt = "You are a test agent.",
-            Tools = tools ?? [],
-            EmitStructuredFindings = false
-        };
+            Scope = SubAgentTestScope.Create(),
+            Task = "Return a short result.",
+            Timeout = TimeSpan.FromSeconds(10),
+            OwnedRun = execution,
+            Cancellation = execution.Token
+        }, owner.Ref);
+
+        var terminal = await owner.ExpectMsgAsync<ChildTerminalReturned>(TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(new SubAgentRunId("terminal-ack-run"), terminal.RunId);
+        Assert.Equal(1, client.CallCount);
+
+        var watcher = CreateTestProbe("child-terminal-watcher");
+        watcher.Watch(actor);
+        owner.Send(actor, new ChildCheckpointCommitted());
+        owner.Send(actor, new ChildTerminalCommitted());
+        await watcher.ExpectTerminatedAsync(actor, TimeSpan.FromSeconds(5), cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, client.CallCount);
     }
 
     private static string MalformedToolCallMarkup() => """
@@ -359,6 +349,112 @@ public class SubAgentActorTests : TestKit, IAsyncDisposable
         Assert.NotNull(fakeTool.LastContext);
         // Second LLM call returns text (tool calls only on first call)
         Assert.Contains("Response #2", result.Output);
+    }
+
+    // Production case (child fea1ce26): the child ended with "Now the scene file." and
+    // 69042 chars of reasoning, no tool call, finishReason=length. The run reported
+    // success=True although the model ran out of output budget before it emitted the
+    // tool call. A reply cut off by length without a tool call is never a completion.
+    private const string TruncatedStub = "Now the scene file.";
+
+    // Wire value of the new outcome reason. Asserted as a string so the test stays
+    // independent of the C# member name.
+    private const string OutputTruncatedReason = "output_truncated";
+
+    [Fact]
+    public async Task Text_reply_cut_off_by_length_fails_with_output_truncated_reason()
+    {
+        var fakeClient = new FakeChatClient
+        {
+            ResponseContentsByCall =
+            [
+                [new TextReasoningContent(new string('t', 20_000)), new TextContent(TruncatedStub)]
+            ],
+            FinishReasonsByCall = [ChatFinishReason.Length]
+        };
+        var agent = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition(), fakeClient, PermissivePolicy()));
+
+        var result = await agent.Ask<SubAgentResult>(
+            new RunSubAgent { Scope = SubAgentTestScope.Create(), Task = "Write the scene file", Timeout = TimeSpan.FromSeconds(5) },
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.False(result.Success);
+        Assert.Equal(SubAgentRunOutcome.Failed, result.Outcome);
+        Assert.Equal(OutputTruncatedReason, result.OutcomeReason?.Value);
+        Assert.Contains("truncat", result.Output, StringComparison.OrdinalIgnoreCase);
+
+        // Fail fast: no retry call.
+        Assert.Equal(1, fakeClient.CallCount);
+    }
+
+    [Fact]
+    public async Task Text_reply_that_ends_with_stop_still_completes()
+    {
+        var fakeClient = new FakeChatClient
+        {
+            ResponseContentsByCall =
+            [
+                [new TextReasoningContent("plan the answer"), new TextContent("The scene file is ready.")]
+            ],
+            FinishReasonsByCall = [ChatFinishReason.Stop]
+        };
+        var agent = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition(), fakeClient, PermissivePolicy()));
+
+        var result = await agent.Ask<SubAgentResult>(
+            new RunSubAgent { Scope = SubAgentTestScope.Create(), Task = "Write the scene file", Timeout = TimeSpan.FromSeconds(5) },
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.True(result.Success);
+        Assert.Equal(SubAgentRunOutcome.Completed, result.Outcome);
+        Assert.Null(result.OutcomeReason);
+        Assert.Equal("The scene file is ready.", result.Output);
+    }
+
+    [Fact]
+    public async Task Tool_call_response_that_ends_with_length_still_runs_the_tool()
+    {
+        // Today a tool call wins over the finish reason. Keep it: only a reply with
+        // no tool call is a failure.
+        var fakeTool = new FakeNetclawTool("greet", "Hello from tool!");
+        var fakeClient = new FakeChatClient
+        {
+            ToolCallsOnFirstCall =
+            [
+                CreateToolCall("call-1", "greet", new Dictionary<string, object?> { ["name"] = "World" })
+            ],
+            FinishReasonsByCall = [ChatFinishReason.Length]
+        };
+        var agent = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition([fakeTool]), fakeClient, PermissivePolicy()));
+
+        var result = await agent.Ask<SubAgentResult>(
+            new RunSubAgent { Scope = SubAgentTestScope.Create(), Task = "Greet the user", Timeout = TimeSpan.FromSeconds(5) },
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.True(fakeTool.WasCalled);
+        Assert.True(result.Success);
+        Assert.Contains("Response #2", result.Output);
+    }
+
+    [Fact]
+    public async Task Thinking_only_reply_cut_off_by_length_still_retries_and_recovers()
+    {
+        // The existing ThinkingOnly retry path must keep working next to the new
+        // text-reply rule.
+        var fakeClient = new FakeChatClient
+        {
+            ResponseContentsByCall = [[new TextReasoningContent("still thinking")]],
+            FinishReasonsByCall = [ChatFinishReason.Length, ChatFinishReason.Stop],
+            ResponseText = "Recovered answer."
+        };
+        var agent = Sys.ActorOf(SubAgentActor.CreateProps(CreateDefinition(), fakeClient, PermissivePolicy()));
+
+        var result = await agent.Ask<SubAgentResult>(
+            new RunSubAgent { Scope = SubAgentTestScope.Create(), Task = "Answer please", Timeout = TimeSpan.FromSeconds(5) },
+            TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.True(result.Success);
+        Assert.Equal("Recovered answer.", result.Output);
+        Assert.Equal(2, fakeClient.CallCount);
     }
 
     [Fact]
@@ -818,123 +914,6 @@ public class SubAgentActorTests : TestKit, IAsyncDisposable
             GetLastToolResult(fakeClient, "call-native-temporary-correction"));
     }
 
-    // A child may read the worktree, attended or not (D2), so the reviewed
-    // phrase runs with no project declaration and no prompt.
-    [Fact]
-    public async Task Subagent_interactive_reviewed_phrase_in_readable_worktree_needs_no_prompt()
-    {
-        const string callId = "call-project-scope-approval";
-        var approvalBridge = new RecordingParentApprovalBridge(ConsentAnswer.Once.Instance);
-        var scenario = await RunProjectScopeScenarioAsync(
-            CreateShellTool(),
-            callId,
-            ProjectScopeCommand,
-            approvalBridge);
-
-        Assert.True(scenario.Result.Success, scenario.Result.Output);
-        Assert.Equal(0, approvalBridge.RequestCount);
-        Assert.Contains(
-            scenario.Worktree,
-            GetLastToolResult(scenario.Client, callId),
-            StringComparison.OrdinalIgnoreCase);
-    }
-
-    [SlopwatchSuppress("SW001", "This regression requires a POSIX shell cwd and Bash project-scope correction behavior.")]
-    [Theory(SkipUnless = nameof(IsPosix), Skip = "The project-scope correction defines Bash path behavior.")]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task Subagent_project_declaration_updates_child_prompt_before_unchanged_retry(
-        bool supportsApproval)
-    {
-        const string firstCallId = "call-project-scope-first";
-        const string declarationCallId = "call-project-scope-declare";
-        const string retryCallId = "call-project-scope-retry";
-        const string projectGuidance = "Project instructions: use the local test conventions.";
-        var sessionDirectory = TestPath("sessions", "project-scope-child");
-        var worktree = Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory));
-        var workspacesDirectory = Directory.GetParent(worktree)!.FullName;
-        var shell = CreateShellTool();
-        var setWorkingDirectory = new SetWorkingDirectoryTool(
-            new ToolConfig(),
-            new NetclawPaths(workspacesDirectory, workspacesDirectory),
-            new ToolPathPolicy([]));
-        var client = new SequencedToolCallChatClient(
-        [
-            ProjectScopeCall(
-                firstCallId,
-                worktree,
-                TestShellEnvironment.PrintWorkingDirectoryCommand),
-            new FunctionCallContent(
-                declarationCallId,
-                SetWorkingDirectoryTool.ToolName,
-                new Dictionary<string, object?>
-                {
-                    ["Path"] = worktree,
-                    ["_rationale"] = "Declare the project directory before the next inspection."
-                }),
-            ProjectScopeCall(
-                retryCallId,
-                worktree,
-                TestShellEnvironment.PrintWorkingDirectoryCommand)
-        ]);
-        var approvalBridge = supportsApproval
-            ? new RecordingParentApprovalBridge(ConsentAnswer.Once.Instance)
-            : null;
-        var actor = Sys.ActorOf(SubAgentActor.CreatePropsWithProjectInstructionProvider(
-            CreateDefinition([shell, setWorkingDirectory]),
-            client,
-            CreateProjectScopePolicy(workspacesDirectory),
-            new ProjectPromptProvider(worktree, projectGuidance)));
-
-        var result = await actor.Ask<SubAgentResult>(
-            new RunSubAgent
-            {
-                Scope = SubAgentTestScope.Create(
-                    sessionDirectory: sessionDirectory,
-                    approvalBridge: approvalBridge),
-                Task = "Declare the project and retry the exact inspection.",
-                Timeout = TimeSpan.FromSeconds(5)
-            },
-            ApprovalAskTimeout,
-            TestContext.Current.CancellationToken);
-
-        // D2: an attended and an unattended child get the same result.
-        Assert.True(result.Success, result.Output);
-        Assert.Contains(
-            worktree,
-            GetLastToolResult(client.LastReceivedMessages, retryCallId),
-            StringComparison.Ordinal);
-        Assert.Equal(0, approvalBridge?.RequestCount ?? 0);
-        Assert.Contains(
-            projectGuidance,
-            client.LastReceivedMessages!.Single(message => message.Role == ChatRole.System).Text,
-            StringComparison.Ordinal);
-        Assert.Single(
-            client.LastReceivedMessages!,
-            message => message.Text.Contains($"session_dir: {sessionDirectory}", StringComparison.Ordinal));
-        Assert.Single(
-            client.LastReceivedMessages!,
-            message => message.Text.Contains(ToolChoiceGuidance.StructuredWorkspaceSelection, StringComparison.Ordinal));
-        Assert.Single(
-            client.LastReceivedMessages!,
-            message => message.Text.Contains(ToolChoiceGuidance.DirectorySelectionOrder, StringComparison.Ordinal));
-        Assert.Single(
-            client.LastReceivedMessages!,
-            message => message.Text.Contains(ToolChoiceGuidance.ShellCompositionOrder, StringComparison.Ordinal));
-        Assert.DoesNotContain(
-            sessionDirectory,
-            client.LastReceivedMessages!.Single(message => message.Role == ChatRole.System).Text,
-            StringComparison.Ordinal);
-
-        if (supportsApproval)
-        {
-            Assert.Equal(worktree, result.WorkingContext!.ProjectDirectory);
-            var parent = new WorkingContext { ProjectDirectory = "/parent/project" };
-            var merged = WorkingContextUpdater.MergeSuccessfulSubAgentWorkingContext(parent, result.Completion);
-            Assert.Equal("/parent/project", merged.ProjectDirectory);
-        }
-    }
-
     [Theory]
     [InlineData("\0")]
     [InlineData("\r")]
@@ -1377,7 +1356,7 @@ public class SubAgentActorTests : TestKit, IAsyncDisposable
         Assert.False(fakeTool.WasCalled);
     }
 
-    private static ToolAccessPolicy PermissivePolicy() => new(
+    internal static ToolAccessPolicy PermissivePolicy() => new(
         new NetclawPaths(),
         new ToolConfig { ShellMode = ShellExecutionMode.HostAllowed },
         new EffectivePolicyDefaults(
@@ -1419,15 +1398,6 @@ public class SubAgentActorTests : TestKit, IAsyncDisposable
             new ToolPathPolicy(environment, []));
     }
 
-    private static ShellTool CreateShellTool()
-    {
-        var environment = TestShellEnvironment.Current;
-        return new ShellTool(
-            new ToolConfig { ShellMode = ShellExecutionMode.HostAllowed },
-            new ToolPathPolicy(environment, []),
-            new ShellCommandPolicy(environment));
-    }
-
     private static ToolAccessPolicy CreateManagedTemporaryCorrectionPolicy()
     {
         var toolConfig = new ToolConfig { ShellMode = ShellExecutionMode.HostAllowed };
@@ -1457,90 +1427,6 @@ public class SubAgentActorTests : TestKit, IAsyncDisposable
                 new AlwaysSafeTemporaryPathInspector()));
     }
 
-    private async Task<ProjectScopeScenario> RunProjectScopeScenarioAsync(
-        INetclawTool shell,
-        string callId,
-        string shellCommand,
-        IParentApprovalBridge? approvalBridge)
-    {
-        var worktree = Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory));
-        var client = new FakeChatClient
-        {
-            ToolCallsOnFirstCall = [ProjectScopeCall(callId, worktree, shellCommand)]
-        };
-        var agent = Sys.ActorOf(SubAgentActor.CreateProps(
-            CreateDefinition([shell]),
-            client,
-            CreateProjectScopePolicy(worktree)));
-        var result = await agent.Ask<SubAgentResult>(
-            new RunSubAgent
-            {
-                Scope = SubAgentTestScope.Create(approvalBridge: approvalBridge),
-                Task = "Inspect project metrics.",
-                Timeout = TimeSpan.FromSeconds(5)
-            },
-            ApprovalAskTimeout,
-            TestContext.Current.CancellationToken);
-
-        return new ProjectScopeScenario(result, client, worktree);
-    }
-
-    private sealed record ProjectScopeScenario(
-        SubAgentResult Result,
-        FakeChatClient Client,
-        string Worktree);
-
-    private sealed class ProjectPromptProvider(
-        string expectedProjectDirectory,
-        string projectInstructions) : ISystemPromptProvider
-    {
-        public int CallCount { get; private set; }
-
-        public string GetSystemPrompt(TrustAudience audience, string? projectDirectory = null)
-            => string.Empty;
-
-        public string? GetProjectInstructions(TrustAudience audience, string? projectDirectory)
-        {
-            CallCount++;
-            return string.Equals(projectDirectory, expectedProjectDirectory, StringComparison.Ordinal)
-                ? projectInstructions
-                : null;
-        }
-
-        public string? GetOperatingRules(TrustAudience audience) => null;
-    }
-
-    private static ToolAccessPolicy CreateProjectScopePolicy(string workspacesDirectory)
-    {
-        var toolConfig = new ToolConfig { ShellMode = ShellExecutionMode.HostAllowed };
-        toolConfig.AudienceProfiles.Personal.ApprovalPolicy = new ToolApprovalConfig
-        {
-            ToolOverrides = new Dictionary<string, ToolApprovalMode>(StringComparer.Ordinal)
-            {
-                [ShellTool.ToolName] = ToolApprovalMode.Approval,
-                [SetWorkingDirectoryTool.ToolName] = ToolApprovalMode.Auto
-            }
-        };
-        var environment = TestShellEnvironment.Current;
-        var approvalShell = environment.Grammar == ShellGrammar.Bash
-            ? ApprovalShell.Bash
-            : ApprovalShell.PowerShell;
-        var safeVerbs = environment.Grammar == ShellGrammar.Bash
-            ? new[] { "pwd", "whoami" }
-            : ["Get-Location", "Get-Date"];
-        return new ToolAccessPolicy(
-            new NetclawPaths(workspacesDirectory, workspacesDirectory),
-            toolConfig,
-            new EffectivePolicyDefaults(
-                DeploymentPosture.Personal,
-                TrustAudience.Personal,
-                ShellExecutionMode.HostAllowed,
-                UsedStrictFallback: false),
-            new ShellCommandPolicy(environment),
-            new ToolPathPolicy(environment, []),
-            safeVerbs: SafeVerbList.FromVerbs(approvalShell, safeVerbs));
-    }
-
     private static FunctionCallContent PlatformTemporaryCall(string callId)
         => new(callId, ShellTool.ToolName, new Dictionary<string, object?>
         {
@@ -1560,39 +1446,6 @@ public class SubAgentActorTests : TestKit, IAsyncDisposable
             ["WorkingDirectory"] = Path.GetFullPath(Path.GetTempPath()),
             ["_rationale"] = "Write a disposable diagnostic artifact."
         });
-
-    private static FunctionCallContent ProjectScopeCall(
-        string callId,
-        string workingDirectory,
-        string command)
-        => new(callId, ShellTool.ToolName, new Dictionary<string, object?>
-        {
-            ["Command"] = command,
-            ["WorkingDirectory"] = workingDirectory,
-            ["_rationale"] = "Inspect the project metric sources."
-        });
-
-    private static string ProjectScopeCommand =>
-        TestShellEnvironment.Current.Grammar == ShellGrammar.Bash
-            ? "pwd"
-            : "Get-Location";
-
-    private static string? GetLastToolResult(FakeChatClient fakeClient, string callId)
-    {
-        Assert.NotNull(fakeClient.LastReceivedMessages);
-        return GetLastToolResult(fakeClient.LastReceivedMessages, callId);
-    }
-
-    private static string? GetLastToolResult(
-        IReadOnlyList<ChatMessage>? messages,
-        string callId)
-    {
-        Assert.NotNull(messages);
-        return messages
-            .SelectMany(m => m.Contents.OfType<FunctionResultContent>())
-            .Single(r => r.CallId == callId)
-            .Result?.ToString();
-    }
 
     private sealed class AlwaysSafeTemporaryPathInspector : IPlatformTemporaryPathInspector
     {
@@ -1657,101 +1510,101 @@ public class SubAgentActorTests : TestKit, IAsyncDisposable
     }
 
     [Fact]
-    public async Task Max_iterations_forces_text_response()
+    public async Task Distinct_productive_tool_rounds_continue_past_the_former_limit()
     {
-        var fakeTool = new FakeNetclawTool("looper", "loop result");
-        var fakeClient = new FakeChatClient
-        {
-            ToolCallsOnFirstCall =
-            [
-                CreateToolCall("call-loop", "looper")
-            ],
-            AlwaysReturnToolCalls = true
-        };
-
-        var definition = CreateDefinition([fakeTool]);
+        const int FormerDefaultLimit = 30;
+        const int UsefulRounds = FormerDefaultLimit + 1;
+        var tool = new ProgressTool();
+        var responses = Enumerable.Range(1, UsefulRounds)
+            .Select(round => (IReadOnlyList<AIContent>)[CreateToolCall(
+                $"call-{round}",
+                "looper",
+                new Dictionary<string, object?> { ["query"] = $"step-{round}" })])
+            .ToArray();
+        var fakeClient = new ScriptedToolCallChatClient(responses, "Task complete.");
+        var definition = CreateDefinition([tool]);
         var agent = Sys.ActorOf(SubAgentActor.CreateProps(
             definition,
             fakeClient,
-            PermissivePolicy(),
-            maxToolIterations: 3));
+            PermissivePolicy()));
 
         var result = await agent.Ask<SubAgentResult>(
-            new RunSubAgent { Scope = SubAgentTestScope.Create(), Task = "Loop forever", Timeout = TimeSpan.FromSeconds(10) },
-            TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            new RunSubAgent { Scope = SubAgentTestScope.Create(), Task = "Use each distinct result", Timeout = TimeSpan.FromSeconds(30) },
+            TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
 
-        // After the configured tool budget, force a no-tools call which returns text.
         Assert.True(result.Success);
-        Assert.Equal(SubAgentRunOutcome.Partial, result.Outcome);
-        Assert.Equal(SubAgentOutcomeReason.ToolIterationBudgetExhausted, result.OutcomeReason);
-        Assert.Equal(4, fakeClient.CallCount);
-        Assert.NotNull(fakeClient.LastReceivedMessages);
-        Assert.Contains(fakeClient.LastReceivedMessages,
-            message => message.Role == ChatRole.User
-                       && message.Text.Contains("Start wrapping up your tool usage", StringComparison.Ordinal));
-        Assert.Contains(fakeClient.LastReceivedMessages,
-            message => message.Role == ChatRole.User
-                       && message.Text.Contains("Do NOT request any more tools", StringComparison.Ordinal));
+        Assert.Equal(SubAgentRunOutcome.Completed, result.Outcome);
+        Assert.Null(result.OutcomeReason);
+        Assert.Equal("Task complete.", result.Output);
+        Assert.Equal(UsefulRounds + 1, fakeClient.CallCount);
+        Assert.Equal(Enumerable.Range(1, UsefulRounds).Select(static round => $"step-{round}"), tool.Queries);
     }
 
     [Fact]
-    public async Task Exact_tool_cycle_gets_one_correction_then_stops()
+    public async Task Repeated_corrected_call_is_refused_again_with_a_nudge_and_the_child_continues()
     {
         var diagnostics = CreateTestProbe();
         Sys.EventStream.Subscribe(diagnostics, typeof(Warning));
-        var executionCount = 0;
-        var fakeTool = new FakeNetclawTool(
-            "mutate_state",
-            "loop result",
-            onExecute: _ => Interlocked.Increment(ref executionCount));
-        var fakeClient = new FakeChatClient
-        {
-            ToolCallsOnFirstCall =
-            [
-                CreateToolCall("call-loop", "mutate_state")
-            ],
-            AlwaysReturnToolCalls = true,
-            ResponseTextsByCall =
-            [
-                "unused",
-                "unused",
-                "unused",
-                "unused",
-                string.Empty,
-                "Final partial report."
-            ]
-        };
+        var tool = new ProgressTool();
+        FunctionCallContent Call(string callId, string query)
+            => CreateToolCall(callId, "looper", new Dictionary<string, object?> { ["query"] = query });
+        IReadOnlyList<AIContent>[] responses =
+        [
+            [Call("repeat-1", "repeat"), Call("diagnostic-1", "diagnostic-1")],
+            [Call("repeat-2", "repeat"), Call("diagnostic-2", "diagnostic-2")],
+            [Call("repeat-3", "repeat"), Call("diagnostic-3", "diagnostic-3")],
+            [Call("repeat-4", "repeat"), Call("diagnostic-4", "diagnostic-4")]
+        ];
+        var fakeClient = new ScriptedToolCallChatClient(responses, "The repeat stalls. Diagnostics 1 to 4 ran.");
 
         var agent = Sys.ActorOf(SubAgentActor.CreateProps(
-            CreateDefinition([fakeTool]),
+            CreateDefinition([tool]),
             fakeClient,
-            PermissivePolicy(),
-            maxToolIterations: 10));
+            PermissivePolicy()));
 
         var result = await agent.Ask<SubAgentResult>(
             new RunSubAgent
             {
                 Scope = SubAgentTestScope.Create(),
-                Task = "Repeat the same tool.",
+                Task = "Repeat one call and run a diagnostic each round.",
                 Timeout = TimeSpan.FromSeconds(10)
             },
             TimeSpan.FromSeconds(10),
             TestContext.Current.CancellationToken);
 
+        // The child is not stopped. It reads the nudge and completes with its own answer.
         Assert.True(result.Success);
-        Assert.Equal(SubAgentRunOutcome.Partial, result.Outcome);
-        Assert.Equal(SubAgentOutcomeReason.ToolCycleStopped, result.OutcomeReason);
-        Assert.Equal(6, fakeClient.CallCount);
-        Assert.Equal(2, executionCount);
-        Assert.Equal("Final partial report.", result.Output);
-        Assert.NotNull(fakeClient.LastReceivedMessages);
-        var toolResults = fakeClient.LastReceivedMessages
+        Assert.Equal(SubAgentRunOutcome.Completed, result.Outcome);
+        Assert.Null(result.OutcomeReason);
+        Assert.Equal("The repeat stalls. Diagnostics 1 to 4 ran.", result.Output);
+        Assert.Equal(5, fakeClient.CallCount);
+        // The new diagnostic next to the repeat still runs. Neither refused repeat runs.
+        Assert.Equal(
+            ["diagnostic-1", "diagnostic-2", "diagnostic-3", "diagnostic-4", "repeat", "repeat"],
+            tool.Queries.Order(StringComparer.Ordinal));
+        var lastRequest = fakeClient.ReceivedMessagesByCall[^1];
+        var toolResults = lastRequest
             .SelectMany(static message => message.Contents.OfType<FunctionResultContent>())
             .Select(static toolResult => toolResult.Result?.ToString() ?? string.Empty)
             .ToList();
-        Assert.Equal(2, toolResults.Count(static text => text == "loop result"));
-        Assert.Single(toolResults, static text =>
-            text.Contains("repeated action-and-outcome cycle", StringComparison.Ordinal));
+        Assert.Equal(2, toolResults.Count(static text => text == "result:repeat"));
+        Assert.Equal(4, toolResults.Count(static text => text.StartsWith("result:diagnostic-", StringComparison.Ordinal)));
+        Assert.Equal(2, toolResults.Count(static text =>
+            text.Contains("same action completed twice", StringComparison.Ordinal)));
+
+        // The first correction has no nudge. The repeat gets the child nudge as the last message.
+        static bool IsChildNudge(ChatMessage message)
+            => message.Role == Microsoft.Extensions.AI.ChatRole.User
+                && message.Text.StartsWith("[system: Netclaw refused your repeated call to `looper` again.",
+                    StringComparison.Ordinal);
+        Assert.DoesNotContain(fakeClient.ReceivedMessagesByCall[3], IsChildNudge);
+        var nudge = lastRequest[^1];
+        Assert.True(IsChildNudge(nudge), $"The last message was: {nudge.Text}");
+        // A child has no background job manager, so its nudge sends the long command to the parent.
+        Assert.DoesNotContain("_background", nudge.Text, StringComparison.Ordinal);
+        Assert.Contains("parent", nudge.Text, StringComparison.Ordinal);
+        Assert.Contains("did not execute", nudge.Text, StringComparison.Ordinal);
+
         for (var i = 0; i < 2; i++)
         {
             var diagnostic = await diagnostics.FishForMessageAsync<Warning>(
@@ -1761,8 +1614,79 @@ public class SubAgentActorTests : TestKit, IAsyncDisposable
             Assert.Equal($"TurnStateTracker (akka://{Sys.Name})", diagnostic.LogSource);
             Assert.DoesNotContain(agent.Path.Name, diagnostic.LogSource, StringComparison.Ordinal);
             var properties = Assert.IsAssignableFrom<LogMessage>(diagnostic.Message).GetProperties();
-            Assert.Equal(["DecisionKind", "Period", "Repetitions"], properties.Keys.Order(StringComparer.Ordinal));
+            Assert.Equal(["DecisionKind", "RefusedCalls", "RepeatedCalls"], properties.Keys.Order(StringComparer.Ordinal));
         }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Child_ends_quietly_with_its_last_text_after_it_ignores_the_escalated_nudge(bool finalResponseHasText)
+    {
+        // Aaron's rule (18 Oct 2026), child form. Rounds 1 and 2 run, round 3 is the first correction,
+        // rounds 4 to 7 are refused repeats 1 to 4, round 8 is repeat 5 (the escalation), and round 9 is
+        // repeat 6. Repeat 6 ends the child with the last text that the child wrote. The parent sees no error.
+        const string EarlierText = "The looper call returns the same value. I try once more.";
+        const string FinalText = "The looper call stays blocked. The repeat check did not finish.";
+        var tool = new ProgressTool();
+        FunctionCallContent Call(int round)
+            => CreateToolCall($"repeat-{round}", "looper", new Dictionary<string, object?> { ["query"] = "repeat" });
+        var responses = new List<IReadOnlyList<AIContent>>();
+        for (var round = 1; round <= 8; round++)
+        {
+            responses.Add(round == 4
+                ? [new TextContent(EarlierText), Call(round)]
+                : [Call(round)]);
+        }
+        responses.Add(finalResponseHasText ? [new TextContent(FinalText), Call(9)] : [Call(9)]);
+        var fakeClient = new ScriptedToolCallChatClient(responses, "This response must not run.");
+
+        var agent = Sys.ActorOf(SubAgentActor.CreateProps(
+            CreateDefinition([tool]),
+            fakeClient,
+            PermissivePolicy()));
+
+        var result = await agent.Ask<SubAgentResult>(
+            new RunSubAgent
+            {
+                Scope = SubAgentTestScope.Create(),
+                Task = "Repeat one call.",
+                Timeout = TimeSpan.FromSeconds(10)
+            },
+            TimeSpan.FromSeconds(10),
+            TestContext.Current.CancellationToken);
+
+        // Repeats 1 to 4 get the plain child nudge. Repeat 5 gets the escalated child nudge.
+        static bool IsChildNudge(ChatMessage message)
+            => message.Role == Microsoft.Extensions.AI.ChatRole.User
+                && message.Text.StartsWith("[system: Netclaw refused your repeated call to `looper` again.",
+                    StringComparison.Ordinal);
+        const string EscalationMarker = "Stop trying this action.";
+        var requests = fakeClient.ReceivedMessagesByCall;
+        for (var request = 4; request <= 7; request++)
+        {
+            Assert.True(IsChildNudge(requests[request][^1]), $"Request {request} must end with the child nudge.");
+            Assert.DoesNotContain(EscalationMarker, requests[request][^1].Text, StringComparison.Ordinal);
+        }
+
+        var escalation = requests[8][^1];
+        Assert.True(IsChildNudge(escalation), $"The last message was: {escalation.Text}");
+        Assert.Contains(EscalationMarker, escalation.Text, StringComparison.Ordinal);
+        Assert.Contains("parent", escalation.Text, StringComparison.Ordinal);
+        Assert.Contains("No call in that response runs.", escalation.Text, StringComparison.Ordinal);
+        Assert.DoesNotContain("_background", escalation.Text, StringComparison.Ordinal);
+        // Only the latest child nudge stays in the child history.
+        for (var request = 4; request <= 8; request++)
+            Assert.Single(requests[request], IsChildNudge);
+
+        // Repeat 6 ends the child with no further model request and no execution.
+        Assert.Equal(9, fakeClient.CallCount);
+        Assert.Equal(["repeat", "repeat"], tool.Queries);
+        // A successful partial run: the parent gets the child text, not an error.
+        Assert.True(result.Success);
+        Assert.Equal(SubAgentRunOutcome.Partial, result.Outcome);
+        Assert.Equal(SubAgentOutcomeReason.ToolCycleStopped, result.OutcomeReason);
+        Assert.Equal(finalResponseHasText ? FinalText : EarlierText, result.Output);
     }
 
     [Fact]
@@ -2572,6 +2496,94 @@ internal sealed class DelayingParentApprovalBridge : IParentConsentBridge
         // hand-rolled WhenAny+Register+TCS dance.
         var answer = await _decisionFactory().WaitAsync(ct);
         return ConsentStep.From(answer, request.CallName, request.Approval);
+    }
+}
+
+internal sealed class ProgressTool : INetclawTool
+{
+    private readonly ConcurrentQueue<string> _queries = new();
+
+    public string Name => "looper";
+    public LlmFacingToolName LlmFacingName => LlmFacingToolName.FromCanonical(Name);
+    public string Description => "Returns a result for one distinct query.";
+    public string GrantCategory => "builtin";
+    public System.Text.Json.JsonElement ParameterSchema => default;
+    public IReadOnlyList<string> Queries => _queries.ToArray();
+
+    public AITool ToAITool() => AIFunctionFactory.Create(
+        (string query) => $"result:{query}",
+        name: Name,
+        description: Description);
+
+    public Task<string> ExecuteAsync(
+        IDictionary<string, object?>? arguments,
+        ToolInvocationContext context,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        var query = arguments?["query"]?.ToString()
+            ?? throw new InvalidOperationException("The query argument is required.");
+        _queries.Enqueue(query);
+        return Task.FromResult($"result:{query}");
+    }
+}
+
+internal sealed class ScriptedToolCallChatClient(
+    IReadOnlyList<IReadOnlyList<AIContent>> toolResponses,
+    string finalResponse) : IChatClient
+{
+    private readonly List<IReadOnlyList<ChatMessage>> _receivedMessages = [];
+    private int _callCount;
+
+    public int CallCount => Volatile.Read(ref _callCount);
+    public IReadOnlyList<IReadOnlyList<ChatMessage>> ReceivedMessagesByCall => _receivedMessages;
+
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var callNumber = Record(messages);
+        return Task.FromResult(Response(callNumber));
+    }
+
+    public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var callNumber = Record(messages);
+        return StreamResponse(Response(callNumber), cancellationToken);
+    }
+
+    public object? GetService(Type serviceType, object? serviceKey = null) => null;
+    public void Dispose() { }
+
+    private int Record(IEnumerable<ChatMessage> messages)
+    {
+        var callNumber = Interlocked.Increment(ref _callCount);
+        _receivedMessages.Add(messages.ToArray());
+        return callNumber;
+    }
+
+    private ChatResponse Response(int callNumber)
+    {
+        IReadOnlyList<AIContent> contents = callNumber <= toolResponses.Count
+            ? toolResponses[callNumber - 1]
+            : [new TextContent(finalResponse)];
+        return new ChatResponse(new ChatMessage(Microsoft.Extensions.AI.ChatRole.Assistant, contents.ToList()));
+    }
+
+    private static async IAsyncEnumerable<ChatResponseUpdate> StreamResponse(
+        ChatResponse response,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        foreach (var update in response.ToChatResponseUpdates())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return update;
+            await Task.Yield();
+        }
     }
 }
 

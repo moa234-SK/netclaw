@@ -13,7 +13,7 @@ using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Sessions.Handlers;
 
-internal enum InputPlacement { Activate, BufferDuringModel, BufferDuringCompaction }
+internal enum InputPlacement { Activate, BufferDuringModel, BufferDuringCompaction, BufferDuringApproval }
 
 internal abstract record AdmissionDecision
 {
@@ -22,12 +22,20 @@ internal abstract record AdmissionDecision
     internal sealed record Reject(string Reason) : AdmissionDecision;
     // The durable source key already exists, so the actor acknowledges without execution.
     internal sealed record Duplicate : AdmissionDecision;
+    // A reminder keeps at most one waiting fire in a session. The newer fire is acknowledged and not stored.
+    internal sealed record Dropped(ReminderFireKey Fire, ReminderFireKey Waiting) : AdmissionDecision;
     internal sealed record Persist(InputAdmitted Event) : AdmissionDecision;
 }
 
+// AdoptsAuthority: the batch starts a turn for its own requester. The flow then holds the authority of the first
+// input in the batch, and the actor must derive trust for it before the next model call.
+// JoinsAutomationTurn: the batch joins a running turn whose requester is automation (a reminder, a background
+// job, a webhook). Every later input of that kind has the same fixed system sender, so it joins the same way.
 internal sealed record BufferedInputBatch(
     IReadOnlyList<SendUserMessage> Messages,
-    bool StartsNewTurn);
+    bool StartsNewTurn,
+    bool AdoptsAuthority,
+    bool JoinsAutomationTurn);
 
 internal readonly record struct SelectedInputFacts(
     IReadOnlyList<InputId> Ids,
@@ -85,16 +93,6 @@ internal sealed class SessionInputFlow
     public SelectedInputFacts SelectedInputs =>
         new(_selectedIds.ToArray(), _source?.ReminderId, _source?.BackgroundJobId);
 
-    public bool IsReminderDuplicate(ReminderId? reminderId, SessionState state)
-    {
-        if (reminderId is not { } id || string.IsNullOrEmpty(id.Value))
-            return false;
-
-        return state.ProcessedReminderIds.Contains(id)
-               || _inFlightDedup.IsReminderInFlight(id)
-               || _buffer.Any(item => item.Message.Source?.ReminderId == id);
-    }
-
     public bool IsBackgroundJobDuplicate(BackgroundJobId? backgroundJobId, SessionState state)
     {
         if (backgroundJobId is not { } id || string.IsNullOrEmpty(id.Value))
@@ -111,8 +109,10 @@ internal sealed class SessionInputFlow
         SessionId sessionId,
         long admittedAtMs)
     {
-        if (command.AdmittedInputId is not null)
-            return new AdmissionDecision.Existing();
+        if (command.AdmittedInputId is { } admittedId)
+            return state.IsLegacyInputQuarantined(admittedId)
+                ? new AdmissionDecision.Reject("The legacy input is quarantined and cannot execute.")
+                : new AdmissionDecision.Existing();
 
         var context = TurnContext.FromMessageSource(
             sessionId,
@@ -122,6 +122,7 @@ internal sealed class SessionInputFlow
         {
             SessionId = sessionId,
             InputId = InputId.New(),
+            SourceBackgroundJobId = command.Source?.BackgroundJobId,
             SourceMessageId = command.Source?.MessageId
                 ?? command.Source?.ReminderId?.Value
                 ?? command.Source?.BackgroundJobId?.Value,
@@ -147,7 +148,43 @@ internal sealed class SessionInputFlow
         if (sourceKey is not null && state.RecentSourceMessageKeys.Contains(sourceKey))
             return new AdmissionDecision.Duplicate();
 
+        if (TryFindWaitingFire(evt, state, out var fire, out var waiting))
+            return new AdmissionDecision.Dropped(fire, waiting);
+
         return new AdmissionDecision.Persist(evt);
+    }
+
+    // Drop rule: a fire waits only while this flow's queue holds it. Recovery rebuilds that queue for approval waits.
+    // A journal row that nothing will run (a crash, a restart with two requesters, an expired restart reminder) is not
+    // waiting, so it must not block a later fire. An input that a turn selected has left the queue. A newer fire of
+    // its reminder gets its own turn. An input whose key is not a fire key has an unknown owner, so it is never
+    // dropped and never blocks.
+    private bool TryFindWaitingFire(
+        InputAdmitted incoming,
+        SessionState state,
+        out ReminderFireKey fire,
+        out ReminderFireKey waiting)
+    {
+        waiting = default;
+        if (!TryReadFireKey(incoming, out fire))
+            return false;
+
+        foreach (var pending in state.PendingInputs)
+        {
+            if (IsBuffered(pending.InputId)
+                && TryReadFireKey(pending, out waiting)
+                && waiting.DefinitionId == fire.DefinitionId)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryReadFireKey(InputAdmitted input, out ReminderFireKey key)
+    {
+        key = default;
+        return input.TurnContext.SourceKind == ReminderExecutionActor.ReminderSourceKind
+               && ReminderFireKey.TryParse(input.SourceMessageId, out key);
     }
 
     public SendUserMessage AdmissionCommitted(
@@ -156,21 +193,89 @@ internal sealed class SessionInputFlow
         InputPlacement placement)
     {
         // The journal callback applies the event before this owner reserves or places the input.
-        _inFlightDedup.ReserveReminder(command.Source?.ReminderId);
+        var authority = RecordedAuthority(admitted);
         _inFlightDedup.ReserveBackgroundJob(command.Source?.BackgroundJobId);
-        var accepted = command with { AdmittedInputId = admitted.InputId };
+        var accepted = command with { AdmittedInputId = admitted.InputId, AdmittedAuthority = authority };
         PlaceAccepted(accepted, placement);
         return accepted;
     }
 
-    // Actor restart can requeue an admitted command. Keep its ID without another journal write.
+    // Actor restart can requeue an admitted command. Keep its ID and recorded authority without another journal write.
     public void AdmissionAlreadyCommitted(SendUserMessage command, InputPlacement placement)
         => PlaceAccepted(command, placement);
 
     private void PlaceAccepted(SendUserMessage command, InputPlacement placement)
     {
-        if (placement != InputPlacement.Activate)
+        // A recovery can rebuild an input that an actor restart also requeues. Keep one copy.
+        if (placement != InputPlacement.Activate && !IsBuffered(command.AdmittedInputId))
             _buffer.Add((command, false));
+    }
+
+    private bool IsBuffered(InputId? id)
+        => id is { } inputId && _buffer.Any(item => item.Message.AdmittedInputId == inputId);
+
+    /// <summary>
+    /// Rebuilds the waiting queue from the journal after recovery. The session acknowledged each pending input, and the
+    /// journal is the only durable copy, so a restart must not drop one. The caller passes only inputs that wait for an
+    /// open approval. Each input keeps its recorded authority. The transport source is rebuilt from the record, so a
+    /// reminder or a background job keeps its id (the record's <c>SourceMessageId</c>).
+    /// </summary>
+    public int RestoreWaitingInputs(IReadOnlyList<InputAdmitted> pending, SessionId sessionId)
+    {
+        var restored = 0;
+        foreach (var admitted in pending)
+        {
+            if (IsBuffered(admitted.InputId))
+                continue;
+
+            var authority = RecordedAuthority(admitted);
+            var source = RecordedSource(admitted, authority);
+            _inFlightDedup.ReserveBackgroundJob(source?.BackgroundJobId);
+            _buffer.Add((new SendUserMessage
+            {
+                SessionId = sessionId,
+                Content = admitted.UserMessage.Content ?? string.Empty,
+                MediaReferences = admitted.UserMessage.MediaReferences,
+                Source = source,
+                AdmittedInputId = admitted.InputId,
+                AdmittedAuthority = authority
+            }, false));
+            restored++;
+        }
+
+        return restored;
+    }
+
+    // The journal keeps the authority and the source message id, not the transport source. A source needs a channel
+    // and a sender; a record without them had no source, so it gets none.
+    private static MessageSource? RecordedSource(InputAdmitted admitted, TurnContext authority)
+    {
+        if (authority.ChannelType is not { } channelType || authority.RequesterSenderId is not { } senderId)
+            return null;
+
+        var sourceKind = authority.Provenance.SourceKind?.Value;
+        return new MessageSource
+        {
+            ChannelType = channelType,
+            SenderId = senderId,
+            MessageId = admitted.SourceMessageId,
+            TurnId = authority.TurnId,
+            Audience = authority.Audience,
+            Boundary = authority.Boundary,
+            Principal = authority.RequesterPrincipal,
+            Provenance = authority.Provenance,
+            DefaultDeliveryTarget = authority.DefaultDeliveryTarget,
+            RequestedDeliveryTarget = authority.RequestedDeliveryTarget,
+            HasThirdPartyAdoptedContext = authority.HasThirdPartyAdoptedContext,
+            AdoptedSpeakerIds = authority.AdoptedSpeakerIds,
+            ExecutableText = admitted.ExecutableText,
+            ReminderId = sourceKind == ReminderExecutionActor.ReminderSourceKind && admitted.SourceMessageId is { } reminderKey
+                ? new ReminderId(reminderKey)
+                : null,
+            BackgroundJobId = sourceKind == BackgroundJobManagerActor.SourceKind && admitted.SourceMessageId is { } jobKey
+                ? new BackgroundJobId(jobKey)
+                : null
+        };
     }
 
     public void ActivateInput(
@@ -182,9 +287,11 @@ internal sealed class SessionInputFlow
             ?? throw new InvalidOperationException("The accepted input has no admission ID.");
         var admitted = pending.FirstOrDefault(input => input.InputId == id)
             ?? throw new InvalidOperationException($"Journal input {id} is missing before turn activation.");
-        if (!TurnContext.TryFromRecord(admitted.TurnContext, out var context, out var reason)
-            || context is null)
-            throw new InvalidOperationException($"Journal input {id} has invalid authority: {reason}");
+        var context = RecordedAuthority(admitted);
+
+        // A recovery can rebuild this input into the queue while an actor restart also requeues it. The input runs
+        // now, so the queued copy must not run again.
+        _buffer.RemoveAll(item => item.Message.AdmittedInputId == id);
 
         // Use recorded identity and authority so live execution matches journal recovery.
         _emittedText = false;
@@ -208,7 +315,6 @@ internal sealed class SessionInputFlow
         _selectedIds.Clear();
         _source = source;
         RestoreTurnAuthority(context, deriver);
-        _inFlightDedup.ReserveReminder(source?.ReminderId);
     }
 
     public string? BeginSlashResume(InputAdmitted first)
@@ -244,7 +350,8 @@ internal sealed class SessionInputFlow
                 SessionId = sessionId,
                 Content = item.UserMessage.Content ?? string.Empty,
                 MediaReferences = item.UserMessage.MediaReferences,
-                AdmittedInputId = item.InputId
+                AdmittedInputId = item.InputId,
+                AdmittedAuthority = RecordedAuthority(item)
             }, false));
         }
 
@@ -253,40 +360,88 @@ internal sealed class SessionInputFlow
 
     public IReadOnlyList<SerializableChatMessage> ResumePendingInputs(IReadOnlyList<InputAdmitted> pending)
     {
+        // The resumed turn consumes every pending input, including any input that recovery rebuilt into the queue.
+        var resumed = pending.Select(static item => item.InputId).ToHashSet();
+        _buffer.RemoveAll(item => item.Message.AdmittedInputId is { } id && resumed.Contains(id));
         _selectedIds.AddRange(pending.Select(static item => item.InputId));
         return pending.Select(static item => item.UserMessage).ToArray();
     }
 
     public void BufferReplay(SendUserMessage command) => _buffer.Insert(0, (command, true));
 
-    private BufferedInputBatch? DrainBufferedBatch()
+    // Security boundary: a turn has one authority, fixed when the turn starts. A drain takes only the leading
+    // buffered inputs of one requester (TurnContext.HasSameRequester). An input from another requester waits for
+    // its own turn, so a model call never serves one requester under the authority of another.
+    //   continuesTurn: a tool batch or a compaction continues the running turn. Only inputs of the requester that
+    //                  owns that turn may join it, and the turn keeps its authority.
+    //   otherwise:     the first buffered input starts a new turn, and the flow adopts its recorded authority.
+    // A replay is the current turn's own message after an overflow, so it always joins the current turn.
+    private BufferedInputBatch? DrainBufferedBatch(bool continuesTurn)
     {
         if (_buffer.Count == 0)
             return null;
 
+        var adoptsAuthority = !continuesTurn && !_buffer[0].IsReplay;
+        var owner = adoptsAuthority ? BufferedAuthority(_buffer[0].Message) : _context;
+        var count = 0;
+        while (count < _buffer.Count && JoinsTurn(_buffer[count], owner))
+            count++;
+        if (count == 0)
+            return null;
+
+        var drained = _buffer.GetRange(0, count);
+        _buffer.RemoveRange(0, count);
+
         // Fresh input resets the turn limits; overflow replay keeps the current limits.
-        var startsNewTurn = _buffer.Any(static item => !item.IsReplay);
+        var startsNewTurn = drained.Any(static item => !item.IsReplay);
         if (startsNewTurn)
             _emittedText = false;
 
-        // The actor sends this whole ordered batch in one call, regardless of source authority.
-        var messages = _buffer.Select(static item => item.Message).ToArray();
+        var messages = drained.Select(static item => item.Message).ToArray();
         foreach (var message in messages)
         {
             if (message.AdmittedInputId is { } id && !_selectedIds.Contains(id))
                 _selectedIds.Add(id);
         }
 
-        _buffer.Clear();
-        return new BufferedInputBatch(messages, startsNewTurn);
+        if (adoptsAuthority)
+            AdoptAuthority(messages[0], BufferedAuthority(messages[0]));
+        var joinsAutomationTurn = !adoptsAuthority
+            && owner is { } running && SessionToolWorkflow.IsAutomation(running.RequesterPrincipal);
+        return new BufferedInputBatch(messages, startsNewTurn, adoptsAuthority, joinsAutomationTurn);
     }
+
+    private static bool JoinsTurn((SendUserMessage Message, bool IsReplay) input, TurnContext? owner)
+        => input.IsReplay || (owner is not null && BufferedAuthority(input.Message).HasSameRequester(owner));
+
+    private void AdoptAuthority(SendUserMessage first, TurnContext authority)
+    {
+        _source = first.Source;
+        _context = authority;
+        // The old trust belongs to another authority. Tool exposure fails closed until DeriveAdoptedTrust runs.
+        _trust = null;
+        _telemetry = new TurnTelemetryFacts(authority.TurnId, first.Source?.MessageId, first.Source?.ChannelType);
+    }
+
+    public void DeriveAdoptedTrust(TrustContextDeriver? deriver)
+        => _trust = _context is { } context ? deriver?.DeriveFromTurnContext(context) : null;
+
+    private static TurnContext BufferedAuthority(SendUserMessage message)
+        => message.AdmittedAuthority
+           ?? throw new InvalidOperationException(
+               $"Buffered input {message.AdmittedInputId?.ToString() ?? "(no admission ID)"} has no recorded authority.");
+
+    private static TurnContext RecordedAuthority(InputAdmitted admitted)
+        => TurnContext.TryFromRecord(admitted.TurnContext, out var context, out var reason) && context is not null
+            ? context
+            : throw new InvalidOperationException($"Journal input {admitted.InputId} has invalid authority: {reason}");
 
     public AfterTurnResult AdvanceAfterTurn(bool restartDrainRequested)
     {
         if (restartDrainRequested)
             return new AfterTurnResult(InputProgressAction.Restart, null);
 
-        var batch = DrainBufferedBatch();
+        var batch = DrainBufferedBatch(continuesTurn: false);
         return batch is null
             ? new AfterTurnResult(InputProgressAction.Ready, null)
             : new AfterTurnResult(InputProgressAction.FollowUp, batch);
@@ -296,8 +451,8 @@ internal sealed class SessionInputFlow
         BatchCompletion.Ready completion,
         bool compactionDue)
     {
-        var batch = DrainBufferedBatch();
-        var next = completion.ChooseNext(batch?.StartsNewTurn == true, compactionDue);
+        var batch = DrainBufferedBatch(continuesTurn: true);
+        var next = completion.ChooseNext(compactionDue);
         return new ToolBatchInputAdvance(batch, next);
     }
 
@@ -314,7 +469,6 @@ internal sealed class SessionInputFlow
 
     private void ReleaseRecordedSources(TurnRecorded evt)
     {
-        _inFlightDedup.CompleteReminder(evt.SourceReminderId);
         _inFlightDedup.CompleteBackgroundJob(evt.SourceBackgroundJobId);
         _selectedIds.Clear();
     }
@@ -323,7 +477,6 @@ internal sealed class SessionInputFlow
 
     public void FailedTurn()
     {
-        _inFlightDedup.CompleteReminder(_source?.ReminderId);
         _inFlightDedup.CompleteBackgroundJob(_source?.BackgroundJobId);
         _context = null;
     }
@@ -369,7 +522,7 @@ internal sealed class SessionInputFlow
 
         var resume = _resumeToolLoopAfterCompaction;
         _resumeToolLoopAfterCompaction = false;
-        var batch = DrainBufferedBatch();
+        var batch = DrainBufferedBatch(continuesTurn: resume);
         // The actor replays this response only after it applies the phase transition.
         var deferred = _deferredApproval;
         _deferredApproval = null;

@@ -6,16 +6,14 @@
 using Akka.Actor;
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
-using Netclaw.Actors.Reminders;
 using static Netclaw.Actors.Sessions.SessionProtocol;
-using static Netclaw.Actors.Reminders.ReminderProtocol;
 
 namespace Netclaw.Channels;
 
 /// <summary>
 /// Shared session-output handling for the channel binding actors. The engine
 /// owns the per-turn delivery bookkeeping: the pending cursor, the
-/// turn-in-flight signal, the reminder delivery observers, the empty-turn
+/// turn-in-flight signal, the empty-turn
 /// fallback decision, and the pending-approval prompt list. Slack, Discord, and
 /// Mattermost supply the transport effects; the algorithm has one
 /// implementation here.
@@ -34,8 +32,6 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
 {
     private static readonly PendingApprovalPromptCleared[] NoClearedPrompts = [];
 
-    private readonly ChannelType _channelType;
-    private readonly string _channelName;
     private readonly IComparer<string> _cursorComparer;
     private readonly List<TRequest> _pendingRequests;
     private readonly Func<ToolInteractionRequest, TRequest> _createPendingRequest;
@@ -50,16 +46,8 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
     private readonly Action<PendingApprovalPromptTracked> _persistPromptTracked;
     private readonly Func<SessionOutput, Task> _handleChannelSpecificOutputAsync;
     private readonly Action<string> _advanceCursor;
-    private readonly Func<Task> _postEmptyTurnFallbackAsync;
+    private readonly Func<TurnCompleted, Task> _postEmptyTurnFallbackAsync;
     private readonly Func<TurnCompleted, Task> _onEmptyTurnSuppressedAsync;
-    private readonly Func<TurnCompleted, long?> _readObservedAtMs;
-
-    // Reply targets for in-flight reminder delivery confirmations, keyed by
-    // reminder delivery key. Captured from DeliverTrustedSessionTurn; each is
-    // told a ReminderDeliveryResult on its turn's TurnCompleted and removed.
-    // Keyed (not a single field) because multiple reminders can target the
-    // same session concurrently — a single field would be clobbered.
-    private readonly Dictionary<ReminderId, IActorRef> _reminderDeliveryObservers = new();
 
     private bool _deliveredThisTurn;
 
@@ -74,8 +62,6 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
     /// list is the actor's own list, which the approval-response flow also
     /// reads, so the engine cannot run with it absent.
     /// </summary>
-    /// <param name="channelType">Telemetry and reminder-result category for the channel.</param>
-    /// <param name="channelName">Channel name for generated text, for example <c>Slack</c>.</param>
     /// <param name="cursorComparer">Orders two cursor keys of this channel.</param>
     /// <param name="pendingRequests">
     /// The actor's own pending-approval list. The engine appends the prompts it
@@ -116,18 +102,17 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
     /// A channel without the capability ignores the output here.
     /// </param>
     /// <param name="advanceCursor">Persists the cursor a completed turn confirmed.</param>
-    /// <param name="postEmptyTurnFallbackAsync">Posts the channel's empty-turn fallback text.</param>
+    /// <param name="postEmptyTurnFallbackAsync">
+    /// Posts the channel's empty-turn fallback text. It receives the completed
+    /// turn, so a failed fallback post can report the turn that it answers.
+    /// </param>
     /// <param name="onEmptyTurnSuppressedAsync">
     /// Runs instead of the fallback when the turn produced output that failed
-    /// to post. Discord and Mattermost already told the session inline, so
-    /// their hook does nothing more; Slack tells the session here.
-    /// </param>
-    /// <param name="readObservedAtMs">
-    /// Reads the observation timestamp for the reminder delivery result.
+    /// to post and no output posted. Every channel tells the session about the
+    /// failure here, with the number of the completed turn. The engine does not
+    /// run it for a turn with a posted output.
     /// </param>
     public ChannelOutputEngine(
-        ChannelType channelType,
-        string channelName,
         IComparer<string> cursorComparer,
         List<TRequest> pendingRequests,
         Func<ToolInteractionRequest, TRequest> createPendingRequest,
@@ -142,12 +127,9 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
         Action<PendingApprovalPromptTracked> persistPromptTracked,
         Func<SessionOutput, Task> handleChannelSpecificOutputAsync,
         Action<string> advanceCursor,
-        Func<Task> postEmptyTurnFallbackAsync,
-        Func<TurnCompleted, Task> onEmptyTurnSuppressedAsync,
-        Func<TurnCompleted, long?> readObservedAtMs)
+        Func<TurnCompleted, Task> postEmptyTurnFallbackAsync,
+        Func<TurnCompleted, Task> onEmptyTurnSuppressedAsync)
     {
-        _channelType = channelType;
-        _channelName = channelName;
         _cursorComparer = cursorComparer;
         _pendingRequests = pendingRequests;
         _createPendingRequest = createPendingRequest;
@@ -164,7 +146,6 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
         _advanceCursor = advanceCursor;
         _postEmptyTurnFallbackAsync = postEmptyTurnFallbackAsync;
         _onEmptyTurnSuppressedAsync = onEmptyTurnSuppressedAsync;
-        _readObservedAtMs = readObservedAtMs;
     }
 
     /// <summary>
@@ -190,12 +171,6 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
     /// </summary>
     public string? PendingCursor { get; private set; }
 
-    /// <summary>
-    /// Turn number of the most recently completed turn. Channels that report a
-    /// delivery failure outside a turn boundary use it as the failure's turn.
-    /// </summary>
-    public TurnNumber LastCompletedTurnNumber { get; private set; }
-
     /// <summary>Records that the journal replayed an approval prompt.</summary>
     public void MarkApprovalRequestObserved() => HasObservedApprovalRequest = true;
 
@@ -216,21 +191,9 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
     }
 
     /// <summary>
-    /// Registers the reply target that waits for a delivery-gated reminder's
-    /// outcome. Keyed by the per-fire reminder delivery id so a second
-    /// concurrent reminder to this session cannot overwrite the first's
-    /// observer before its turn reaches <see cref="TurnCompleted"/>.
-    /// </summary>
-    public void TrackReminderDeliveryObserver(ReminderId reminderKey, IActorRef observer)
-        => _reminderDeliveryObservers[reminderKey] = observer;
-
-    /// <summary>
     /// Clears the per-turn state after a pipeline reinitialize. The
     /// reinitialize abandons any in-flight turn before its
-    /// <see cref="TurnCompleted"/>, so the mention re-arm guard is released and
-    /// every waiting reminder observer is told the delivery did not happen. The
-    /// execution actor then redelivers immediately instead of stalling until
-    /// its backstop timeout.
+    /// <see cref="TurnCompleted"/>, so the mention re-arm guard is released.
     /// <para>
     /// The pending cursor of the abandoned turn goes too. A later turn must not
     /// commit it: the cursor would move past messages that no session ever
@@ -239,13 +202,12 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
     /// next hydration re-includes them.
     /// </para>
     /// </summary>
-    public void ResetForPipelineReinitialize(string reason)
+    public void ResetForPipelineReinitialize()
     {
         _deliveredThisTurn = false;
         _postFailedThisTurn = false;
         TurnInFlight = false;
         PendingCursor = null;
-        FailPendingReminderDeliveries($"{_channelName} pipeline reinitialized: {reason}");
     }
 
     /// <summary>
@@ -322,33 +284,20 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
         PendingCursor = null;
         TurnInFlight = false;
 
-        if (completed.SourceReminderId is { } sourceReminderKey
-            && !string.IsNullOrWhiteSpace(sourceReminderKey.Value)
-            && _reminderDeliveryObservers.Remove(sourceReminderKey, out var reminderObserver))
-        {
-            reminderObserver.Tell(new ReminderDeliveryResult(
-                sourceReminderKey,
-                _channelType,
-                Delivered: _deliveredThisTurn,
-                FailureReason: _deliveredThisTurn ? null : $"{_channelName} post did not succeed",
-                ObservedAtMs: _readObservedAtMs(completed)));
-        }
-
         if (!_deliveredThisTurn)
         {
             // Only post the empty-turn fallback when the turn genuinely
             // produced nothing. A failed post means a reply WAS produced, so
             // "I didn't manage to produce a reply" would mislead and would
-            // double up with the redelivered one. The channel decides what to
-            // do instead, because the channels differ on when they tell the
-            // session about the failure.
+            // double up with the redelivered one. The channel tells the session
+            // about the failure, with this turn's number.
+            // A quiet end is a deliberate end with no reply. The fallback is Netclaw text, and the person must see
+            // only text of the model. The end is a normal turn otherwise, so the typing indicator clears.
             if (_postFailedThisTurn)
                 await _onEmptyTurnSuppressedAsync(completed);
-            else
-                await _postEmptyTurnFallbackAsync();
+            else if (!completed.QuietEnd)
+                await _postEmptyTurnFallbackAsync(completed);
         }
-
-        LastCompletedTurnNumber = completed.TurnNumber;
 
         var clearedPrompts = _pendingRequests
             .Select(pending => new PendingApprovalPromptCleared { CallId = pending.CallId.Value })
@@ -357,21 +306,6 @@ public sealed class ChannelOutputEngine<TRequest, TPromptId>
         _deliveredThisTurn = false;
         _postFailedThisTurn = false;
         return clearedPrompts;
-    }
-
-    /// <summary>
-    /// Tells every in-flight reminder observer that delivery did not happen,
-    /// then clears them.
-    /// </summary>
-    private void FailPendingReminderDeliveries(string reason)
-    {
-        if (_reminderDeliveryObservers.Count == 0)
-            return;
-
-        foreach (var (key, observer) in _reminderDeliveryObservers)
-            observer.Tell(new ReminderDeliveryResult(key, _channelType, Delivered: false, FailureReason: reason));
-
-        _reminderDeliveryObservers.Clear();
     }
 
     private static PendingApprovalPromptTracked BuildTracked(TRequest pending, string promptId)

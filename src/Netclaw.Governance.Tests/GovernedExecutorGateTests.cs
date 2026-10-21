@@ -51,7 +51,8 @@ public class GovernedExecutorGateTests
                 SessionStoragePaths.CreateLegacy(
                     Path.Combine(AppContext.BaseDirectory, "netclaw-governance-test-workspace"),
                     Path.Combine(AppContext.BaseDirectory, "netclaw-governance-test-logs"),
-                    "test-session")),
+                    "test-session",
+                    ManagedTemporaryLayout.InsideSessionStorage.Instance)),
             Audience = TrustAudience.Personal,
             InlineOutputBudget = InlineOutputBudget.Default,
             InteractiveApproval = new InteractiveApprovalCapability.Unavailable(),

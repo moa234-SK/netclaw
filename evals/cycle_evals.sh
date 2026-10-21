@@ -11,7 +11,7 @@ start_cycle_fixture() {
         exit 2
     fi
     case "$FILTER_CASE" in
-        ""|tool_cycle_correction|tool_cycle_terminal|tool_cycle_compaction|tool_cycle_changed_result|tool_cycle_metadata_repair) ;;
+        ""|tool_cycle_correction|tool_cycle_repeat_nudge|tool_cycle_compaction|tool_cycle_changed_result|tool_cycle_metadata_repair) ;;
         *) echo "ERROR: unknown cycle case: $FILTER_CASE" >&2; exit 2 ;;
     esac
     command -v python3 >/dev/null
@@ -44,7 +44,7 @@ setup_cycle_case() {
 }
 
 setup_tool_cycle_correction() { setup_cycle_case correction; }
-setup_tool_cycle_terminal() { setup_cycle_case terminal; }
+setup_tool_cycle_repeat_nudge() { setup_cycle_case repeat_nudge; }
 setup_tool_cycle_compaction() { setup_cycle_case compaction; }
 setup_tool_cycle_changed_result() { setup_cycle_case changed_result; }
 setup_tool_cycle_metadata_repair() { setup_cycle_case metadata_repair; }
@@ -58,6 +58,9 @@ assert_cycle_case() {
     local snapshot report actor_log headless_log
     snapshot="${STDOUT_FILE%.txt}_cycle-snapshot.json"
     report="${STDOUT_FILE%.txt}_cycle-verdict.txt"
+    # The report says "inconclusive" when the check could not run. The harness
+    # keeps it as assert-report.json, so the trial is not scored as a fail.
+    keep_assertion_report "$report"
     if ! curl -fsS --connect-timeout 5 --max-time 10 -H 'Content-Type: application/json' -d '{}' \
         "http://127.0.0.1:$CYCLE_FIXTURE_PORT/control/snapshot" > "$snapshot"; then
         cycle_inconclusive snapshot_unavailable "$report"
@@ -83,7 +86,7 @@ assert_cycle_case() {
 }
 
 assert_tool_cycle_correction() { assert_cycle_case; }
-assert_tool_cycle_terminal() { assert_cycle_case; }
+assert_tool_cycle_repeat_nudge() { assert_cycle_case; }
 assert_tool_cycle_compaction() { assert_cycle_case; }
 assert_tool_cycle_changed_result() { assert_cycle_case; }
 assert_tool_cycle_metadata_repair() { assert_cycle_case; }
@@ -91,7 +94,7 @@ assert_tool_cycle_metadata_repair() { assert_cycle_case; }
 run_cycle_cases() {
     print_category "Tool cycles"
     run_case --json tool_cycle_correction "real model recovers after the runtime cycle correction" '{{CYCLE_PROMPT}}'
-    run_case --json tool_cycle_terminal "real model reports a truthful runtime text-only stop" '{{CYCLE_PROMPT}}'
+    run_case --json tool_cycle_repeat_nudge "runtime refuses a repeated refusal again, nudges, and continues the turn" '{{CYCLE_PROMPT}}'
     run_case --json tool_cycle_compaction "cycle state survives normal compaction before model recovery" '{{CYCLE_PROMPT}}'
     run_case --json tool_cycle_changed_result "changed results permit the third execution" '{{CYCLE_PROMPT}}'
     run_case --json tool_cycle_metadata_repair "valid metadata repair permits execution" '{{CYCLE_PROMPT}}'

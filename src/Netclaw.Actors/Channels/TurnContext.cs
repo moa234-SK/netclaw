@@ -4,6 +4,7 @@
 // </copyright>
 // -----------------------------------------------------------------------
 using Netclaw.Actors.Protocol;
+using Netclaw.Actors.Reminders;
 using Netclaw.Configuration;
 using Netclaw.Tools;
 using static Netclaw.Actors.Sessions.SessionProtocol;
@@ -51,6 +52,54 @@ public sealed record TurnContext
     public bool HasApprovalRequester
         => RequesterPrincipal == PrincipalClassification.VerifiedAutomation
            || RequesterSenderId is not null;
+
+    // Security boundary: this check decides who owns delegated work, such as child status and cancellation.
+    // It compares only the identity of the requester. The turn id, provenance, delivery targets, adopted
+    // context, and approval capability describe one message, and they change from turn to turn for the same
+    // person. An owner check that compares them locks the owner out of its own work in a later turn.
+    internal bool HasSameRequester(TurnContext right)
+        => SessionId == right.SessionId
+           && Audience == right.Audience
+           && Boundary == right.Boundary
+           && ChannelType == right.ChannelType
+           && RequesterSenderId == right.RequesterSenderId
+           && RequesterPrincipal == right.RequesterPrincipal;
+
+    // Security boundary: this check decides who may read the status of a child run and who may cancel it (#2524).
+    // The instance is the requesting turn. The argument is the turn that started the run.
+    // If either turn is a reminder turn, the sender and the principal do not count, because a reminder fire
+    // always has the sender "reminder-system" and the principal VerifiedAutomation. The session, the audience,
+    // the boundary, and the channel type must still match, so a turn never reaches a run of another session.
+    // The session is the unit of trust for a reminder. All other pairs of turns keep the six-fact rule.
+    // HasSameRequester stays strict, because input batching also uses it.
+    internal bool CanControlChildRunOf(TurnContext owner)
+        => IsReminderTurn || owner.IsReminderTurn
+            ? SessionId == owner.SessionId
+              && Audience == owner.Audience
+              && Boundary == owner.Boundary
+              && ChannelType == owner.ChannelType
+            : owner.HasSameRequester(this);
+
+    // Three facts make a reminder turn. A webhook turn also has VerifiedAutomation, and its sender sets the source
+    // kind through the event header or the route name, so the source kind can read "reminder". The webhook path
+    // sets the authenticity Verified in code. The reminder path sets LocalProcess in code, so a webhook sender
+    // cannot copy it. A person turn cannot set the principal.
+    private bool IsReminderTurn
+        => RequesterPrincipal == PrincipalClassification.VerifiedAutomation
+           && Provenance.TransportAuthenticity == TransportAuthenticity.LocalProcess
+           && Provenance.SourceKind?.Value == ReminderExecutionActor.ReminderSourceKind;
+
+    // Turn identity is separate: restart batches can span several turns. Use this check where one authority
+    // must continue unchanged (start idempotency, approval and continuation recovery), not for ownership.
+    internal bool HasSameAuthority(TurnContext right)
+        => HasSameRequester(right)
+           && Provenance == right.Provenance
+           && DefaultDeliveryTarget == right.DefaultDeliveryTarget
+           && RequestedDeliveryTarget == right.RequestedDeliveryTarget
+           && HasAdoptedContext == right.HasAdoptedContext
+           && HasThirdPartyAdoptedContext == right.HasThirdPartyAdoptedContext
+           && AdoptedSpeakerIds.SequenceEqual(right.AdoptedSpeakerIds, StringComparer.Ordinal)
+           && SupportsInteractiveApproval == right.SupportsInteractiveApproval;
 
     public static TurnContext FromMessageSource(SessionId sessionId, TurnId turnId, MessageSource? source)
     {

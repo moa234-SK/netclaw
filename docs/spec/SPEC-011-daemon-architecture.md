@@ -255,8 +255,22 @@ unit's `Environment` property decides: no `NETCLAW_HOME` means the default home.
 A unit whose `NETCLAW_HOME` comes only from an `EnvironmentFile`, sampled at an
 instant when it has no main process, is therefore treated as serving the default
 home. For a home the unit does not serve, `start` and `stop` act on that home's
-own daemon process and never on the unit. A stale PID file that names another
-home's live `netclawd` is still trusted by a direct `stop`, as in 0.27.1.
+own daemon process and never on the unit.
+
+A direct `stop` sends a signal only to a PID that is shown to serve the home of
+the command (capability spec `daemon-lifecycle`, change
+`bind-daemon-stop-to-home`). `stop` posts the shutdown notice with the PID and
+the resolved home path to the local control endpoint of the home. The daemon
+answers 200 with its PID and its resolved home, or 409 for another PID or home.
+A 200 with the right PID and the right home is the proof. A daemon that does not
+answer, or answers 200 with no `home` (an older daemon), is proven on Linux only by
+its own environment: `NETCLAW_HOME`, or `<HOME>/.netclaw` with the `HOME` of that
+environment. A relative `NETCLAW_HOME`, or one with `~`, `$`, or `%`, gives no proof.
+Without proof, `stop` sends no signal, keeps the PID file, prints a two-line
+refusal on stderr, and exits with code 1. `start` and `status` use the same
+environment rule, or the held lock file where the environment cannot be read,
+and report a PID with no proof as "not shown to serve" this home. Runbook:
+`docs/runbooks/daemon-upgrade.md`, section "When a command refuses".
 
 The session journals each accepted input before it acknowledges the source.
 The record retains the text, media, source message ID, and original authority.
@@ -361,8 +375,35 @@ wiring and contents. Producer, rehydrator, and validator share
 `install`/`doctor --fix`, so after installing new tools re-run either and then
 `systemctl --user restart netclaw`.
 
+**Operator lines.** `daemon.env` is also the place for operator settings, for example
+`NETCLAW_HOME=/x/home` or `HTTP_PROXY=...`.
+
+Caution: the file holds plain text. If a line holds a credential, run `chmod 600` on `daemon.env`.
+Netclaw never makes the file more open than it was, but it does not make a new file private.
+
+Install and `doctor --fix` replace the first `PATH` line in place, drop a later `PATH` line, and add
+`PATH=` at the end when none exists. A line is a `PATH` line when its key, the text before the first
+`=`, is `PATH` once trimmed. This matches systemd, so `PATH = /x` and `PATH<TAB>=/x` count.
+`export PATH=/x` does not count, because systemd reads it as another key. Both commands keep every
+other line verbatim and in order. A line ending of `\r\n` stays. A rerun with the same input leaves
+the file byte-identical. A rewrite never opens the file more than it was. Install overwrites the file
+in place, which keeps its mode and any symbolic link. `doctor --fix` writes the file atomically and
+gives the new file the mode of the file that it replaces. A new file gets the default mode of a new
+file.
+
 `netclaw daemon uninstall` stops the service and removes the unit file and the
-`daemon.env` file.
+`daemon.env` file. It removes the operator lines in that file too. To change the unit file and keep
+the operator lines, run `netclaw daemon install` again.
+
+The install scripts honor `NETCLAW_HOME` with the `NetclawPaths` rules (`~`, `$HOME`, `${HOME}`,
+and `%USERPROFILE%` expand, a blank value is unset, a relative path resolves against the working
+directory; `install.ps1` uses the PowerShell location). Both scripts use `<home>/config`. A fresh
+`install.sh` also uses `<home>/bin` and `<home>/env`. An upgrade does not move an install. The
+order of the rules: `INSTALL_DIR` always wins. Else an install that sits in `<home>/bin` is
+upgraded there. Else, if `$HOME/.netclaw/bin` holds `netclaw` or `netclawd`, `install.sh` upgrades
+there, keeps the env script at `$HOME/.netclaw/env`, and prints the directory. Else it is a fresh
+install under `<home>`. `install.ps1` keeps its own install directory. `CONFIG_DIR` and
+`NETCLAW_CONFIG_DIR` no longer have an effect.
 
 ### Service Registration (macOS)
 

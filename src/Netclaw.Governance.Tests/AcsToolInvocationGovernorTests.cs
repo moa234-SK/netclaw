@@ -29,7 +29,8 @@ public class AcsToolInvocationGovernorTests
                     SessionStoragePaths.CreateLegacy(
                         Path.Combine(AppContext.BaseDirectory, "netclaw-governor-test-workspace"),
                         Path.Combine(AppContext.BaseDirectory, "netclaw-governor-test-logs"),
-                        "test-session")),
+                        "test-session",
+                        ManagedTemporaryLayout.InsideSessionStorage.Instance)),
             Audience = audience,
             InlineOutputBudget = InlineOutputBudget.Default,
             ChannelType = channelType,

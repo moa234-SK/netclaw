@@ -55,6 +55,13 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
     private readonly List<PendingApprovalRequest> _pendingApprovalRequests = [];
     private readonly ApprovalResponseFlow<PendingApprovalRequest, MattermostPostId> _approvalFlow;
     private readonly ChannelOutputEngine<PendingApprovalRequest, MattermostPostId> _outputEngine;
+
+    // The first failed post of the turn in flight. The binding reports it once at
+    // TurnCompleted, with the number of the turn that the post belongs to.
+    // Actor-local; it lives for one turn.
+    private (DeliveryFailureKind Kind, string Message)? _heldFailedPost;
+    // True only while a post of turn output runs. Actor-local.
+    private bool _holdOutputFailures;
     private readonly SafeTransportCall _safeCall;
 
     private static readonly TimeSpan PipelineInitTimeout = TimeSpan.FromSeconds(15);
@@ -120,11 +127,9 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
         _safeCall = new SafeTransportCall(
             ChannelType.Mattermost,
             _dependencies.TimeProvider,
-            NotifyDeliveryFailedAsync);
+            HoldFailedPostAsync);
 
         _outputEngine = new ChannelOutputEngine<PendingApprovalRequest, MattermostPostId>(
-            channelType: ChannelType.Mattermost,
-            channelName: "Mattermost",
             // Mattermost post IDs are lexicographically sortable strings.
             cursorComparer: StringComparer.Ordinal,
             pendingRequests: _pendingApprovalRequests,
@@ -132,19 +137,16 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
             isApprovalRequest: request => string.Equals(request.Kind, "approval", StringComparison.OrdinalIgnoreCase),
             renderTextOutput: textOutput => textOutput.Text,
             renderErrorOutput: error => $":warning: {error.Message}",
-            postTextAsync: SafeReplyAsync,
-            uploadFileAsync: SafeUploadFileAsync,
+            postTextAsync: PostOutputTextAsync,
+            uploadFileAsync: UploadOutputFileAsync,
             postApprovalPromptAsync: SafeReplyWithApprovalPromptAsync,
             readPromptIdValue: promptPostId => promptPostId.Value,
             onApprovalPromptFailedAsync: SendApprovalPromptUnavailableAsync,
             persistPromptTracked: tracked => Persist(tracked, ApplyPendingApprovalPromptTracked),
             handleChannelSpecificOutputAsync: HandleChannelSpecificOutputAsync,
             advanceCursor: AdvanceCursor,
-            postEmptyTurnFallbackAsync: () => SafeReplyAsync(EmptyTurnFallbackText),
-            // Mattermost reports a delivery failure inline from SafeReplyAsync,
-            // so the session already knows by the time the turn completes.
-            onEmptyTurnSuppressedAsync: _ => Task.CompletedTask,
-            readObservedAtMs: completed => completed.TimestampMs);
+            postEmptyTurnFallbackAsync: PostEmptyTurnFallbackAsync,
+            onEmptyTurnSuppressedAsync: ReportHeldFailedPostAsync);
 
         if (_dependencies.ThreadHistoryFetcher is { } historyFetcher)
         {
@@ -326,7 +328,8 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
             // pulses here so a lost ProcessingStateOutput(false) cannot leave
             // the thread in the typing state.
             StopTypingPulses();
-            _outputEngine.ResetForPipelineReinitialize(msg.Reason);
+            _heldFailedPost = null;
+            _outputEngine.ResetForPipelineReinitialize();
             await _handle.ReinitializeAsync(
                 msg.Reason,
                 () => Timers.StartSingleTimer(
@@ -604,15 +607,6 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
             AckTarget = ackTarget
         };
 
-        // Only delivery-gated (DeliveryRequired) reminders carry a
-        // DeliveryObserver. Key it by the per-fire reminder delivery id so a
-        // second concurrent reminder to this session can't overwrite the
-        // first's observer before its turn reaches TurnCompleted.
-        if (message.Source.DeliveryObserver is { } deliveryObserver
-            && message.Source.ReminderId is { } reminderKey
-            && !string.IsNullOrWhiteSpace(reminderKey.Value))
-            _outputEngine.TrackReminderDeliveryObserver(reminderKey, deliveryObserver);
-
         try
         {
             using var writeCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -650,6 +644,8 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
         }
 
         var clearedPrompts = await _outputEngine.HandleOutputAsync(msg.Output);
+        if (msg.Output is TurnCompleted)
+            _heldFailedPost = null;
         if (clearedPrompts.Count > 0)
             PersistAll(clearedPrompts, ApplyPendingApprovalPromptCleared);
     }
@@ -819,7 +815,7 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
     /// <summary>
     /// Posts <paramref name="text"/> (chunked) to Mattermost. Returns true only
     /// when every chunk posted successfully; false if any chunk failed (after
-    /// notifying the session of the delivery failure). Callers that gate
+    /// holding the failure for the session). Callers that gate
     /// reminder delivery confirmation on real delivery must honor the result.
     /// </summary>
     private Task<bool> SafeReplyAsync(string text)
@@ -847,7 +843,7 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
         if (!File.Exists(file.FilePath))
         {
             _log.Warning("File not found for upload: {Path}", file.FilePath);
-            await NotifyDeliveryFailedAsync(DeliveryFailureKind.Unknown, $"File not found for upload: {file.FilePath}");
+            await HoldFailedPostAsync(DeliveryFailureKind.Unknown, $"File not found for upload: {file.FilePath}");
             return false;
         }
 
@@ -879,14 +875,74 @@ internal sealed class MattermostSessionBindingActor : ReceivePersistentActor, IW
         return uploaded;
     }
 
-    private async Task NotifyDeliveryFailedAsync(DeliveryFailureKind failureKind, string errorMessage)
+    /// <summary>
+    /// Keeps the first failed post of the turn. The binding learns the turn
+    /// number only when <c>TurnCompleted</c> arrives, so it reports the failure
+    /// then (see <see cref="ReportHeldFailedPostAsync"/>). A report now would
+    /// carry the number of the previous turn, and the session would drop it as
+    /// stale feedback. A failed post that is not turn output is not held.
+    /// </summary>
+    private Task HoldFailedPostAsync(DeliveryFailureKind failureKind, string errorMessage)
+    {
+        if (_holdOutputFailures)
+            _heldFailedPost ??= (failureKind, errorMessage);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Tells the session about the held failure with the number of the
+    /// completed turn. The engine runs this only for a turn with a failed post
+    /// and no posted output.
+    /// </summary>
+    private async Task ReportHeldFailedPostAsync(TurnCompleted completed)
+    {
+        if (_heldFailedPost is not { } held)
+            return;
+
+        _heldFailedPost = null;
+        await SendDeliveryFailedAsync(completed.TurnNumber, held.Kind, held.Message);
+    }
+
+    /// <summary>
+    /// Posts turn output text for the shared engine. Only a failed post of turn
+    /// output is held for the turn report (see <see cref="HoldFailedPostAsync"/>).
+    /// A failed post of any other kind, such as a warning or an approval prompt,
+    /// only logs, so it cannot replace the failure of the next turn.
+    /// </summary>
+    private async Task<bool> PostOutputTextAsync(string text)
+    {
+        _holdOutputFailures = true;
+        try { return await SafeReplyAsync(text); }
+        finally { _holdOutputFailures = false; }
+    }
+
+    /// <summary>Uploads turn output for the shared engine. See <see cref="PostOutputTextAsync"/>.</summary>
+    private async Task<bool> UploadOutputFileAsync(FileOutput file)
+    {
+        _holdOutputFailures = true;
+        try { return await SafeUploadFileAsync(file); }
+        finally { _holdOutputFailures = false; }
+    }
+
+    /// <summary>
+    /// Posts the empty-turn fallback. A failed fallback post is a failed post
+    /// of the turn that the fallback answers, so it reports that turn.
+    /// </summary>
+    private async Task PostEmptyTurnFallbackAsync(TurnCompleted completed)
+    {
+        _heldFailedPost = null;
+        await PostOutputTextAsync(EmptyTurnFallbackText);
+        await ReportHeldFailedPostAsync(completed);
+    }
+
+    private async Task SendDeliveryFailedAsync(TurnNumber turnNumber, DeliveryFailureKind failureKind, string errorMessage)
     {
         try
         {
             await _dependencies.Pipeline.SendFeedbackAsync(new DeliveryFailed
             {
                 SessionId = _sessionId,
-                TurnNumber = _outputEngine.LastCompletedTurnNumber,
+                TurnNumber = turnNumber,
                 ChannelType = ChannelType.Mattermost,
                 FailureKind = failureKind,
                 ErrorMessage = errorMessage

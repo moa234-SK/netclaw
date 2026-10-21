@@ -7,6 +7,9 @@ using Akka.Actor;
 using Netclaw.Actors.Channels;
 using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Reminders;
+using Netclaw.Actors.SubAgents;
+using Netclaw.Configuration;
+using Netclaw.Tools;
 using static Netclaw.Actors.Sessions.SessionProtocol;
 
 namespace Netclaw.Actors.Sessions.Handlers;
@@ -60,6 +63,44 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
     }
 
     private readonly ProcessingWatchdog _watchdog = new();
+    private readonly Dictionary<SubAgentRunId, (IActorRef Actor, ChildRunExecution Execution)> _children = [];
+
+    public ChildRunExecution TrackChild(SubAgentRunId runId, IActorRef child)
+    {
+        var execution = new ChildRunExecution(runId, actor);
+        _children.Add(runId, (child, execution));
+        return execution;
+    }
+
+    public bool HasLiveChildren => _children.Count > 0;
+    public bool OwnsChild(SubAgentRunId runId, IActorRef child)
+        => _children.TryGetValue(runId, out var live) && live.Actor.Equals(child);
+    public SubAgentRunId? FindChild(IActorRef child)
+        => _children.Where(pair => pair.Value.Actor.Equals(child)).Select(pair => (SubAgentRunId?)pair.Key).FirstOrDefault();
+    public void CloseChild(SubAgentRunId runId)
+    {
+        if (_children.TryGetValue(runId, out var live))
+        {
+            live.Execution.Close();
+            _ = ObserveChildStop(runId, live.Execution, dispose: false);
+        }
+    }
+    public void ReleaseChild(SubAgentRunId runId)
+    {
+        if (_children.Remove(runId, out var live))
+            _ = ObserveChildStop(runId, live.Execution, dispose: true);
+    }
+    public void StopChildren()
+    {
+        foreach (var runId in _children.Keys.ToArray())
+            ReleaseChild(runId);
+    }
+    private async Task ObserveChildStop(SubAgentRunId runId, ChildRunExecution execution, bool dispose)
+    {
+        try { await execution.StopAsync(); }
+        catch (Exception error) { actor.Tell(new ChildStopFailed(runId, error)); }
+        finally { if (dispose) execution.Dispose(); }
+    }
     private CancellationTokenSource? _modelCts;
     private Task? _modelTask;
     private long _modelCallId;
@@ -73,14 +114,28 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
     private long _jobReapEpoch;
     private ReapOperation? _reap;
     private PassivationAttempt? _attempt;
+    private bool _idlePassivationAfterWaitingInput;
 
     public bool RestartDrainRequested => _restartDrainReplyTo is not null;
+
+    // The idle handler closed a parked batch while an acknowledged input waited behind it. The input runs first,
+    // because nothing would rebuild it after passivation. The idle decision completes when that work ends.
+    public void DeferIdlePassivationUntilWaitingInputEnds() => _idlePassivationAfterWaitingInput = true;
+
+    public bool ClaimDeferredIdlePassivation(SessionPhase phase)
+    {
+        if (!_idlePassivationAfterWaitingInput || phase != SessionPhase.Ready)
+            return false;
+
+        _idlePassivationAfterWaitingInput = false;
+        return true;
+    }
     public bool NeedsAbruptStopNotification => _attempt?.Milestone != AttemptMilestone.FinalEffectsClaimed;
 
     public RestartAction RequestRestart(
         IActorRef replyTo,
         SessionPhase phase,
-        int selectedInputCount,
+        bool hasActiveTurn,
         bool hasBufferedContinuation,
         bool canParkDurableApprovals)
     {
@@ -91,7 +146,7 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
         if (TryStopDurableApprovalWaits(phase, hasBufferedContinuation, canParkDurableApprovals))
             return RestartAction.StopToolTask;
 
-        if (phase == SessionPhase.Processing && HasLiveModel && selectedInputCount > 0)
+        if (phase == SessionPhase.Processing && HasLiveModel && hasActiveTurn)
         {
             timers.StartSingleTimer(
                 RestartModelGraceTimerKey,
@@ -113,10 +168,10 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
            && canParkDurableApprovals
            && RequestToolStop();
 
-    public long? PlanRestartModelStop(RestartModelGraceExpired message, SessionPhase phase, int selectedInputCount)
+    public long? PlanRestartModelStop(RestartModelGraceExpired message, SessionPhase phase, bool hasActiveTurn)
         => RestartDrainRequested
            && phase == SessionPhase.Processing
-           && selectedInputCount > 0
+           && hasActiveTurn
            && CanDispatchPreparedModel(message.CallId)
             ? message.CallId
             : null;
@@ -275,7 +330,7 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
                 continue;
             }
 
-            if (!HasSameRestartAuthority(first, candidate))
+            if (!first.HasSameAuthority(candidate))
                 return new RestartContextResult(null, "pending inputs have different authority");
         }
 
@@ -317,21 +372,6 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
             ExpiresAt = interruptedAt + RestartReminderLifetime
         }, null);
     }
-
-    private static bool HasSameRestartAuthority(TurnContext left, TurnContext right)
-        => left.SessionId == right.SessionId
-           && left.Audience == right.Audience
-           && left.Boundary == right.Boundary
-           && left.ChannelType == right.ChannelType
-           && left.RequesterSenderId == right.RequesterSenderId
-           && left.RequesterPrincipal == right.RequesterPrincipal
-           && left.Provenance == right.Provenance
-           && left.DefaultDeliveryTarget == right.DefaultDeliveryTarget
-           && left.RequestedDeliveryTarget == right.RequestedDeliveryTarget
-           && left.HasAdoptedContext == right.HasAdoptedContext
-           && left.HasThirdPartyAdoptedContext == right.HasThirdPartyAdoptedContext
-           && left.AdoptedSpeakerIds.SequenceEqual(right.AdoptedSpeakerIds, StringComparer.Ordinal)
-           && left.SupportsInteractiveApproval == right.SupportsInteractiveApproval;
 
     public long CurrentModelCallId => _modelCallId;
     public bool HasLiveModel => _modelCts is not null;
@@ -382,7 +422,7 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
 
     public bool AcceptModelProgress(
         long callId,
-        bool substantive,
+        StreamActivity activity,
         TimeSpan prefillTimeout,
         TimeSpan interDeltaTimeout)
     {
@@ -390,7 +430,7 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
             return false;
 
         _anyContentStreamed = _watchdog.OnStreamProgress(
-            substantive, _anyContentStreamed, prefillTimeout, interDeltaTimeout, timers);
+            activity, _anyContentStreamed, prefillTimeout, interDeltaTimeout, timers);
         return true;
     }
 
@@ -438,6 +478,9 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
         return _toolCts.Token;
     }
 
+    public bool OwnsToolDispatch(CancellationToken token)
+        => _toolCts is not null && _toolCts.Token == token && !token.IsCancellationRequested;
+
     public void AttachTool(Task task)
     {
         if (_toolCts is null || _toolTask is { IsCompleted: false })
@@ -446,8 +489,6 @@ internal sealed class SessionExecutionLifetime(ITimerScheduler timers, IActorRef
         _toolTask = task;
     }
 
-    // A synthetic correction can send the batch message without a tool task.
-    // The message does not prove that an ordinary pipeline task returned.
     public void OnToolBatchMessage()
     {
         StopWatchdog();

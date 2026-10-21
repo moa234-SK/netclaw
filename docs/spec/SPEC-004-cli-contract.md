@@ -210,6 +210,214 @@ Download failures do not create security alerts. This change does not alter the 
   logs or emit stack traces
 - exit code `2` for usage and argument errors
 
+## Headless Single-Prompt Output
+
+`netclaw chat -p <text>` sends one prompt and prints the reply. `--json` prints one JSON envelope on
+stdout instead. A script reads stdout, stderr, the exit code, and the session log.
+
+A run can span more than one turn. `spawn_agent` returns `accepted` in turn 1, and the child result
+arrives in a later parent turn. The run ends on the first completed turn that reports no open child
+run. See [Waiting for child runs](#waiting-for-child-runs).
+
+A failed turn or a failed run exits `1`. A run whose last turn completes exits `0`. The exit code does not carry
+the reason. A tool loop has no fixed ceiling: `Session.MaxToolIterationsPerTurn` is a legacy field. A
+model that keeps changing its tool arguments runs until the operator cancels the run or an outside
+`timeout` stops it. A run that an outside `timeout` kills exits `124`. `timeout` sends SIGTERM, and the CLI handles
+SIGTERM like SIGINT, so stderr usually also has `[turn:failed] category=infra kind=Cancelled`. A reader must
+check the exit code first: `124` means `timeout`, whatever stderr holds.
+
+For a failed turn or a failed run, stderr has exactly one line that starts with `[turn:failed]`. It comes
+after the `[error]` or `[headless:error]` line:
+
+```text
+[turn:failed] category=<model|infra> kind=<Kind>
+```
+
+- `category` is `model` only for `kind=ModelBehavior`. The model broke a rule that the runtime
+  enforces: it returned repeated empty replies and each stream finished with the finish reason `stop`
+  or `length`.
+- A text reply that finished with the finish reason `length` and has no tool call is also
+  `kind=ModelBehavior`: the model used all of its output budget. One model call that streamed only
+  thinking until the thinking cap (three times the no-progress timeout) is also `kind=ModelBehavior`.
+  In both cases the provider worked.
+- A repeated refused tool call is not a failure. The runtime refuses the call again, adds a nudge for
+  the model, and continues the turn. The run gets no `[turn:failed]` line for it.
+- After the fifth refused repeat in a turn, the nudge escalates. A sixth refused repeat ends the turn
+  quietly. The run exits with code 0 and prints no `[error]` or `[turn:failed]` line. The JSON envelope
+  has no `errorCategory` or `errorKind`. Its `response` holds only text that the model wrote, and it can
+  be empty.
+- Repeated empty replies from a stream with no finish reason (the connection closed early) are
+  `kind=StreamFailure`. Repeated empty replies with the finish reason `content_filter`, or any other
+  finish reason, are `kind=ProviderFailure`. Both are `infra`: the model did not get a fair turn.
+- `category` is `infra` for every other kind. A failure with no classification is `infra`. A reader
+  must never score an unknown failure as a model failure.
+- `kind` is the `ErrorCategory` name of the last `ErrorOutput` before the failed turn: `ModelBehavior`,
+  `ProviderFailure`, `StreamFailure`, `Timeout`, `ToolFailure`, `InputCompatibility`, or `Unknown`.
+  A failed turn with no `ErrorOutput` is `Unknown`.
+- The CLI adds two kinds: `ChannelFailure` (the daemon is unreachable, rejects the client, the prompt
+  is over the hub frame limit, or the connection is lost during a wait) and `Cancelled` (SIGINT or SIGTERM). A drained daemon restart during a wait
+  also gives `ChannelFailure`. A run with one of these kinds has no JSON envelope. It has a session log
+  record only for the turns that finished before the stop.
+- An error that the turn survived (a compaction timeout, a context overflow recovery) does not decide
+  the kind. A turn that completes prints no token.
+
+The CLI replaces each line break in the error text with a space before it writes the `[error]` or
+`[headless:error]` line. Error text comes from tools, providers, and models, so a line break in it could
+forge a second `[turn:failed]` line. Only the CLI token writer starts a stderr line with the token.
+
+The session log has one `TURN_FAILED: category=<c> kind=<k>` record before `TURN_COMPLETED`. With
+`--json`, the envelope of a failed turn adds `errorCategory` and `errorKind`. A turn that completes has
+neither key. Stdout never holds the token line.
+
+The session log is not safe against forged lines. A model reply or a tool result can hold a line that
+looks like `TURN_FAILED: ...`. A reader of the session log uses the last `TURN_FAILED` record before the
+final `TURN_COMPLETED`, and only when the exit code is `1`.
+
+Positive example: the model repeats `web_search("same")` after the runtime refused that call, up to the
+sixth refused repeat. The runtime ends the turn quietly and makes no more model requests. The exit code
+is `0`. Stderr has no `[turn:failed]` line. The JSON envelope `response` holds only the text that the
+model wrote, and it can be empty. If the model answers with text after the refusal instead, the turn
+completes with that text.
+
+Negative example: the provider returns HTTP 503. The kind is `ProviderFailure` and the category is
+`infra`. A harness must not score this run as a model failure.
+
+Owner: `HeadlessChannel` maps the category. `LlmSessionActor` assigns `ModelBehavior`.
+
+### Waiting for child runs
+
+Every `TurnCompleted` output carries `OpenChildRunIds`. The session owns this fact (see the
+[glossary](GLOSSARY.md#open-child-run)). The wire field is `openChildRunIds`. A new daemon always writes
+it, as an empty array when no run is open. A `TurnCompleted` without the field comes from an earlier
+daemon that runs `spawn_agent` inside one turn. The CLI reads the missing field as "unknown", maps it to
+an empty list, and ends the run on that turn. This keeps the earlier behavior.
+
+```text
+on TurnCompleted t:                       (schematic: it omits logs and JSON detail)
+    if t.Outcome is Failed         -> print [turn:failed]; end the run; exit 1
+    if t.OpenChildRunIds is empty  -> end the run; exit 0
+    otherwise                      -> print [subagent:waiting]; wait for the next TurnCompleted
+```
+
+- While the run waits, text mode prints one line on stdout after each turn that reports open runs:
+  `[subagent:waiting] <n> open: <runId>[,<runId>...]`. JSON mode prints no such line on stdout.
+- The delivered child result prints as tool output: `[tool:result] child_run_result → <result>`. Stdout
+  therefore holds the child text, as it did when `spawn_agent` waited inside one turn.
+- A background shell job is not a child run. The run does not wait for it.
+- A failed turn ends the run at once, with or without open runs. Stderr holds exactly one
+  `[turn:failed]` line. The CLI ignores every output that arrives after the run ends, so the failed
+  run prints one failure line and a JSON run prints one envelope.
+- The CLI records the open runs of a turn before it prints the waiting line.
+- The session log gets `WAITING_FOR_CHILDREN: count=<n> runs=<ids>` for each turn that reports open runs.
+  It gets `SESSION_ENDED` once, at the end of the run.
+- The run has no timeout of its own. The daemon bounds each child with its child timeouts. The operator
+  (SIGINT) or an outside `timeout` bounds the run.
+
+On each failure or stop path, stderr names the open runs. The paths are a failed turn, SIGINT, SIGTERM
+(including an outside `timeout`), `SessionDeactivated`, and a lost connection (see
+[A lost connection](#a-lost-connection)). The CLI writes one line after the `[turn:failed]` line:
+
+```text
+[headless:open-runs] session=<sessionId> runs=<runId>[,<runId>...]
+```
+
+The CLI takes the runs from the most recent `TurnCompleted`. It writes no line when that list is empty,
+and it writes none before the first `TurnCompleted`. The CLI does not cancel the child runs. The
+operator resumes the session with `netclaw chat --resume <sessionId>`.
+
+| Case | Exit | Stderr |
+|------|------|--------|
+| Last turn completes with no open child run | `0` | none |
+| A turn fails (with or without open runs) | `1` | `[turn:failed] ... kind=<Kind>`, plus the open-runs line |
+| `SessionDeactivated` before the run ends | `1` | `kind=ChannelFailure`, plus the open-runs line |
+| Connection state `Disconnected` after the prompt, before the run ends | `1` | `[headless:error]`, `kind=ChannelFailure`, plus the open-runs line when a run is known |
+| Connection state `TransportClosed` after the prompt, before the run ends | `1` | `[headless:error]`, `kind=ChannelFailure`, plus the open-runs line when a run is known |
+| SIGINT or SIGTERM before the run ends | `1` | `kind=Cancelled`, plus the open-runs line |
+| An outside `timeout` ends the run | `124` | `kind=Cancelled` (usually), plus the open-runs line |
+
+The daemon forwards `SessionDeactivated` to the client as the wire type `session_deactivated`. A drained
+daemon restart during the wait sends it, and the run then ends with exit `1`. The CLI writes a
+`[headless:error]` line that says the session stopped, before the `[turn:failed]` line. A daemon that
+stops without a drain sends nothing. [A lost connection](#a-lost-connection) covers that case.
+
+Positive example: turn 1 starts one child and reports one open run. The child finishes. Turn 2 reports
+none. Stdout holds the status text, `[subagent:done]`, the `child_run_result` line, and the turn 2 text.
+The exit code is `0`.
+
+Negative example: turn 1 fails with a provider error while a child runs. The CLI does not wait. It prints
+one `[turn:failed] category=infra kind=ProviderFailure` line and the open-runs line, and it exits `1`.
+A run that ends on turn 1 with exit `0` and only a status line, while a child runs, is a defect.
+
+Owner: `LlmSessionActor` assigns `OpenChildRunIds`. `HeadlessChannel` decides when the run ends.
+
+Compatibility: the CLI and the daemon must have the same version. A CLI from before this contract ignores
+`openChildRunIds`. Against a new daemon, it exits at turn 1 with exit `0` and loses the child result and the
+follow-up turn. A new CLI against an earlier daemon works as before: the missing field ends the run on that
+turn. An operator upgrades the CLI with the daemon.
+
+#### A lost connection
+
+The hub drops session output while no client is connected, and it does not replay that output after a
+reconnect. A client that reconnects receives only the output that comes after the reconnect. A turn that
+completes during a gap is lost. A client that only waited would wait for a turn that never comes, or it would
+end with exit `0` and incomplete output. After the CLI sent the prompt, it therefore ends the run with exit
+`1` on these connection states:
+
+- `Disconnected`. The client reached it after its reconnect attempts failed.
+- `TransportClosed`, whether or not the run knows an open child run. The client reconnects after this
+  state, but the reconnect cannot restore a lost turn.
+
+A short network drop therefore fails the run, and the operator resumes the session. Before the CLI sent the
+prompt, a connection state does not end the run: no output is in flight, and the request that the run
+thread waits for fails with its own reason when the connection cannot be restored.
+
+The CLI marks the prompt as sent just before it sends the prompt. After such a failure, the daemon may
+still run the prompt. Check the session, for example with `netclaw chat --resume <sessionId>` or the session
+log, before you send the prompt again.
+
+The CLI writes one `[headless:error]` line that names the lost connection, then
+`[turn:failed] category=infra kind=ChannelFailure`, then the open-runs line when the run knows an open run.
+With `--json`, it writes no envelope. The CLI does not cancel the child runs. A `Disconnected` or
+`TransportClosed` state after the run ended changes nothing, and it writes no log record: a run that ended
+with exit `0` stays `0`.
+
+A failed run never exits `0`. The channel sets exit code `1` in the same step that marks the run ended. When
+the run thread fails for its own reason, for example a bind that fails with an unsupported text admission
+version, the `[headless:error]` line names that reason and does not say that the connection was lost.
+
+The true bound of a run is the first of these events: a failed turn; a turn that reports no open child run;
+`SessionDeactivated`; `Disconnected` or `TransportClosed` after the prompt; SIGINT or SIGTERM; an outside
+`timeout`. The CLI has no timer of its own. A script SHOULD run `chat -p` under `timeout`, so that an outside
+limit always bounds the run.
+
+Positive example: the run waits with one open run. The network drops. The CLI exits `1`, and stderr holds
+`[turn:failed] category=infra kind=ChannelFailure` and `[headless:open-runs] session=<id> runs=<run>`.
+The operator runs `netclaw chat --resume <id>`.
+
+Negative example: the run waits, the network drops for 10 seconds, the follow-up turn completes in the gap,
+and the CLI waits with no output until SIGINT. That is a defect.
+
+#### JSON envelope for several turns
+
+With `--json`, stdout holds exactly one envelope. The CLI writes it when the run ends on a completed
+turn or on a failed turn. It writes no envelope for a signal or for `SessionDeactivated`.
+
+- `response` is the text of the last turn.
+- `turnResponses` is an array with one entry for each completed turn, in order. An entry holds
+  `turnNumber`, `text`, `toolCalls`, and `usage`. A run with one turn has one entry.
+- `toolCalls` holds the tool calls of all turns, in order.
+- `usage` is the sum over all turns of `inputTokens`, `outputTokens`, `totalTokens`,
+  `cachedInputTokens`, and `reasoningTokens`. `promptMs` and `predictedPerSecond` are rates, so they do
+  not add up. They come from the last turn that has a usage record. If that record has no rate, the
+  rate is `null`. A turn with no usage record does not count.
+- A failed turn is the last entry. The envelope adds `errorCategory` and `errorKind`.
+
+Positive example: turn 1 reports 10 input tokens and turn 2 reports 7. The envelope has
+`usage.inputTokens` `17`, two `turnResponses`, and `response` equal to the turn 2 text.
+
+Negative example: a run with no child. The envelope has one `turnResponses` entry, and `response`,
+`toolCalls`, and `usage` match the single-turn envelope that the CLI wrote before this contract.
+
 ## Safety Rules
 
 - read-only default for all inspection commands

@@ -186,10 +186,10 @@ public sealed record ReminderDefinition
     /// <summary>
     /// When true, a missed delivery fails the execution and emits
     /// <see cref="OperationalAlert.ReminderExecutionFailed"/>. For
-    /// <see cref="DeliveryKind.CurrentSession"/>, this gates envelope ack
-    /// on the <see cref="ReminderDeliveryResult"/> signal. For
     /// <see cref="DeliveryKind.Channel"/>, this gates success on the
-    /// notification tool being called. Ignored for <see cref="DeliveryKind.None"/>.
+    /// notification tool being called. It has no effect for
+    /// <see cref="DeliveryKind.CurrentSession"/>, where the run ends when the
+    /// session admits the fire, and none for <see cref="DeliveryKind.None"/>.
     /// </summary>
     public bool DeliveryRequired { get; init; } = true;
 
@@ -209,7 +209,8 @@ public sealed record ReminderDefinition
     public int ConsecutiveFailures { get; set; }
 
     /// <summary>
-    /// Terminal result for a retained one-shot reminder.
+    /// Terminal result of a reminder that stopped. A recurring reminder keeps it (disabled, <c>Failed</c>)
+    /// until an explicit delete. A one-shot holds it only until the next sweep ends it into a tombstone.
     /// Null means that the reminder can still run.
     /// </summary>
     [JsonConverter(typeof(JsonStringEnumConverter))]
@@ -272,10 +273,73 @@ public sealed record ReminderDefinition
     }
 }
 
+/// <summary>
+/// How a reminder or a one-shot ended. A definition holds <see cref="Completed"/> or <see cref="Failed"/>.
+/// <see cref="Cancelled"/> and <see cref="Expired"/> are the ends without a run, and only a
+/// <see cref="ReminderTombstone"/> holds them.
+/// </summary>
 public enum ReminderTerminalOutcome
 {
     Completed,
-    Failed
+    Failed,
+    Cancelled,
+    Expired
+}
+
+/// <summary>
+/// The durable record of an ended one-shot reminder, kept in <c>{RemindersDirectory}/ended/{id}.json</c>
+/// for <see cref="ReminderManagerActor.TerminalRetention"/>. See the engineering glossary, "reminder tombstone".
+/// The tombstone never holds the delivery target. It holds the prompt only for <see cref="ReminderTerminalOutcome.Failed"/>.
+/// </summary>
+public sealed record ReminderTombstone
+{
+    [JsonConverter(typeof(ReminderIdJsonConverter))]
+    public required ReminderId Id { get; init; }
+
+    public required string Title { get; init; }
+
+    /// <summary>The audience gate for history, status, cancel, and re-arm of the ended id.</summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public required TrustAudience Audience { get; init; }
+
+    /// <summary>The due time of the ended occurrence. It matches the tombstone to a definition.</summary>
+    public required long FireAtMs { get; init; }
+
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public required ReminderTerminalOutcome Outcome { get; init; }
+
+    /// <summary>The end time. Retention counts from this time.</summary>
+    public required long EndedAtMs { get; init; }
+
+    public string? LastError { get; init; }
+
+    /// <summary>The reminder prompt. Set only when <see cref="Outcome"/> is <see cref="ReminderTerminalOutcome.Failed"/>.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Instructions { get; init; }
+
+    [JsonIgnore]
+    public DateTimeOffset EndedAt => DateTimeOffset.FromUnixTimeMilliseconds(EndedAtMs);
+}
+
+/// <summary>What a reply says about an ended one-shot (design D7). <see cref="Instructions"/> is set only in a status reply.</summary>
+public sealed record ReminderEndedInfo(
+    ReminderTerminalOutcome Outcome,
+    DateTimeOffset EndedAt,
+    DateTimeOffset PurgeAt,
+    string? LastError,
+    string? Instructions) : INoSerializationVerificationNeeded
+{
+    /// <summary>
+    /// The text of the "not found" reply for an ended one-shot. The REST route, the CLI, and the
+    /// enable and disable replies use it, so the words are the same on every surface.
+    /// </summary>
+    public string DescribeEnd(ReminderId id) =>
+        $"Reminder '{id.Value}' ended ({Outcome.ToString().ToLowerInvariant()}) at {EndedAt:u} and its definition was deleted. "
+        + $"Its history stays readable until {PurgeAt:u}: netclaw reminder history {id.Value}";
+
+    /// <summary>The reply text of a cancel of an ended one-shot.</summary>
+    public string DescribeAlreadyEnded(ReminderId id) =>
+        $"Reminder '{id.Value}' already ended ({Outcome.ToString().ToLowerInvariant()} at {EndedAt:u}). Nothing changed.";
 }
 
 /// <summary>
@@ -349,8 +413,9 @@ public static partial class ReminderProtocol
         string? SourceDescription = null) : INoSerializationVerificationNeeded;
 
     /// <summary>
-    /// Disables a reminder and cancels any active schedule. The definition file
-    /// is preserved on disk so history and configuration remain available for diagnosis.
+    /// Cancels a reminder. A one-shot ends with the outcome <see cref="ReminderTerminalOutcome.Cancelled"/>:
+    /// the manager writes a tombstone and deletes the schedule and the definition. A recurring reminder is
+    /// disabled, and its definition and history stay.
     /// The caller may act on the reminder only when its audience is at or below
     /// <see cref="Authorization"/>'s source audience; otherwise the manager replies
     /// as if the id does not exist — see <see cref="ReminderManagerActor.CanAccessAudience"/>.
@@ -360,7 +425,7 @@ public static partial class ReminderProtocol
         ReminderAudienceAuthorizationContext Authorization) : IReminderCommand, INoSerializationVerificationNeeded;
 
     /// <summary>
-    /// Permanently deletes a reminder definition, its schedule, and history from disk.
+    /// Permanently deletes a reminder definition, its schedule, its history, and its tombstone from disk.
     /// Not exposed as an LLM tool — use via CLI (<c>netclaw reminder delete</c>) or HTTP API.
     /// Operator-only surface; no audience gate.
     /// </summary>
@@ -412,7 +477,17 @@ public static partial class ReminderProtocol
         ReminderSaveError Error = ReminderSaveError.None,
         string? ErrorMessage = null) : IReminderResponse, INoSerializationVerificationNeeded;
 
-    public sealed record ReminderCancelledResponse(ReminderId Id, bool Found) : IReminderResponse, INoSerializationVerificationNeeded;
+    /// <param name="Id">The reminder id.</param>
+    /// <param name="Found">False for an unknown id and for an id outside the caller's audience.</param>
+    /// <param name="AlreadyEnded">Set when the id is an ended one-shot in the caller's audience. Nothing changed.</param>
+    /// <param name="ErrorMessage">Set when the cancel could not finish. The reminder is unchanged.</param>
+    /// <param name="Deleted">True when this cancel ended a one-shot. False when it disabled a recurring reminder.</param>
+    public sealed record ReminderCancelledResponse(
+        ReminderId Id,
+        bool Found,
+        ReminderEndedInfo? AlreadyEnded = null,
+        string? ErrorMessage = null,
+        bool Deleted = false) : IReminderResponse, INoSerializationVerificationNeeded;
     public sealed record ReminderDeletedResponse(ReminderId Id, bool Found) : IReminderResponse, INoSerializationVerificationNeeded;
 
     public sealed record ReminderStateResponse(
@@ -423,47 +498,9 @@ public static partial class ReminderProtocol
         string? ErrorMessage = null) : IReminderResponse, INoSerializationVerificationNeeded;
 
     public sealed record ReminderListResponse(IReadOnlyList<ReminderInfo> Reminders) : IReminderResponse, INoSerializationVerificationNeeded;
-    public sealed record GetReminderResponse(ReminderInfo? Reminder) : IReminderResponse, INoSerializationVerificationNeeded;
+    public sealed record GetReminderResponse(ReminderInfo? Reminder, ReminderEndedInfo? Ended = null) : IReminderResponse, INoSerializationVerificationNeeded;
 
     // ===== Delivery / Health =====
-
-    /// <summary>
-    /// Point-to-point delivery outcome sent by a channel binding actor directly
-    /// back to the dispatching <see cref="ReminderExecutionActor"/> (carried as
-    /// <see cref="Channels.MessageSource.DeliveryObserver"/> on the originating
-    /// <c>DeliverTrustedSessionTurn</c>) when a reminder-sourced turn completes.
-    /// Used for <see cref="DeliveryKind.CurrentSession"/> with
-    /// <see cref="ReminderDefinition.DeliveryRequired"/> = true to gate envelope
-    /// ack on whether the assistant reply actually reached the channel.
-    /// <para>
-    /// Unlike the prior EventStream-broadcast observation, this signal reports
-    /// <see cref="Delivered"/> = false on a failed post, so the execution actor
-    /// can report failure immediately (triggering Akka.Reminders redelivery)
-    /// instead of waiting out the backstop timeout.
-    /// </para>
-    /// </summary>
-    /// <param name="ReminderDeliveryKey">
-    /// Composite key in format "{reminderId}:{fireTimestampMs}".
-    /// </param>
-    /// <param name="ChannelType">
-    /// The channel that attempted the delivery.
-    /// </param>
-    /// <param name="Delivered">
-    /// True when the assistant reply was posted to the channel; false when the
-    /// turn completed without a successful post.
-    /// </param>
-    /// <param name="FailureReason">
-    /// Optional human-readable reason when <see cref="Delivered"/> is false.
-    /// </param>
-    /// <param name="ObservedAtMs">
-    /// Optional timestamp when the outbound delivery outcome was observed.
-    /// </param>
-    public sealed record ReminderDeliveryResult(
-        ReminderId ReminderDeliveryKey,
-        Channels.ChannelType ChannelType,
-        bool Delivered,
-        string? FailureReason = null,
-        long? ObservedAtMs = null) : IReminderResponse, INoSerializationVerificationNeeded;
 
     // ===== Health query =====
 
@@ -510,7 +547,8 @@ public static partial class ReminderProtocol
         int SkippedDuplicates,
         ReminderTerminalOutcome? TerminalOutcome,
         ReminderOccurrenceInfo? Occurrence,
-        IReadOnlyList<HistoryRecord> RecentHistory) : IReminderResponse, INoSerializationVerificationNeeded;
+        IReadOnlyList<HistoryRecord> RecentHistory,
+        ReminderEndedInfo? Ended = null) : IReminderResponse, INoSerializationVerificationNeeded;
 
     /// <summary>
     /// Response to <see cref="GetReminderHistoryQuery"/>. <see cref="Found"/> is

@@ -81,7 +81,9 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
                 new GitWorkingContextInspector(TimeProvider.System),
                 NullLogger<WorkingContextSnapshotProvider>.Instance,
                 environment),
-            NullLogger<SubAgentSpawner>.Instance, NoOpToolInvocationGovernor.Instance);
+            NullLogger<SubAgentSpawner>.Instance,
+            new SessionConfig(),
+            NoOpToolInvocationGovernor.Instance);
 
         var childProbe = CreateTestProbe("subagent-child");
         var context = TestToolExecutionContext.CreateBound("console/subagent-parent", _parentSessionDir.Path, new TestToolExecutionContextOptions
@@ -216,7 +218,9 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
             new WorkingContextSnapshotProvider(
                 new GitWorkingContextInspector(TimeProvider.System),
                 NullLogger<WorkingContextSnapshotProvider>.Instance),
-            NullLogger<SubAgentSpawner>.Instance, NoOpToolInvocationGovernor.Instance);
+            NullLogger<SubAgentSpawner>.Instance,
+            new SessionConfig(),
+            NoOpToolInvocationGovernor.Instance);
 
         var notifications = new List<SubAgentNotificationInfo>();
         var childProbe = CreateTestProbe("subagent-tool-metadata-child");
@@ -562,8 +566,10 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
                 new GitWorkingContextInspector(TimeProvider.System),
                 NullLogger<WorkingContextSnapshotProvider>.Instance),
             NullLogger<SubAgentSpawner>.Instance,
+            new SessionConfig(),
             NoOpToolInvocationGovernor.Instance,
-            sessionMetrics: metrics);
+            sessionMetrics: metrics
+            );
 
         var context = TestToolExecutionContext.CreateBound("console/subagent-parent", _parentSessionDir.Path, new TestToolExecutionContextOptions
         {
@@ -605,8 +611,8 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
         paths.EnsureDirectoriesExist();
         var parentRoot = Path.Combine(paths.SessionsDirectory, "parent");
         var storage = legacy
-            ? SessionStoragePaths.CreateLegacy(parentRoot, paths.SessionLogsDirectory, "parent")
-            : SessionStoragePaths.CreateVersion2(new SessionStorageEnvelopeRoot(parentRoot));
+            ? SessionStoragePaths.CreateLegacy(parentRoot, paths.SessionLogsDirectory, "parent", ManagedTemporaryLayout.InsideSessionStorage.Instance)
+            : SessionStoragePaths.CreateVersion2(new SessionStorageEnvelopeRoot(parentRoot), ManagedTemporaryLayout.InsideSessionStorage.Instance);
         Directory.CreateDirectory(storage.SessionDirectory.Value);
         Directory.CreateDirectory(Path.GetDirectoryName(storage.LogPath.Value)!);
         await File.WriteAllTextAsync(storage.LogPath.Value, "parent-marker", TestContext.Current.CancellationToken);
@@ -627,7 +633,9 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
             approvalService: null,
             new StaticSystemPromptProvider("Read the supplied file."),
             new WorkingContextSnapshotProvider(new GitWorkingContextInspector(TimeProvider.System), NullLogger<WorkingContextSnapshotProvider>.Instance),
-            NullLogger<SubAgentSpawner>.Instance, NoOpToolInvocationGovernor.Instance);
+            NullLogger<SubAgentSpawner>.Instance,
+            new SessionConfig(),
+            NoOpToolInvocationGovernor.Instance);
         var probe = CreateTestProbe("authority-child");
         var parent = TestToolExecutionContext.CreateBoundWithStorage("slack/parent", storage, new TestToolExecutionContextOptions
         {
@@ -661,7 +669,7 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
         probe.Reply(new SubAgentResult
         {
             Completion = partial
-                ? new ChildRunCompletion.Partial(SubAgentOutcomeReason.ToolIterationBudgetExhausted, WorkingContextDelta.Empty)
+                ? new ChildRunCompletion.Partial(SubAgentOutcomeReason.ToolCycleStopped, WorkingContextDelta.Empty)
                 : new ChildRunCompletion.Completed(WorkingContextDelta.Empty),
             Output = "child-summary", AgentName = new AgentName("reader")
         });
@@ -674,12 +682,104 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
         Assert.Contains("child-artifact", resultText);
     }
 
+    [Fact]
+    public async Task Spawn_async_gives_child_the_session_wide_no_progress_and_prefill_budgets()
+    {
+        var run = await SpawnAndCaptureRunAsync(CreateProfile(), "session-budgets-child");
+
+        Assert.Equal(new SessionConfig().NoProgressTimeout, run.NoProgressTimeout);
+        Assert.Equal(new SessionConfig().PrefillTimeout, run.PrefillTimeout);
+    }
+
+    [Fact]
+    public async Task Spawn_async_gives_child_the_session_wide_inter_delta_budget_without_timeoutSeconds()
+    {
+        var run = await SpawnAndCaptureRunAsync(CreateProfile(), "session-inter-delta-child");
+
+        Assert.Equal(new SessionConfig().FirstTokenTimeout, run.Timeout);
+    }
+
+    [Fact]
+    public async Task Spawn_async_ignores_obsolete_timeoutSeconds_for_child_inter_delta_budget()
+    {
+        var profile = FileSubAgentDefinitionLoader.TryParseDefinition("agents/obsolete-timeout.md", """
+            ---
+            name: inspector
+            description: Inspect the system
+            tools: [inspect_context]
+            timeoutSeconds: 900
+            ---
+
+            You are an inspector.
+            """, NullLogger<FileSubAgentDefinitionLoader>.Instance);
+        Assert.NotNull(profile);
+
+        var run = await SpawnAndCaptureRunAsync(profile, "obsolete-timeout-child");
+
+        Assert.Equal(new SessionConfig().FirstTokenTimeout, run.Timeout);
+    }
+
+    [Fact]
+    public async Task Spawn_async_uses_non_default_session_inter_delta_budget_and_ignores_timeoutSeconds()
+    {
+        var profile = FileSubAgentDefinitionLoader.TryParseDefinition("agents/session-budget.md", """
+            ---
+            name: inspector
+            description: Inspect the system
+            tools: [inspect_context]
+            timeoutSeconds: 900
+            ---
+
+            You are an inspector.
+            """, NullLogger<FileSubAgentDefinitionLoader>.Instance);
+        Assert.NotNull(profile);
+        var sessionConfig = new SessionConfig { FirstTokenTimeout = TimeSpan.FromSeconds(37) };
+
+        var run = await SpawnAndCaptureRunAsync(
+            CreateSpawner(new WorkingContextSnapshotProvider(
+                new GitWorkingContextInspector(TimeProvider.System),
+                NullLogger<WorkingContextSnapshotProvider>.Instance), sessionConfig),
+            profile,
+            "session-budget-child");
+
+        Assert.Equal(TimeSpan.FromSeconds(37), run.Timeout);
+    }
+
+    private async Task<RunSubAgent> SpawnAndCaptureRunAsync(SubAgentProfile profile, string childName)
+        => await SpawnAndCaptureRunAsync(CreateSpawner(), profile, childName);
+
+    private async Task<RunSubAgent> SpawnAndCaptureRunAsync(SubAgentSpawner spawner, SubAgentProfile profile, string childName)
+    {
+        var childProbe = CreateTestProbe(childName);
+        var context = TestToolExecutionContext.CreateBound("console/subagent-parent", _parentSessionDir.Path, new TestToolExecutionContextOptions
+        {
+            Audience = TrustAudience.Personal,
+            ProjectDirectory = _testProjectDir.Path,
+            SpawnChildActor = (_, _, _) => Task.FromResult<object>(childProbe.Ref),
+        });
+
+        var spawnTask = spawner.SpawnAsync(
+            profile,
+            "Inspect the system.",
+            runtimeContext: null,
+            context.Invocation,
+            TestContext.Current.CancellationToken);
+
+        var run = await childProbe.ExpectMsgAsync<RunSubAgent>(cancellationToken: TestContext.Current.CancellationToken);
+        childProbe.Reply(SuccessfulResult());
+        Assert.True((await spawnTask).Success);
+        return run;
+    }
+
     private static SubAgentSpawner CreateSpawner()
         => CreateSpawner(new WorkingContextSnapshotProvider(
             new GitWorkingContextInspector(TimeProvider.System),
             NullLogger<WorkingContextSnapshotProvider>.Instance));
 
     private static SubAgentSpawner CreateSpawner(IWorkingContextSnapshotProvider workingContextSnapshots)
+        => CreateSpawner(workingContextSnapshots, new SessionConfig());
+
+    private static SubAgentSpawner CreateSpawner(IWorkingContextSnapshotProvider workingContextSnapshots, SessionConfig sessionConfig)
     {
         var toolRegistry = new ToolRegistry();
         toolRegistry.Register(new FakeNetclawTool("inspect_context", "ok"));
@@ -699,7 +799,9 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
             approvalService: null,
             new StaticSystemPromptProvider("You are an inspector."),
             workingContextSnapshots,
-            NullLogger<SubAgentSpawner>.Instance, NoOpToolInvocationGovernor.Instance);
+            NullLogger<SubAgentSpawner>.Instance,
+            new SessionConfig(),
+            NoOpToolInvocationGovernor.Instance);
     }
 
     private static GitWorkingContextSnapshot GitSnapshot(string worktree, params string[] changedFiles) => new()

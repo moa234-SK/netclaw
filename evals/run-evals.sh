@@ -38,10 +38,22 @@
 #
 #   Eval suite knobs:
 #     NETCLAW_EVAL_RUNS          Runs per case (default: 5)
-#     NETCLAW_EVAL_THRESHOLD     Pass threshold 0.0-1.0 (default: 0.80)
+#     NETCLAW_EVAL_THRESHOLD     Pass threshold, above 0 and at most 1 (default: 0.80)
 #     NETCLAW_EVAL_TIMEOUT       Per-prompt timeout in seconds (default: 60)
 #     NETCLAW_EVAL_CATEGORY      Run only this category (case-insensitive substring match)
 #     NETCLAW_EVAL_CASE          Run only this specific case name
+#     NETCLAW_EVAL_SEED          Integer seed for prompt variant choice (default: random,
+#                                printed and recorded in each trial's variant.json)
+#
+# A trial is a pass, a fail, or inconclusive (a cut turn, a failed turn, an
+# infrastructure fault, or a broken check). A case uses the same three states.
+# The score counts conclusive trials only.
+#
+# Exit codes:
+#   0  every case passed
+#   1  at least one case failed
+#   2  the harness stopped (bad setting, eval container died, broken evidence step)
+#   3  no case failed, and at least one case is inconclusive
 set -euo pipefail
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -53,11 +65,39 @@ EVAL_ASSET_ROOT="${NETCLAW_EVAL_ASSET_ROOT:-$REPO_ROOT}"
 RUNS="${NETCLAW_EVAL_RUNS:-5}"
 THRESHOLD="${NETCLAW_EVAL_THRESHOLD:-0.80}"
 PROMPT_TIMEOUT="${NETCLAW_EVAL_TIMEOUT:-60}"
+MAX_PROMPT_TIMEOUT="$PROMPT_TIMEOUT"
 EVAL_PORT="${NETCLAW_EVAL_PORT:-5299}"
 EVAL_CONTAINER_NAME="netclaw-eval-$$"
+# True after seed_eval_memories seeded the store. reset_memory_store acts only then.
+# A failed seed stops the run, so a run never goes on with the reset off.
+EVAL_MEMORY_SEEDED=false
+# How the memory reset before the current trial ended: "ok", or a reason code
+# that snapshot_trial_baseline writes into memory-before.json.
+TRIAL_MEMORY_RESET_STATUS=ok
 NO_BUILD="${NETCLAW_EVAL_NO_BUILD:-0}"
 FILTER_CATEGORY="${NETCLAW_EVAL_CATEGORY:-}"
 FILTER_CASE="${NETCLAW_EVAL_CASE:-}"
+
+# One seed for the whole run. Each (case, trial) derives its own seed from it,
+# so a run filtered with NETCLAW_EVAL_CASE picks the same variants as a full run.
+EVAL_SEED="${NETCLAW_EVAL_SEED:-$((RANDOM * 32768 + RANDOM))}"
+if [[ ! "$EVAL_SEED" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: NETCLAW_EVAL_SEED must be a non-negative integer, got: $EVAL_SEED" >&2
+    exit 2
+fi
+# Whole seconds. `timeout` also accepts 5m, but the trial record stores the
+# value as a JSON number, so a unit suffix would fail in the first trial.
+if [[ ! "$PROMPT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NETCLAW_EVAL_TIMEOUT must be a whole number of seconds, 1 or more, got: $PROMPT_TIMEOUT" >&2
+    exit 2
+fi
+
+# A number above 0 and at most 1. The case status rule compares it as an exact
+# decimal. A threshold of 0 would pass a case that has only inconclusive trials.
+if [[ ! "$THRESHOLD" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ || "$THRESHOLD" =~ ^0(\.0+)?$ ]]; then
+    echo "ERROR: NETCLAW_EVAL_THRESHOLD must be a number above 0 and at most 1, got: $THRESHOLD" >&2
+    exit 2
+fi
 
 # Image and CLI binary default to the locally-built artifacts. Evals should
 # always test the current source tree, not a stale published image.
@@ -80,8 +120,10 @@ EVAL_DISABLE_THINKING="${NETCLAW_EVAL_DISABLE_THINKING:-false}"
 TOTAL_CASES=0
 PASSED_CASES=0
 FAILED_CASES=0
+INCONCLUSIVE_CASES=0
 CATEGORY_CASES=0
 CATEGORY_PASSED=0
+CATEGORY_FAILED=0
 CURRENT_CATEGORY=""
 RUN_ID=""
 NETCLAW_VER=""
@@ -102,6 +144,22 @@ STDOUT_FILE=""
 STDERR_FILE=""
 LAST_TURN_STDOUT_FILE=""
 DAEMON_LOG_LINES_BEFORE=0
+
+# Per-trial state (set by begin_trial, read by the evidence helpers)
+TRIAL_RAW=""
+TRIAL_KNOWN_LOGS_FILE=""
+TRIAL_DAEMON_LOG=""
+TRIAL_DAEMON_LINES_BEFORE=0
+PICKED_VARIANT=""
+PICKED_VARIANT_INDEX=0
+PICKED_TRIAL_SEED=0
+# Path of the JSON report of the assertion that runs now (see keep_assertion_report).
+EVAL_ASSERTION_REPORT=""
+# Tally of the trials of the case that runs now (see record_trial).
+CASE_PASSES=0
+CASE_FAILS=0
+CASE_INCONCLUSIVE=0
+CASE_INCONCLUSIVE_REASONS=()
 
 # ─── Prerequisites ────────────────────────────────────────────────────────────
 
@@ -126,6 +184,13 @@ check_prerequisites() {
 
     if ! command -v jq >/dev/null 2>&1; then
         echo "ERROR: 'jq' not found. Install jq to run the eval suite." >&2
+        exit 1
+    fi
+
+    # Each trial runs evals/trial_evidence.py. It needs Path.is_relative_to.
+    if ! command -v python3 >/dev/null 2>&1 \
+        || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
+        echo "ERROR: 'python3' 3.9 or later not found. The eval suite needs it for trial evidence." >&2
         exit 1
     fi
 
@@ -217,6 +282,10 @@ cleanup_eval_env() {
         kill "$CYCLE_FIXTURE_PID_SAVED" 2>/dev/null || true
         wait "$CYCLE_FIXTURE_PID_SAVED" 2>/dev/null || true
     fi
+    if [[ -n "${SPILL_FIXTURE_PID_SAVED:-}" ]]; then
+        kill "$SPILL_FIXTURE_PID_SAVED" 2>/dev/null || true
+        wait "$SPILL_FIXTURE_PID_SAVED" 2>/dev/null || true
+    fi
     # TMPDIR_EVAL only holds host-owned per-prompt stdout/stderr captures, so a
     # plain rm always succeeds — no force_rmrf fallback needed.
     if [[ -n "${TMPDIR_EVAL:-}" && -d "$TMPDIR_EVAL" ]]; then
@@ -277,6 +346,7 @@ archive_eval_run() {
         mkdir -p "$archive_dir/stdout"
         cp "$TMPDIR_EVAL"/stdout_*.txt "$archive_dir/stdout/" 2>/dev/null || true
         cp "$TMPDIR_EVAL"/stderr_*.txt "$archive_dir/stdout/" 2>/dev/null || true
+        cp "$TMPDIR_EVAL"/prompt_status_*.txt "$archive_dir/stdout/" 2>/dev/null || true
     fi
 
     # Write run metadata, including the immutable image identity so before/after
@@ -301,7 +371,9 @@ asset_commit:   $asset_commit
 asset_dirty:    $asset_dirty
 category:  ${FILTER_CATEGORY:-all}
 case:      ${FILTER_CASE:-all}
+seed:      $EVAL_SEED
 timeout:   ${PROMPT_TIMEOUT:-60}s
+max_case_timeout: ${MAX_PROMPT_TIMEOUT:-60}s
 runs:      ${RUNS:-5}
 threshold: ${THRESHOLD:-0.80}
 passed:    ${PASSED_CASES:-0}/${TOTAL_CASES:-0}
@@ -346,6 +418,18 @@ build_local_image() {
     echo "→ Building netclaw from source (image + CLI)..."
     "$REPO_ROOT/scripts/docker/build-image.sh"
     echo "→ Local build complete: $NETCLAW_IMAGE"
+}
+
+build_coordination_observer() {
+    if [[ -n "$FILTER_CASE" && "$FILTER_CASE" != "coordination_independent_synthesis" && "$FILTER_CASE" != "coordination_artifact_review" ]]; then
+        return 0
+    fi
+    if [[ -n "$FILTER_CATEGORY" && "${FILTER_CATEGORY,,}" != *subagent* ]]; then
+        return 0
+    fi
+
+    echo "→ Building the coordination eval observer..."
+    dotnet build "$REPO_ROOT/evals/coordination-observer/coordination-observer.csproj" --verbosity quiet
 }
 
 # ─── Eval Daemon Lifecycle ────────────────────────────────────────────────────
@@ -403,8 +487,47 @@ write_eval_reminder() {
     chmod ugo+rw "$file"
 }
 
+# Prints the epoch seconds of the latest "0 3 * * 0" fire (Sunday 03:00 UTC)
+# at or before a time. UTC has no daylight saving shift, so epoch arithmetic
+# is exact. The epoch day 0 was a Thursday, so (day + 4) % 7 is the weekday
+# with Sunday as 0.
+# Args: epoch seconds of the time (default: now)
+last_sunday_0300_utc_epoch() {
+    local now="${1:-$(date +%s)}"
+    local day=$(( now / 86400 ))
+    local fire=$(( day * 86400 + 3 * 3600 - ((day + 4) % 7) * 86400 ))
+    if (( fire > now )); then
+        fire=$(( fire - 7 * 86400 ))
+    fi
+    printf '%s\n' "$fire"
+}
+
+# Writes one successful history record for a reminder. The reminder tools read
+# the file {id}.history.jsonl next to the definition file.
+# Args: id, epoch seconds of the fire
+write_eval_reminder_history() {
+    local id="$1" fired_at="$2"
+    local file="$EVAL_HOME/data/schedules/reminders/$id.history.jsonl"
+    jq -nc --argjson fired "$fired_at" --arg id "$id" '
+        {
+            firedAt: ($fired | strftime("%Y-%m-%dT%H:%M:%SZ")),
+            success: true,
+            durationMs: 2300,
+            sessionId: ("reminder/" + $id + "/" + ($fired | tostring)),
+            errorMessage: null,
+            toolDenied: false
+        }' > "$file"
+    chmod ugo+rw "$file"
+}
+
+# The seeded reminder fires every Sunday at 03:00 UTC. It gets one successful
+# run at the latest Sunday 03:00 UTC, so the history is never empty for a job
+# that is due. Without it, a run on a Sunday after 03:00 UTC made the agent
+# think the fire was missed. It then ran `netclaw reminder status` to check.
+# The record time depends on the run day, but the schedule never looks late.
 seed_disk_cleanup_reminder() {
     write_eval_reminder "disk-cleanup-weekly" "Weekly disk space cleanup" "0 3 * * 0"
+    write_eval_reminder_history "disk-cleanup-weekly" "$(last_sunday_0300_utc_epoch)"
 }
 
 start_eval_daemon() {
@@ -499,6 +622,17 @@ start_eval_daemon() {
         'exit 0' \
         > "$marker_executable"
     chmod ugo+x "$marker_executable"
+
+    # The long_command_background_job case runs this command. It takes 150 s,
+    # longer than the 90 s foreground shell limit, so a plain foreground run
+    # always times out. The prompt does not tell the agent the duration.
+    local slow_render_executable="$EVAL_HOME/data/evals/slow_render"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'sleep 150' \
+        'echo render-complete' \
+        > "$slow_render_executable"
+    chmod ugo+x "$slow_render_executable"
 
     # Pre-seed a large (>256 KB) text file in the workspaces read-root for the
     # bounded-tool-output file_read eval (complex_large_file_read_ranged). It must
@@ -681,29 +815,39 @@ start_eval_daemon() {
 
 # ─── Memory Seeding ──────────────────────────────────────────────────────────
 
+## Seeds the memory store. Any failure stops the run with exit 2. A run that
+## goes on after a failed seed has no memory reset, so its trials would not be
+## independent, and the log would show only a warning.
 seed_eval_memories() {
     local db_path="/home/netclaw/.netclaw/netclaw.db"
     local fixtures_path="$EVAL_ASSET_ROOT/evals/fixtures/eval-memories.json"
     local seed_script="$REPO_ROOT/evals/seed-memories.py"
 
     if [[ ! -f "$fixtures_path" ]]; then
-        echo "WARN: no eval fixtures at $fixtures_path — memory tests may fail" >&2
-        return
+        echo "ERROR: no eval fixtures at $fixtures_path. The memory store cannot be seeded." >&2
+        exit 2
     fi
 
     if [[ ! -f "$seed_script" ]]; then
-        echo "WARN: no seed script at $seed_script — memory tests may fail" >&2
-        return
+        echo "ERROR: no seed script at $seed_script. The memory store cannot be seeded." >&2
+        exit 2
     fi
 
     # If the daemon has not touched memory yet, send one warm-up prompt through
     # the normal headless path so the session pipeline creates netclaw.db before
     # fixture seeding runs.
     if ! docker exec "$EVAL_CONTAINER_NAME" test -f "$db_path" 2>/dev/null; then
-        NETCLAW_DAEMON_ENDPOINT="http://127.0.0.1:$EVAL_PORT" \
-        NETCLAW_HOME="$EVAL_HOME" \
+        local ts exit_code=0
+        ts="$(date +%s%N)"
+        if NETCLAW_DAEMON_ENDPOINT="http://127.0.0.1:$EVAL_PORT" \
+            NETCLAW_HOME="$EVAL_HOME" \
             timeout "$PROMPT_TIMEOUT" "$NETCLAW_BIN" chat -p "Warm up memory initialization. Reply with OK only." \
-            >/dev/null 2>&1 || true
+            > "$TMPDIR_EVAL/stdout_${ts}_warmup.txt" 2> "$TMPDIR_EVAL/stderr_${ts}_warmup.txt"; then
+            :
+        else
+            exit_code=$?
+        fi
+        check_prompt_exit_status "$ts" "$exit_code" "Memory warm-up prompt"
     fi
 
     # Wait for the daemon to create the database.
@@ -716,24 +860,62 @@ seed_eval_memories() {
     done
 
     if ! docker exec "$EVAL_CONTAINER_NAME" test -f "$db_path" 2>/dev/null; then
-        echo "WARN: netclaw.db not found in container after 30s — skipping memory seeding" >&2
-        return
+        echo "ERROR: netclaw.db not found in the container after 30 s. The memory store cannot be seeded." >&2
+        exit 2
     fi
 
-    # Copy seed script and fixtures into the container, then run inside.
-    # The DB is owned by root, so we must execute within the container.
-    docker cp "$seed_script" "$EVAL_CONTAINER_NAME:/tmp/seed-memories.py"
-    docker cp "$fixtures_path" "$EVAL_CONTAINER_NAME:/tmp/eval-memories.json"
-
-    if docker exec "$EVAL_CONTAINER_NAME" python3 /tmp/seed-memories.py \
-        --db-path "$db_path" \
-        --fixtures /tmp/eval-memories.json; then
+    if run_memory_seed_script; then
         local count
         count=$(python3 -c "import json; print(len(json.load(open('$fixtures_path')).get('seedDocuments', [])))")
         echo "→ Seeded $count eval memories into container"
+        EVAL_MEMORY_SEEDED=true
     else
-        echo "WARN: memory seeding failed — memory tests may fail" >&2
+        echo "ERROR: the memory seed failed. The memory reset would be off, and the trials would not be independent." >&2
+        exit 2
     fi
+}
+
+## Runs seed-memories.py in the container with the given extra options.
+## The database belongs to the daemon, so the script must run in the
+## container, not on the host. The script runs as the daemon user, so the
+## -wal and -shm files that it can create keep the owner of the database.
+## Each call copies the script and the fixtures again, so the call needs no
+## earlier state.
+run_memory_seed_script() {
+    local db_path="/home/netclaw/.netclaw/netclaw.db"
+    docker cp "$REPO_ROOT/evals/seed-memories.py" "$EVAL_CONTAINER_NAME:/tmp/seed-memories.py" || return 1
+    docker cp "$EVAL_ASSET_ROOT/evals/fixtures/eval-memories.json" "$EVAL_CONTAINER_NAME:/tmp/eval-memories.json" || return 1
+    docker exec --user netclaw "$EVAL_CONTAINER_NAME" python3 /tmp/seed-memories.py "$@" \
+        --db-path "$db_path" \
+        --fixtures /tmp/eval-memories.json
+}
+
+## Puts the memory store back in the seeded state: the doc-eval-* memories at
+## their fixture content, and nothing else. A trial can write a memory with
+## store_memory, and a session can distill one. Without this reset, the next
+## trial recalls that memory and tests the memory, not the product. The reset
+## is one transaction, so a recall never sees an empty store. The script
+## first waits (30 s) until no curation checkpoint is pending or processing,
+## because a worker that has a checkpoint writes its documents even after the
+## reset deleted the checkpoint row. Exit 3 means that the wait ended. The
+## reset did not run, so the trial is inconclusive: the snapshot records
+## TRIAL_MEMORY_RESET_STATUS. Any other failure stops the run.
+reset_memory_store() {
+    TRIAL_MEMORY_RESET_STATUS=ok
+    [[ "$EVAL_MEMORY_SEEDED" == "true" ]] || return 0
+    local rc=0
+    run_memory_seed_script --reset >/dev/null || rc=$?
+    case "$rc" in
+        0) ;;
+        3)
+            TRIAL_MEMORY_RESET_STATUS=reset_curation_busy
+            echo "WARN: the memory reset waited 30 s for the curation worker and did not run. This trial will be inconclusive." >&2
+            ;;
+        *)
+            echo "ERROR: the memory reset before the trial failed. The trials would not be independent." >&2
+            exit 2
+            ;;
+    esac
 }
 
 # ─── SQLite Setup ─────────────────────────────────────────────────────────────
@@ -741,54 +923,25 @@ seed_eval_memories() {
 init_db() {
     [[ -z "$RESULTS_DB" ]] && return
     mkdir -p "$RESULTS_DIR"
-    sqlite3 "$RESULTS_DB" <<'SQL'
-CREATE TABLE IF NOT EXISTS eval_runs (
-    run_id        TEXT PRIMARY KEY,
-    started_at    TEXT NOT NULL,
-    netclaw_ver   TEXT NOT NULL,
-    model_id      TEXT,
-    runs_per_case INTEGER NOT NULL,
-    threshold     REAL NOT NULL,
-    total_cases   INTEGER NOT NULL,
-    passed_cases  INTEGER NOT NULL,
-    overall_score REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS eval_results (
-    run_id      TEXT NOT NULL REFERENCES eval_runs(run_id),
-    category    TEXT NOT NULL,
-    case_name   TEXT NOT NULL,
-    run_number  INTEGER NOT NULL,
-    prompt_used TEXT NOT NULL,
-    passed      INTEGER NOT NULL,
-    details     TEXT,
-    PRIMARY KEY (run_id, case_name, run_number)
-);
-CREATE TABLE IF NOT EXISTS eval_metrics (
-    run_id            TEXT NOT NULL REFERENCES eval_runs(run_id),
-    category          TEXT NOT NULL,
-    case_name         TEXT NOT NULL,
-    run_number        INTEGER NOT NULL,
-    turn_number       INTEGER NOT NULL DEFAULT 1,
-    input_tokens      INTEGER,
-    output_tokens     INTEGER,
-    cached_tokens     INTEGER,
-    prompt_ms         REAL,
-    predicted_tok_s   REAL,
-    PRIMARY KEY (run_id, case_name, run_number, turn_number)
-);
-SQL
+    python3 "$RESULTS_DB_PY" init --db "$RESULTS_DB" || {
+        echo "ERROR: results_db.py init failed for $RESULTS_DB" >&2
+        exit 2
+    }
 }
 
+## Stores one trial. The row holds the status and the reason. The passed column
+## is NULL for an inconclusive trial, so an old AVG(passed) query does not count
+## it as a fail. results_db.py binds every value as a parameter. Each option
+## has the form --name=VALUE, so a prompt that starts with a dash is safe.
+## Args: case_name, run_number, prompt, status, reason, details
 store_result() {
     [[ -z "$RESULTS_DB" ]] && return
-    local case_name="$1" run_number="$2" prompt="$3" passed="$4" details="$5"
-    # Escape single quotes for SQL
-    local esc_prompt="${prompt//\'/\'\'}"
-    local esc_details="${details//\'/\'\'}"
-    local esc_category="${CURRENT_CATEGORY//\'/\'\'}"
-    sqlite3 "$RESULTS_DB" \
-        "INSERT INTO eval_results (run_id, category, case_name, run_number, prompt_used, passed, details)
-         VALUES ('$RUN_ID', '$esc_category', '$case_name', $run_number, '$esc_prompt', $passed, '$esc_details');"
+    python3 "$RESULTS_DB_PY" store --db "$RESULTS_DB" --run-id "$RUN_ID" \
+        "--category=$CURRENT_CATEGORY" "--case=$1" "--run-number=$2" "--prompt=$3" \
+        "--status=$4" "--reason=$5" "--details=$6" || {
+        echo "ERROR: results_db.py store failed for $1 run $2" >&2
+        exit 2
+    }
 }
 
 ## Parses text or structured JSON usage output and stores performance metrics.
@@ -908,15 +1061,348 @@ finalize_db() {
     local esc_ver="${NETCLAW_VER//\'/\'\'}"
     local esc_model="${EVAL_MODEL_ID//\'/\'\'}"
     sqlite3 "$RESULTS_DB" \
-        "INSERT INTO eval_runs (run_id, started_at, netclaw_ver, model_id, runs_per_case, threshold, total_cases, passed_cases, overall_score)
-         VALUES ('$RUN_ID', '$STARTED_AT', '$esc_ver', '$esc_model', $RUNS, $THRESHOLD, $TOTAL_CASES, $PASSED_CASES, $score);"
+        "INSERT INTO eval_runs (run_id, started_at, netclaw_ver, model_id, runs_per_case, threshold, total_cases, passed_cases, overall_score, inconclusive_cases)
+         VALUES ('$RUN_ID', '$STARTED_AT', '$esc_ver', '$esc_model', $RUNS, $THRESHOLD, $TOTAL_CASES, $PASSED_CASES, $score, $INCONCLUSIVE_CASES);"
 }
 
 # ─── Utility Functions ────────────────────────────────────────────────────────
 
+## Picks the prompt variant of one (case, trial). Args: case_name, trial, variant...
+## Sets PICKED_VARIANT, PICKED_VARIANT_INDEX, and PICKED_TRIAL_SEED. The index
+## is trial_seed % variant count. It does not use RANDOM: bash 5.1 changed that
+## generator, so the same seed would pick another variant on another host.
 pick_variant() {
-    local -a arr=("$@")
-    echo "${arr[RANDOM % ${#arr[@]}]}"
+    local case_name="$1" trial="$2"
+    shift 2
+    local -a variants=("$@")
+    PICKED_TRIAL_SEED=$(python3 "$TRIAL_EVIDENCE_PY" derive-seed \
+        --seed "$EVAL_SEED" --case "$case_name" --trial "$trial")
+    PICKED_VARIANT_INDEX=$((PICKED_TRIAL_SEED % ${#variants[@]}))
+    PICKED_VARIANT="${variants[PICKED_VARIANT_INDEX]}"
+}
+
+# ─── Trial Evidence ───────────────────────────────────────────────────────────
+
+# Each trial keeps its evidence in evals/runs/<run-id>/trials/<case>/<nn>/raw/.
+# A single-turn trial puts the CLI files there. A multi-turn trial puts them in
+# raw/turn-<nn>/. Session files (session.json, cli-session.log, session.log,
+# daemon-*.log, assert-stderr.txt) always sit in raw/.
+
+TRIAL_EVIDENCE_PY="$REPO_ROOT/evals/trial_evidence.py"
+TRIAL_VERDICT_PY="$REPO_ROOT/evals/trial_verdict.py"
+RESULTS_DB_PY="$REPO_ROOT/evals/results_db.py"
+# Exit codes of `trial_evidence.py discover-session` that are findings, not crashes.
+DISCOVER_NO_SESSION=3
+DISCOVER_AMBIGUOUS_SESSION=4
+
+iso_now() {
+    date -u +%Y-%m-%dT%H:%M:%S.%3N%:z
+}
+
+## Args: case_name, trial number
+begin_trial() {
+    TRIAL_RAW="$REPO_ROOT/evals/runs/${RUN_ID:?}/trials/$1/$(printf '%02d' "$2")/raw"
+    mkdir -p "$TRIAL_RAW"
+}
+
+## Args: variant count. Reads the PICKED_* variables.
+record_variant() {
+    jq -n --argjson index "$PICKED_VARIANT_INDEX" --argjson count "$1" \
+        --argjson seed "$EVAL_SEED" --argjson trial_seed "$PICKED_TRIAL_SEED" \
+        '{variant_index: $index, variant_count: $count, seed: $seed, trial_seed: $trial_seed}' \
+        > "$TRIAL_RAW/variant.json"
+}
+
+## Takes the snapshots that the trial evidence needs, just before the first CLI
+## call: the names of the CLI logs that exist, and the daemon log position.
+snapshot_trial_baseline() {
+    TRIAL_KNOWN_LOGS_FILE="$TMPDIR_EVAL/known_logs_$(date +%s%N).txt"
+    find "$EVAL_HOME/logs" -maxdepth 1 -type f -printf '%f\n' > "$TRIAL_KNOWN_LOGS_FILE"
+    resolve_daemon_log
+    TRIAL_DAEMON_LOG="$DAEMON_LOG"
+    TRIAL_DAEMON_LINES_BEFORE=0
+    if [[ -f "$TRIAL_DAEMON_LOG" ]]; then
+        TRIAL_DAEMON_LINES_BEFORE=$(wc -l < "$TRIAL_DAEMON_LOG")
+    fi
+    # The memory snapshot: the ids of every memory that exists now and that the
+    # harness did not seed. reset_trial_state ran just before, so the list
+    # should be empty. trial_verdict.py makes the trial inconclusive when
+    # recall injects one of these ids, or when this snapshot failed or the
+    # reset did not run. The file is always written, so a failure shows in the
+    # evidence. The snapshot catches a write between the reset and this point.
+    # It does not catch a write later in the trial; the idle wait of the reset
+    # prevents the one writer that is known (a curation in progress).
+    python3 "$TRIAL_EVIDENCE_PY" memory-ids --home "$EVAL_HOME" \
+        --dest "$TRIAL_RAW/memory-before.json" \
+        --reset-status "$TRIAL_MEMORY_RESET_STATUS"
+}
+
+## Writes the agent definitions of the eval fixtures into the daemon home
+## again, and removes every other file from the agents folder. A trial can edit
+## a definition or add one (the parent agent can rewrite an agent file), and
+## the next trial of the same run must start from the fixtures.
+## The daemon user (uid 1654) can own a file that the trial replaced. The host
+## user cannot write over such a file. So the restore runs in the container.
+## It runs as the daemon user (netclaw), not as root: the agent can remove the
+## folder or replace it with a symbolic link, and root would follow the link
+## and change its target. The daemon user owns the folder and each file in it,
+## so it needs no more right. The restore removes a link and not its target,
+## and then it rebuilds the folder from the fixtures. A trial can also remove
+## the write right from the folder or a subfolder (chmod -R a-w). rm -rf would
+## fail on such a folder, so the restore gives the owner the right back first.
+## The guard skips a link at the top, and chmod -R does not follow a link
+## inside the tree.
+## The daemon creates agents/.server-feeds at start, so the restore makes it
+## too, and the home matches a real install.
+restore_agent_fixtures() {
+    local fixtures="$EVAL_ASSET_ROOT/evals/fixtures/agents"
+    [[ -d "$fixtures" ]] || return 0
+    # chmod keeps the files editable by the daemon user, as in a real install.
+    if ! tar -C "$fixtures" -cf - . \
+        | docker exec --interactive --user netclaw "$EVAL_CONTAINER_NAME" sh -c '
+            set -e
+            if [ -d "$1" ] && [ ! -L "$1" ]; then chmod -R u+rwx -- "$1"; fi
+            rm -rf -- "$1"
+            mkdir -m 0777 -- "$1"
+            tar -xf - -C "$1" --no-same-owner
+            mkdir -p -- "$1/.server-feeds"
+            chmod -R ugo+rwX "$1"' sh /home/netclaw/.netclaw/agents; then
+        echo "ERROR: the restore of the agent fixtures failed. The trials would not be independent." >&2
+        exit 2
+    fi
+}
+
+## Puts the state that a trial can change back to the state of the start of the
+## run. Run this before the setup function of the case and before the snapshot.
+reset_trial_state() {
+    restore_agent_fixtures
+    reset_memory_store
+}
+
+## Writes the record of one CLI call: the prompt that the CLI received, how the
+## call ended, and its output. The exit code is kept, not discarded: 124 means
+## that `timeout` cut the call off.
+## Args: dir, prompt, output_format, exit_code, started_at, ended_at, stdout_file, stderr_file
+record_cli_call() {
+    local dir="$1" prompt="$2" output_format="$3" exit_code="$4"
+    local started_at="$5" ended_at="$6" stdout_file="$7" stderr_file="$8"
+    mkdir -p "$dir"
+    printf '%s' "$prompt" > "$dir/prompt.txt"
+    jq -n --argjson exit_code "$exit_code" --arg started_at "$started_at" \
+        --arg ended_at "$ended_at" --argjson deadline_s "$PROMPT_TIMEOUT" \
+        '{exit_code: $exit_code, started_at: $started_at, ended_at: $ended_at, deadline_s: $deadline_s}' \
+        > "$dir/cli-exit.json"
+    local extension="txt"
+    if [[ "$output_format" == "json" ]]; then
+        extension="json"
+    fi
+    cp "$stdout_file" "$dir/cli-stdout.$extension"
+    cp "$stderr_file" "$dir/cli-stderr.txt"
+}
+
+## Copies the session evidence of a finished trial into raw/. A source that is
+## missing is reported on stderr and the run goes on. The trial folder then
+## shows which source was missing. The daemon evidence comes later, from
+## finish_assertion_evidence, because the assertion reads the daemon log too.
+finish_trial() {
+    local discover_code=0
+    python3 "$TRIAL_EVIDENCE_PY" discover-session --logs-dir "$EVAL_HOME/logs" \
+        --known "$TRIAL_KNOWN_LOGS_FILE" > "$TRIAL_RAW/session.json" || discover_code=$?
+    if [[ "$discover_code" -ne 0 && "$discover_code" -ne "$DISCOVER_NO_SESSION" \
+        && "$discover_code" -ne "$DISCOVER_AMBIGUOUS_SESSION" ]]; then
+        echo "ERROR: discover-session crashed (exit $discover_code)" >&2
+        exit 2
+    fi
+
+    local status
+    status=$(jq -r '.status' "$TRIAL_RAW/session.json")
+    if [[ "$status" != "ok" ]]; then
+        echo "  WARN: no CLI session log for the trial ($status). See $TRIAL_RAW/session.json" >&2
+        return
+    fi
+
+    local session_id
+    session_id=$(jq -r '.session_id' "$TRIAL_RAW/session.json")
+    cp "$EVAL_HOME/logs/$(jq -r '.log' "$TRIAL_RAW/session.json")" "$TRIAL_RAW/cli-session.log"
+
+    local actor_status
+    actor_status=$(python3 "$TRIAL_EVIDENCE_PY" actor-log --home "$EVAL_HOME" \
+        --session "$session_id" --dest "$TRIAL_RAW" | jq -r '.status')
+    if [[ "$actor_status" != "ok" ]]; then
+        echo "  WARN: no actor log for $session_id ($actor_status). See $TRIAL_RAW/actor-log.json" >&2
+    fi
+}
+
+## Copies the daemon window and writes assert.json. Call it right after the
+## assertion, so the window holds every line that the assertion could read.
+## The window starts at the first line after the trial baseline, in the daemon
+## file that was current then. A multi-turn trial starts at turn 1, not at the
+## last turn. A daemon file that did not exist at the baseline (the UTC day
+## changed) is added in full, in name order.
+## Args: assertion exit code
+finish_assertion_evidence() {
+    local assert_rc="$1"
+    local window="$TRIAL_RAW/daemon-window.log"
+    local lines_after name
+    local -a new_files=()
+    while IFS= read -r name; do
+        if [[ "$name" != "$(basename "$TRIAL_DAEMON_LOG")" ]] \
+            && ! grep -qxF -- "$name" "$TRIAL_KNOWN_LOGS_FILE"; then
+            new_files+=("$name")
+        fi
+    done < <(find "$EVAL_HOME/logs" -maxdepth 1 -type f -name 'daemon-*.log' -printf '%f\n' | sort)
+
+    if [[ ! -f "$TRIAL_DAEMON_LOG" ]]; then
+        echo "ERROR: daemon log $TRIAL_DAEMON_LOG is gone after the assertion" >&2
+        exit 2
+    fi
+    lines_after=$(wc -l < "$TRIAL_DAEMON_LOG")
+    head -n "$lines_after" "$TRIAL_DAEMON_LOG" \
+        | tail -n +"$((TRIAL_DAEMON_LINES_BEFORE + 1))" > "$window"
+    for name in "${new_files[@]}"; do
+        cat "$EVAL_HOME/logs/$name" >> "$window"
+    done
+
+    jq -n --argjson exit_code "$assert_rc" \
+        --arg daemon_log "$(basename "$TRIAL_DAEMON_LOG")" \
+        --argjson before "$TRIAL_DAEMON_LINES_BEFORE" --argjson after "$lines_after" \
+        --args '{exit_code: $exit_code, daemon_log: $daemon_log,
+                 window_lines_before: $before, window_lines_after: $after,
+                 extra_daemon_logs: $ARGS.positional}' "${new_files[@]}" \
+        > "$TRIAL_RAW/assert.json"
+
+    # An assertion that reports "inconclusive" returns 1 like a fail. The report
+    # tells them apart (trial_verdict.py reads assert-report.json). A report
+    # that is gone leaves an empty file, which the verdict reports as infra.
+    if [[ -n "${EVAL_ASSERTION_REPORT:-}" ]]; then
+        cp "$EVAL_ASSERTION_REPORT" "$TRIAL_RAW/assert-report.json" 2>/dev/null \
+            || : > "$TRIAL_RAW/assert-report.json"
+    fi
+
+    if [[ -f "$window" && "$(jq -r '.status' "$TRIAL_RAW/session.json")" == "ok" ]]; then
+        python3 "$TRIAL_EVIDENCE_PY" daemon-session --log "$window" \
+            --session "$(jq -r '.session_id' "$TRIAL_RAW/session.json")" \
+            > "$TRIAL_RAW/daemon-session.log"
+    fi
+}
+
+# ─── Trial and Case Results ───────────────────────────────────────────────────
+
+## Marks a JSON report as the evidence of the assertion that runs now.
+## Args: report path
+keep_assertion_report() {
+    EVAL_ASSERTION_REPORT="$1"
+}
+
+reset_case_tally() {
+    CASE_PASSES=0
+    CASE_FAILS=0
+    CASE_INCONCLUSIVE=0
+    CASE_INCONCLUSIVE_REASONS=()
+}
+
+## Judges the finished trial, adds it to the tally of the case, and stores its
+## row. Call it after finish_assertion_evidence, because the verdict reads
+## assert.json. trial_verdict.py writes verdict.json in the trial folder.
+## Args: case_name, run_number, prompt, details of a fail
+record_trial() {
+    local case_name="$1" run="$2" prompt="$3" fail_details="$4"
+    local verdict status reason error details
+    if ! verdict=$(python3 "$TRIAL_VERDICT_PY" trial-status --trial-dir "$(dirname "$TRIAL_RAW")"); then
+        echo "ERROR: trial-status failed for $TRIAL_RAW" >&2
+        exit 2
+    fi
+    status=$(jq -r '.status' <<< "$verdict")
+    reason=$(jq -r '.reason // ""' <<< "$verdict")
+    error=$(jq -r '.error // ""' <<< "$verdict")
+    case "$status" in
+        pass)
+            CASE_PASSES=$((CASE_PASSES + 1))
+            details="pass"
+            ;;
+        fail)
+            CASE_FAILS=$((CASE_FAILS + 1))
+            details="$fail_details"
+            ;;
+        inconclusive)
+            CASE_INCONCLUSIVE=$((CASE_INCONCLUSIVE + 1))
+            CASE_INCONCLUSIVE_REASONS+=("$reason")
+            details="${error:-$reason}"
+            ;;
+        *)
+            echo "ERROR: trial-status gave an unknown status: $status" >&2
+            exit 2
+            ;;
+    esac
+    store_result "$case_name" "$run" "$prompt" "$status" "$reason" "$details"
+}
+
+## Prints each distinct reason once, in order of first use, with a count when
+## it repeats: "timeout x2, turn_failed".
+format_reasons() {
+    printf '%s\n' "$@" | awk '
+        { count[$0]++; if (count[$0] == 1) order[++distinct] = $0 }
+        END {
+            for (i = 1; i <= distinct; i++)
+                printf "%s%s%s", (i > 1 ? ", " : ""), order[i], (count[order[i]] > 1 ? " x" count[order[i]] : "")
+        }'
+}
+
+## Gives the case its state from the tally, prints the case line, and updates
+## the counters. The score counts conclusive trials only.
+## Args: case_name, description
+finish_case() {
+    local case_name="$1" description="$2"
+    local result status score conclusive=$((CASE_PASSES + CASE_FAILS))
+    if ! result=$(python3 "$TRIAL_VERDICT_PY" case-status --threshold "$THRESHOLD" \
+        --passes "$CASE_PASSES" --fails "$CASE_FAILS" --inconclusive "$CASE_INCONCLUSIVE"); then
+        echo "ERROR: case-status failed for $case_name" >&2
+        exit 2
+    fi
+    status=$(jq -r '.status' <<< "$result")
+    score="n/a"
+    if [[ "$conclusive" -gt 0 ]]; then
+        score=$(jq -r '.score' <<< "$result" | awk '{printf "%.3f", $1}')
+        score="$score, threshold $THRESHOLD"
+    fi
+    if [[ "$CASE_INCONCLUSIVE" -gt 0 ]]; then
+        score="$score, $CASE_INCONCLUSIVE inconclusive: $(format_reasons "${CASE_INCONCLUSIVE_REASONS[@]}")"
+    fi
+
+    CATEGORY_CASES=$((CATEGORY_CASES + 1))
+    TOTAL_CASES=$((TOTAL_CASES + 1))
+    case "$status" in
+        pass)
+            CATEGORY_PASSED=$((CATEGORY_PASSED + 1))
+            PASSED_CASES=$((PASSED_CASES + 1))
+            ;;
+        fail)
+            CATEGORY_FAILED=$((CATEGORY_FAILED + 1))
+            FAILED_CASES=$((FAILED_CASES + 1))
+            ;;
+        inconclusive)
+            INCONCLUSIVE_CASES=$((INCONCLUSIVE_CASES + 1))
+            ;;
+        *)
+            echo "ERROR: case-status gave an unknown status: $status" >&2
+            exit 2
+            ;;
+    esac
+    printf "  [%s] %-30s %d/%d (%s)  — %s\n" "${status^^}" "$case_name" \
+        "$CASE_PASSES" "$conclusive" "$score" "$description"
+}
+
+check_prompt_exit_status() {
+    local timestamp="$1" exit_code="$2" prompt_kind="$3"
+    printf '%s\n' "$exit_code" > "$TMPDIR_EVAL/prompt_status_${timestamp}.txt"
+    if (( exit_code != 0 )); then
+        if (( exit_code == 124 )); then
+            echo "ERROR: $prompt_kind timed out after ${PROMPT_TIMEOUT}s; the eval run stops to prevent overlapping model requests." >&2
+        else
+            echo "ERROR: $prompt_kind exited with status $exit_code; the eval run stops before another prompt." >&2
+        fi
+        exit 2
+    fi
 }
 
 # ─── Prompt Runner ────────────────────────────────────────────────────────────
@@ -934,7 +1420,7 @@ check_daemon_alive() {
         overall_score=$(awk "BEGIN {printf \"%.1f\", ($PASSED_CASES / ($TOTAL_CASES > 0 ? $TOTAL_CASES : 1)) * 100}")
         echo ""
         echo "─────────────────────────────────────────────────"
-        echo "ABORTED: Eval container not running. Partial results: $PASSED_CASES/$TOTAL_CASES ($overall_score%)"
+        echo "ABORTED: Eval container not running. Partial results: $PASSED_CASES/$TOTAL_CASES ($overall_score%), $FAILED_CASES failed, $INCONCLUSIVE_CASES inconclusive"
         if [[ -n "$RESULTS_DB" ]]; then
             echo "Results: $RESULTS_DB (run_id: $RUN_ID)"
         fi
@@ -974,13 +1460,42 @@ run_prompt() {
     # "[error] Unknown output type from daemon: ...") to stderr, and a
     # trailing diagnostic line breaks jq's parse of the JSON envelope on
     # stdout, producing a false eval failure rather than a real one.
+    local started_at ended_at exit_code=0
+    started_at=$(iso_now)
     NETCLAW_DAEMON_ENDPOINT="http://127.0.0.1:$EVAL_PORT" \
     NETCLAW_HOME="$EVAL_HOME" \
         timeout "$PROMPT_TIMEOUT" stdbuf -oL -eL "$NETCLAW_BIN" chat -p "${output_args[@]}" "$prompt" \
-        > "$STDOUT_FILE" 2> "$STDERR_FILE" || true
+        > "$STDOUT_FILE" 2> "$STDERR_FILE" || exit_code=$?
+    ended_at=$(iso_now)
+    record_cli_call "$TRIAL_RAW" "$prompt" "$output_format" "$exit_code" \
+        "$started_at" "$ended_at" "$STDOUT_FILE" "$STDERR_FILE"
 
     # Brief pause for daemon log flush
     sleep 2
+}
+
+run_coordination_observer_prompt() {
+    local prompt="$1" required_children="$2"
+    local ts
+    ts="$(date +%s%N)"
+    STDOUT_FILE="$TMPDIR_EVAL/stdout_${ts}.txt"
+    STDERR_FILE="$TMPDIR_EVAL/stderr_${ts}.txt"
+    resolve_daemon_log
+    if [[ -f "$DAEMON_LOG" ]]; then
+        DAEMON_LOG_LINES_BEFORE=$(wc -l < "$DAEMON_LOG")
+    else
+        DAEMON_LOG_LINES_BEFORE=0
+    fi
+
+    local started_at ended_at exit_code=0
+    started_at=$(iso_now)
+    timeout "$PROMPT_TIMEOUT" dotnet run --no-build \
+        --project "$REPO_ROOT/evals/coordination-observer/coordination-observer.csproj" -- \
+        "http://127.0.0.1:$EVAL_PORT" "$PROMPT_TIMEOUT" "$required_children" "$prompt" \
+        > "$STDOUT_FILE" 2> "$STDERR_FILE" || exit_code=$?
+    ended_at=$(iso_now)
+    record_cli_call "$TRIAL_RAW" "$prompt" json "$exit_code" \
+        "$started_at" "$ended_at" "$STDOUT_FILE" "$STDERR_FILE"
 }
 
 ## Runs a prompt against an existing (or new) named session via `chat -p --resume`.
@@ -988,11 +1503,12 @@ run_prompt() {
 ## assertion helpers (stdout_contains, etc.) see the full concatenated output.
 ## Stderr is captured the same way, into a separate shared STDERR_FILE, so
 ## stdout stays pure for assertions (see run_prompt for why that matters).
-## Args: session_id, prompt, [output_format]
+## Args: session_id, prompt, output_format, turn number
 run_prompt_resume() {
     local session_id="$1"
     local prompt="$2"
-    local output_format="${3:-text}"
+    local output_format="$3"
+    local turn_number="$4"
     local ts
     ts="$(date +%s%N)"
     local turn_file="$TMPDIR_EVAL/stdout_${ts}_turn.txt"
@@ -1028,11 +1544,16 @@ run_prompt_resume() {
         output_args+=(--json)
     fi
 
+    local started_at ended_at exit_code=0
+    started_at=$(iso_now)
     NETCLAW_DAEMON_ENDPOINT="http://127.0.0.1:$EVAL_PORT" \
     NETCLAW_HOME="$EVAL_HOME" \
         timeout "$PROMPT_TIMEOUT" stdbuf -oL -eL "$NETCLAW_BIN" chat -p --resume "$session_id" \
         "${output_args[@]}" "$prompt" \
-        > "$turn_file" 2> "$turn_stderr_file" || true
+        > "$turn_file" 2> "$turn_stderr_file" || exit_code=$?
+    ended_at=$(iso_now)
+    record_cli_call "$TRIAL_RAW/turn-$(printf '%02d' "$turn_number")" "$prompt" "$output_format" \
+        "$exit_code" "$started_at" "$ended_at" "$turn_file" "$turn_stderr_file"
 
     # Append this turn's output to the shared files so assertions see all turns.
     cat "$turn_file" >> "$STDOUT_FILE"
@@ -1071,6 +1592,9 @@ run_multi_turn_case() {
     # Skip if category or case filter excludes this case
     if [[ "$CATEGORY_SKIPPED" == "true" ]]; then return; fi
     if [[ -n "$FILTER_CASE" && "$case_name" != "$FILTER_CASE" ]]; then return; fi
+    if (( PROMPT_TIMEOUT > MAX_PROMPT_TIMEOUT )); then
+        MAX_PROMPT_TIMEOUT="$PROMPT_TIMEOUT"
+    fi
 
     check_daemon_alive
 
@@ -1079,19 +1603,22 @@ run_multi_turn_case() {
         return
     fi
 
-    local passes=0
+    reset_case_tally
     local run
     for ((run = 1; run <= RUNS; run++)); do
         # Fresh session per run so runs don't pollute each other.
         local session_id="eval/${case_name}-run${run}-$$"
         MULTI_TURN_STDOUT_FILE=""
         MULTI_TURN_STDERR_FILE=""
+        begin_trial "$case_name" "$run"
 
+        reset_trial_state
         local setup_fn="setup_${case_name}"
         if declare -f "$setup_fn" >/dev/null 2>&1; then
             "$setup_fn" "$run"
         fi
 
+        snapshot_trial_baseline
         local turn=1
         local prompt
         for prompt in "${prompts[@]}"; do
@@ -1101,42 +1628,23 @@ run_multi_turn_case() {
             rendered_prompt="${rendered_prompt//\{\{TARGET_BRANCH\}\}/${CODING_CONTEXT_TARGET_BRANCH:-}}"
             rendered_prompt="${rendered_prompt//\{\{TARGET_FILE\}\}/${CODING_CONTEXT_TARGET_FILE:-}}"
             rendered_prompt="${rendered_prompt//\{\{DIRECT_ATTACHMENT_SOURCE\}\}/${DIRECT_ATTACHMENT_SOURCE_PATH:-}}"
-            run_prompt_resume "$session_id" "$rendered_prompt" "$output_format"
+            run_prompt_resume "$session_id" "$rendered_prompt" "$output_format" "$turn"
             store_metrics "$case_name" "$run" "$turn" "$LAST_TURN_USAGE_LINE"
             turn=$((turn + 1))
         done
+        finish_trial
 
-        local passed=0
-        local details="fail"
+        local assert_rc=0
         EVAL_ASSERTION_DETAILS=""
-        if $assert_fn 2>/dev/null; then
-            passed=1
-            passes=$((passes + 1))
-            details="pass"
-        elif [[ -n "${EVAL_ASSERTION_DETAILS:-}" ]]; then
-            details="$EVAL_ASSERTION_DETAILS"
-        fi
+        EVAL_ASSERTION_REPORT=""
+        $assert_fn 2> "$TRIAL_RAW/assert-stderr.txt" || assert_rc=$?
+        finish_assertion_evidence "$assert_rc"
 
         # Use the first prompt as the representative prompt_used for eval_results.
-        store_result "$case_name" "$run" "${prompts[0]}" "$passed" "$details"
+        record_trial "$case_name" "$run" "${prompts[0]}" "${EVAL_ASSERTION_DETAILS:-fail}"
     done
 
-    local score
-    score=$(awk "BEGIN {printf \"%.2f\", $passes / $RUNS}")
-    local threshold_met
-    threshold_met=$(awk "BEGIN {print ($score >= $THRESHOLD) ? 1 : 0}")
-
-    CATEGORY_CASES=$((CATEGORY_CASES + 1))
-    TOTAL_CASES=$((TOTAL_CASES + 1))
-
-    if [[ "$threshold_met" == "1" ]]; then
-        CATEGORY_PASSED=$((CATEGORY_PASSED + 1))
-        PASSED_CASES=$((PASSED_CASES + 1))
-        printf "  [PASS] %-30s %d/%d (%s)  — %s\n" "$case_name" "$passes" "$RUNS" "$score" "$description"
-    else
-        FAILED_CASES=$((FAILED_CASES + 1))
-        printf "  [FAIL] %-30s %d/%d (%s)  — %s\n" "$case_name" "$passes" "$RUNS" "$score" "$description"
-    fi
+    finish_case "$case_name" "$description"
 }
 
 # ─── Assertion Helpers ────────────────────────────────────────────────────────
@@ -1165,6 +1673,25 @@ stdout_response_not_contains() {
     return 0
 }
 
+# The parent's own text. A headless run prints the child's whole answer on one
+# "[tool:result] child_run_result" line. That text is the child's, not the
+# parent's. A pattern about the parent reply must not match it. Tool call lines
+# stay excluded as in stdout_response_contains.
+stdout_parent_text() {
+    grep -av -e '^\[tool:call\]' -e '^\[tool:result\] child_run_result ' "$STDOUT_FILE" 2>/dev/null
+}
+
+stdout_parent_text_contains() {
+    stdout_parent_text | grep -qia "$1"
+}
+
+stdout_parent_text_not_contains() {
+    if stdout_parent_text | grep -qia "$1"; then
+        return 1
+    fi
+    return 0
+}
+
 ## The daemon runs inside the container on its own clock (UTC), so a host
 ## date computation can name a log file the daemon never writes — every
 ## daemon_log_contains then fails silently for the whole run (observed when a
@@ -1172,10 +1699,19 @@ stdout_response_not_contains() {
 ## instead of trusting a computed date. Callers re-resolve before they take a
 ## per-case line baseline; a midnight rollover inside a single case remains
 ## unhandled and acceptable.
+## A run needs a daemon log, because every assertion and the trial evidence
+## read it. When none exists, the daemon did not start or write its log, so
+## the run stops.
 resolve_daemon_log() {
     local newest
-    newest=$(ls -1t "$EVAL_HOME"/logs/daemon-*.log 2>/dev/null | head -n 1)
-    [[ -n "$newest" ]] && DAEMON_LOG="$newest"
+    # `ls` exits non-zero when no file matches. The empty check below turns
+    # that case into a clear error.
+    newest=$(ls -1t "$EVAL_HOME"/logs/daemon-*.log 2>/dev/null | head -n 1) || true
+    if [[ -z "$newest" ]]; then
+        echo "ERROR: no daemon log (daemon-*.log) in $EVAL_HOME/logs. The daemon did not write its log." >&2
+        exit 2
+    fi
+    DAEMON_LOG="$newest"
 }
 
 daemon_log_tail() {
@@ -1250,6 +1786,11 @@ stdout_json_tool_called() {
     jq -e --arg tool_name "$tool_name" \
         'any(.toolCalls[]?; .toolName == $tool_name)' \
         "$STDOUT_FILE" >/dev/null 2>&1
+}
+
+stdout_json_response_contains() {
+    local pattern="$1"
+    jq -r '.response // empty' "$STDOUT_FILE" | grep -qia "$pattern" 2>/dev/null
 }
 
 stdout_json_tool_call_arguments() {
@@ -1522,9 +2063,11 @@ assert_memory_recall_active() {
 # Per the netclaw-agent-memory spec, durable user preferences are memory documents,
 # not identity-file edits. The invariant under test: the preference is routed to
 # memory and NOT written to an identity file (SOUL.md). The eval memory store is
-# shared across runs, so after the first store the model correctly recognizes the
-# fact is already in durable memory rather than re-storing it — both are correct
-# routing. The hard failure we guard against is a SOUL.md (file_edit/file_write) edit.
+# reset to the seeded state before each trial, so each trial starts without the
+# preference and the model should store it. The fallback below also accepts a
+# reply that only names memory, because a model can answer that it keeps the
+# preference in memory without a call. The hard failure we guard against is a
+# SOUL.md (file_edit/file_write) edit.
 assert_memory_identity_preference_routing() {
     # 'memor' not 'memory': correct responses often say "memories", and the
     # plural drops the y — "memories" does not contain the substring "memory".
@@ -1770,6 +2313,23 @@ assert_tool_background_job_api_selection() {
         && stdout_contains '\[tool:call\] check_background_job'
 }
 
+assert_long_command_background_job() {
+    # Regression for the live failure of 18 October 2026. The check reads the
+    # tool calls in the JSON envelope and the result of each call in the headless
+    # log. A denied call is inconclusive, not a pass. long_command_evals.py has
+    # the rules. An unknown log path gives an empty argument and an inconclusive report.
+    local report headless_log rc=0
+    report="${STDOUT_FILE%.txt}_long-command-verdict.txt"
+    keep_assertion_report "$report"
+    headless_log=$(stdout_json_headless_log_path) || headless_log=""
+    python3 "$REPO_ROOT/evals/long_command_evals.py" check --output "$STDOUT_FILE" \
+        --headless-log "$headless_log" > "$report" || rc=$?
+    if (( rc != 0 )); then
+        EVAL_ASSERTION_DETAILS=$(jq -r '.reason // "fail"' "$report" 2>/dev/null || printf 'fail')
+    fi
+    return "$rc"
+}
+
 # Category 5: Grounding & Alignment
 assert_grounding_no_hallucinate_version() {
     stdout_contains '\[tool:call\]'
@@ -1833,19 +2393,229 @@ assert_deployment_mission_sales_email() {
 assert_subagent_headless_ambiguous_task() {
     stdout_tool_called 'spawn_agent' && \
         stdout_contains '\[subagent:done\] headless-analyst (completed' && \
-        stdout_response_contains 'assumption' && \
-        stdout_response_not_contains 'which.*include' && \
-        stdout_response_not_contains 'what.*include' && \
-        stdout_response_not_contains 'please.*clarify' && \
-        stdout_response_not_contains 'need.*more.*information'
+        stdout_parent_text_contains 'assumption' && \
+        stdout_parent_text_not_contains 'which.*include' && \
+        stdout_parent_text_not_contains 'what.*include' && \
+        stdout_parent_text_not_contains 'please.*clarify' && \
+        stdout_parent_text_not_contains 'need.*more.*information'
 }
 
+# Prints the JSON body of each child_run_result TOOL_RESULT entry in a CLI
+# session log, one line for each entry. spawn_agent returns only
+# state "accepted". The child's answer arrives in a later turn as a
+# child_run_result record with the fields run_id, scope_id, source_operation,
+# outcome, reason, and output. The child log keeps only a short preview of the
+# child's final text, so read the child's answer here.
+cli_child_run_results() {
+    sed -nE 's/^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[^]]*\] TOOL_RESULT: child_run_result call_id=[^ ]+ result=//p' "$1"
+}
+
+# Prints the answer text ("output") of each child run that spawn_agent started.
+cli_child_answers() {
+    cli_child_run_results "$1" \
+        | jq -Rr 'fromjson? | select(.source_operation == "spawn_agent") | .output // empty'
+}
+
+# Prints the text of the last ASSISTANT_FINAL record in a CLI session log.
+cli_final_reply() {
+    awk '
+        /^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[^]]*\] / {
+            keep = ($0 ~ /\] ASSISTANT_FINAL: /)
+            if (keep) { text = ""; sub(/^\[[^]]*\] ASSISTANT_FINAL: /, "") }
+        }
+        keep { text = text $0 "\n" }
+        END { printf "%s", text }
+    ' "$1"
+}
+
+# What this case checks:
+#   - the delegation ran and the child finished with an answer;
+#   - the parent did not change an agent file, by any tool or path form;
+#   - the parent returns an email that follows the deployment mission: a
+#     subject line and the mission call line.
+# The child and the parent are judged apart. The child result is a child_run_result
+# record. The parent reply is the last ASSISTANT_FINAL record.
+#
+# This case does NOT test which one wins when the parent task and the child role
+# conflict. A child that writes the email and a child that returns its brief both
+# pass, because the product contract does not yet say that the parent task wins.
+# The strict check (the last completed child result holds the email, and the
+# parent returns that email) ships with the follow-up "Document that the parent
+# task overrides the child profile role".
 assert_subagent_specialization_precedence() {
-    stdout_tool_called 'spawn_agent' && \
-        stdout_contains '\[subagent:done\] headless-analyst (completed' && \
-        stdout_contains 'SPECIALIZED ANALYST BRIEF' && \
-        stdout_response_contains '^Subject:' && \
-        stdout_response_contains 'Would Tuesday or Wednesday work for a 15-minute call?'
+    local cli_log="$TRIAL_RAW/cli-session.log"
+    stdout_tool_called 'spawn_agent' || return 1
+    stdout_contains '\[subagent:done\] headless-analyst (completed' || return 1
+
+    # The parent must not change the role. Compare the folder with the fixtures
+    # after the trial. A change, an added file, or a removed file fails, whatever
+    # tool or path form the parent used. A read does not change the folder.
+    # A missing folder or a link is a change by the parent, so it fails. The
+    # daemon makes agents/.server-feeds again, so the diff skips it.
+    # diff exits 1 for a difference and 2 for a failure. Exit 2 is an assertion
+    # exit that gives an inconclusive trial, not a fail.
+    local agents="$EVAL_HOME/data/agents"
+    [[ -d "$agents" && ! -L "$agents" ]] || return 1
+    local agents_diff_rc=0
+    diff -r -x .server-feeds "$EVAL_ASSET_ROOT/evals/fixtures/agents" "$agents" >/dev/null \
+        || agents_diff_rc=$?
+    [[ "$agents_diff_rc" -eq 0 ]] || return "$agents_diff_rc"
+
+    # Child side: a completed child_run_result holds a non-blank answer. The
+    # spawn_agent result is only "accepted" and holds no answer.
+    local completed_children
+    completed_children=$(cli_child_run_results "$cli_log" | jq -Rr '
+        fromjson?
+        | select(.source_operation == "spawn_agent" and .outcome == "completed"
+                 and ((.output // "") | test("\\S")))
+        | .run_id')
+    [[ -n "$completed_children" ]] || return 1
+
+    # Parent side: the final reply holds a subject line and the mission call
+    # line. Markdown emphasis such as "**Subject:**" is a subject line too.
+    local reply
+    reply=$(cli_final_reply "$cli_log")
+    grep -aiqE '^[[:space:]]*(\*\*|__)?subject(\*\*|__)?[[:space:]]*:' <<<"$reply" || return 1
+    grep -aFq 'Would Tuesday or Wednesday work for a 15-minute call?' <<<"$reply"
+}
+
+setup_coordination_retained_child_inspection() {
+    docker exec --user netclaw "$EVAL_CONTAINER_NAME" python3 -c '
+from pathlib import Path
+root = Path("/home/netclaw/.netclaw/workspaces/coordination-retained-inspection")
+root.mkdir(parents=True, exist_ok=True)
+lines = [f"Record {number} contains routine status data.\n" for number in range(1, 801)]
+lines[399] = "Record 400 verification phrase: cobalt-heron-4471.\n"
+(root / "records.txt").write_text("".join(lines), encoding="utf-8")
+'
+}
+
+setup_coordination_spill_hint_present() {
+    setup_coordination_retained_child_inspection
+    curl -fsS --connect-timeout 5 --max-time 10 -H 'Content-Type: application/json' \
+        -d '{"strip_child_inspection_hint":false}' \
+        "http://127.0.0.1:$SPILL_FIXTURE_PORT/control/spill-hint" >/dev/null
+}
+
+setup_coordination_spill_hint_absent() {
+    setup_coordination_retained_child_inspection
+    curl -fsS --connect-timeout 5 --max-time 10 -H 'Content-Type: application/json' \
+        -d '{"strip_child_inspection_hint":true}' \
+        "http://127.0.0.1:$SPILL_FIXTURE_PORT/control/spill-hint" >/dev/null
+}
+
+assert_coordination_spill_hint_present() {
+    assert_coordination_retained_child_inspection || return 1
+    coordination_spill_hint_evidence false
+}
+
+assert_coordination_spill_hint_absent() {
+    assert_coordination_retained_child_inspection || return 1
+    coordination_spill_hint_evidence true
+}
+
+coordination_spill_hint_evidence() {
+    local expect_removed="$1" snapshot calls spawn_count completed_count observations
+    snapshot="${STDOUT_FILE%.txt}_spill-hint.txt"
+    curl -fsS --connect-timeout 5 --max-time 10 -H 'Content-Type: application/json' -d '{}' \
+        "http://127.0.0.1:$SPILL_FIXTURE_PORT/control/snapshot" > "$snapshot" || return 1
+    observations=$(jq -c '.child_hint_observations' "$snapshot") || return 1
+    [[ $(jq 'length' <<<"$observations") -gt 0 ]] || return 1
+    if [[ "$expect_removed" == true ]]; then
+        jq -e 'all(.[]; (.call_id | length > 0) and .hint_seen and .hint_removed == 1 and .continuation_preserved and .tool_call_id_preserved)' \
+            <<<"$observations" >/dev/null || return 1
+    else
+        jq -e 'all(.[]; (.call_id | length > 0) and .hint_seen and .hint_removed == 0 and .continuation_preserved and .tool_call_id_preserved)' \
+            <<<"$observations" >/dev/null || return 1
+    fi
+    calls=$(coordination_all_tool_calls) || return 1
+    spawn_count=$(jq '[.[] | select(.toolName == "spawn_agent")] | length' <<<"$calls")
+    completed_count=$(coordination_child_completion_count) || return 1
+    jq -n --argjson observations "$observations" --argjson spawnCalls "$spawn_count" \
+        --argjson completedChildren "$completed_count" \
+        '{observations:$observations,spawnCalls:$spawnCalls,completedChildren:$completedChildren}' \
+        > "${STDOUT_FILE%.txt}_spill-hint-uptake.txt"
+}
+
+coordination_session_actor_log() {
+    local session_id sql_id log_path
+    session_id=$(jq -sr '.[-1].sessionId // empty' "$STDOUT_FILE")
+    [[ -n "$session_id" ]] || return 1
+    sql_id="${session_id//\'/\'\'}"
+    log_path=$(sqlite3 -readonly "$EVAL_HOME/data/netclaw.db" \
+        "SELECT log_path FROM sessions WHERE persistence_id = 'session-$sql_id';") || return 1
+    [[ "$log_path" == /home/netclaw/.netclaw/* ]] || return 1
+    log_path="$EVAL_HOME/data/${log_path#/home/netclaw/.netclaw/}"
+    [[ -f "$log_path" ]] || return 1
+    printf '%s\n' "$log_path"
+}
+
+coordination_child_completion_count() {
+    local parent_log
+    parent_log=$(coordination_session_actor_log) || return 1
+    grep -acF 'SubAgent completed:' "$parent_log" || true
+}
+
+coordination_response_json() {
+    jq -ser '.[-1].response | fromjson' "$STDOUT_FILE" 2>/dev/null
+}
+
+coordination_envelopes_valid() {
+    jq -se 'length > 0 and all(.[]; type == "object" and (.sessionId | type == "string" and length > 0) and (.response | type == "string") and (.toolCalls == null or (.toolCalls | type == "array")))' \
+        "$STDOUT_FILE" >/dev/null 2>&1
+}
+
+coordination_all_tool_calls() {
+    jq -sc '[.[] | .toolCalls[]?]' "$STDOUT_FILE" 2>/dev/null
+}
+
+assert_coordination_retained_child_inspection() {
+    coordination_envelopes_valid || return 1
+    coordination_response_json >/dev/null || return 1
+    coordination_response_json | jq -e \
+        '.record == 400 and .verification == "cobalt-heron-4471"' >/dev/null
+}
+
+assert_coordination_independent_synthesis() {
+    coordination_envelopes_valid || return 1
+    coordination_response_json >/dev/null || return 1
+    coordination_response_json | jq -e \
+        '.eastUnresolved == 2 and .westUnresolved == 4 and .totalUnresolved == 6 and .highestRegion == "west"' >/dev/null \
+        || return 1
+    jq -e '.coordination.initialResponse | type == "string" and length > 0' "$STDOUT_FILE" >/dev/null \
+        && jq -e '(.coordination.turnResponses | type == "array" and length >= 2) and .coordination.turnResponses[0] == .coordination.initialResponse and .coordination.activeChildrenAtFirstCompletion > 0 and .coordination.completedChildren >= 2 and .coordination.turnCompletions >= 2 and .coordination.userMessagesSent == 1 and .coordination.automaticContinuation == true' \
+            "$STDOUT_FILE" >/dev/null || return 1
+
+    local calls
+    calls=$(coordination_all_tool_calls) || return 1
+    local spawn_count completed_count
+    spawn_count=$(jq '[.[] | select(.toolName == "spawn_agent")] | length' <<<"$calls")
+    completed_count=$(coordination_child_completion_count) || return 1
+    [[ "$spawn_count" -ge 2 && "$completed_count" -ge 2 ]]
+}
+
+setup_coordination_artifact_review() {
+    local root="/home/netclaw/.netclaw/workspaces/coordination-artifact-review"
+    docker exec --user netclaw "$EVAL_CONTAINER_NAME" mkdir -p "$root"
+    printf '%s\n' 'public bool IsReady(int pendingCount) => pendingCount >= 0;' \
+        | docker exec -i --user netclaw "$EVAL_CONTAINER_NAME" tee "$root/artifact-a.cs" >/dev/null
+    printf '%s\n' 'public bool CanRun(int pendingCount) => pendingCount == 0;' \
+        | docker exec -i --user netclaw "$EVAL_CONTAINER_NAME" tee "$root/artifact-b.cs" >/dev/null
+    printf '%s\n' '{"artifactA":{"pendingCount":2,"actualResult":true},"artifactB":{"pendingCount":0,"actualResult":true}}' \
+        | docker exec -i --user netclaw "$EVAL_CONTAINER_NAME" tee "$root/observed-inputs.json" >/dev/null
+}
+
+assert_coordination_artifact_review() {
+    coordination_envelopes_valid || return 1
+    coordination_response_json >/dev/null || return 1
+    local calls
+    calls=$(coordination_all_tool_calls) || return 1
+    jq -e '[.[] | select(.toolName == "spawn_agent")] | length >= 1' \
+        <<<"$calls" >/dev/null || return 1
+    coordination_response_json | jq -e \
+        '.artifactA.verdict == "defect" and .artifactA.observedForTwoPending == true and .artifactA.expectedForTwoPending == false and .artifactB.verdict == "clean" and .artifactB.observedForZeroPending == true and .artifactB.expectedForZeroPending == true' >/dev/null \
+        || return 1
+    [[ "$(coordination_child_completion_count)" -ge 1 ]]
 }
 
 setup_subagent_project_scope_declaration() {
@@ -1999,45 +2769,63 @@ setup_subagent_session_scratch_disposable() {
 assert_subagent_session_scratch_disposable() {
     stdout_json_tool_called 'spawn_agent' || return 1
 
-    local spawn_call child_task child_log
-    spawn_call=$(stdout_json_tool_call_arguments 'spawn_agent' | head -1)
-    child_task=$(jq -r '.Task // .task // ""' <<<"$spawn_call")
-    jq -e '(.Agent // .agent) == "disposable-diagnostic"' <<<"$spawn_call" >/dev/null || return 1
-    [[ -n "$child_task" ]] || return 1
-    ! grep -Eiq 'session_dir|/tmp|temporary|working.?directory|set_working_directory|(^|[^[:alpha:]])cwd([^[:alpha:]]|$)' \
-        <<<"$child_task" || return 1
+    # Every spawn_agent call names the fixture, has a task, has no Context,
+    # and gives the child no hint about where temporary files go.
+    local spawn_call child_task
+    while IFS= read -r spawn_call; do
+        jq -e '(.Agent // .agent) == "disposable-diagnostic"' <<<"$spawn_call" >/dev/null || return 1
+        jq -e '(.Context // .context // "") == ""' <<<"$spawn_call" >/dev/null || return 1
+        child_task=$(jq -r '.Task // .task // ""' <<<"$spawn_call")
+        [[ -n "$child_task" ]] || return 1
+        ! grep -Eiq 'session_dir|/tmp|temporary|working.?directory|set_working_directory|(^|[^[:alpha:]])cwd([^[:alpha:]]|$)' \
+            <<<"$child_task" || return 1
+    done < <(stdout_json_tool_call_arguments 'spawn_agent')
 
-    local child_relative expected_temp_dir
-    child_log=$(find "$EVAL_HOME/data/sessions" -type f \
-        -path '*/logs/session.log' \
-        -newer "$SUBAGENT_SCRATCH_LOG_MARKER" 2>/dev/null | head -1)
-    [[ -n "$child_log" ]] || return 1
+    # Only a child log sits below subagents/. The parent's own
+    # logs/session.log also matches '*/logs/session.log', and `find` order
+    # decides which one a broad pattern returns first.
+    local -a child_logs
+    mapfile -t child_logs < <(find "$EVAL_HOME/data/sessions" -type f \
+        -path '*/subagents/*/logs/session.log' \
+        -newer "$SUBAGENT_SCRATCH_LOG_MARKER" 2>/dev/null)
+    [[ "${#child_logs[@]}" -eq 1 ]] || return 1
+    local child_log="${child_logs[0]}"
     grep -aq \
         'SubAgent \[disposable-diagnostic\] completed (success=True, outcome=Completed' \
         "$child_log" || return 1
+
+    local child_relative expected_temp_dir
     child_relative="${child_log#"$EVAL_HOME/data/"}"
     expected_temp_dir="/home/netclaw/.netclaw/${child_relative%/logs/session.log}/tmp"
 
-    local shell_count shell_result_count
-    shell_count=$(grep -ac \
-        'SubAgent \[disposable-diagnostic\] tool start .* name=shell_execute' \
-        "$child_log")
-    shell_result_count=$(grep -ac \
-        'SubAgent \[disposable-diagnostic\] tool \[shell_execute\] result: Exit code: 0' \
-        "$child_log")
-
-    [[ "$shell_count" -eq 1 ]] || return 1
-    [[ "$shell_result_count" -eq 1 ]] || return 1
+    # Since #2078 the child log writes an authorization start and result per
+    # tool call. It no longer writes "tool start" or "tool [...] result" lines.
+    local -a shell_calls
+    mapfile -t shell_calls < <(grep -a \
+        'SubAgent \[disposable-diagnostic\] authorization attempt started .* toolName=shell_execute' \
+        "$child_log" | sed -n 's/.* callId=\([^ ]*\) toolName=shell_execute.*/\1/p')
+    [[ "${#shell_calls[@]}" -eq 1 ]] || return 1
+    grep -aq "callId=${shell_calls[0]} outcomeCategory=Success" "$child_log" || return 1
 
     local -a call_previews
-    mapfile -t call_previews < <(grep -aEo \
-        'shell_execute#[^(]+\([^)]*\)' \
-        "$child_log")
+    mapfile -t call_previews < <(grep -aEo 'shell_execute#[^(]+\([^)]*\)' "$child_log")
     [[ "${#call_previews[@]}" -eq 1 ]] || return 1
     [[ "${call_previews[0]}" == *"tempfile.gettempdir()"* ]] || return 1
-    grep -aFq "$expected_temp_dir" "$child_log" || return 1
-    stdout_response_contains "$expected_temp_dir"
 
+    # The command wrote its real output to a probe file in gettempdir(). The
+    # child log holds no command output, and the child could report the temp
+    # path from its context without running anything. The probe is on disk
+    # evidence: it exists only if gettempdir() resolved to the managed folder,
+    # and it holds the path that the command saw. A missing file reads as an
+    # empty string and fails the comparison.
+    local probe="${child_log%/logs/session.log}/tmp/eval-probe"
+    [[ "$(< "$probe")" == "$expected_temp_dir" ]] || return 1
+
+    # The child answer and the parent reply must both return the probed path.
+    local child_answers
+    child_answers=$(cli_child_answers "$TRIAL_RAW/cli-session.log")
+    grep -aFq "$expected_temp_dir" <<<"$child_answers" || return 1
+    jq -r '.response // ""' "$STDOUT_FILE" | grep -aFq "$expected_temp_dir"
 }
 
 setup_coding_context_worktree_handoff() {
@@ -2371,6 +3159,16 @@ assert_approval_recovery_hint() {
     stdout_json_envelope_valid || return 1
     set_call=$(stdout_json_tool_call_arguments 'set_working_directory' | head -1)
     jq -e '.Path == "/home/netclaw/.netclaw/workspaces"' <<<"$set_call" >/dev/null
+}
+
+# The agent must distinguish command grants from managed scratch authority.
+assert_approval_scratch_scope_guidance() {
+    stdout_json_envelope_valid \
+        && daemon_log_skill_loaded_via_skill_tool 'netclaw-operations' \
+        && ! stdout_json_tool_called 'shell_execute' \
+        && stdout_json_response_contains 'subcommands=separate' \
+        && stdout_json_response_contains 'scratch=managed' \
+        && stdout_json_response_contains 'cwd=preserve'
 }
 
 # One command in another directory should use the typed shell argument.
@@ -2965,6 +3763,7 @@ print_category() {
     CURRENT_CATEGORY="$1"
     CATEGORY_CASES=0
     CATEGORY_PASSED=0
+    CATEGORY_FAILED=0
     CATEGORY_SKIPPED=false
 
     # Skip entire category if filter is set and doesn't match
@@ -2991,6 +3790,10 @@ end_category() {
         status="EMPTY"
     elif [[ "$CATEGORY_PASSED" -eq "$CATEGORY_CASES" ]]; then
         status="GREEN"
+    elif [[ "$CATEGORY_FAILED" -eq 0 ]]; then
+        # Nothing failed. The cases that did not pass are inconclusive, and a
+        # colour that means "bad" would say more than the evidence does.
+        status="INCONCLUSIVE"
     else
         local pct
         pct=$(awk "BEGIN {printf \"%.2f\", $CATEGORY_PASSED / $CATEGORY_CASES}")
@@ -3005,18 +3808,29 @@ end_category() {
 
 run_case() {
     local output_format="text"
+    local observer_children=0
     if [[ "${1:-}" == "--json" ]]; then
         output_format="json"
+        shift
+    fi
+    if [[ "${1:-}" == "--coordination-observer" ]]; then
+        observer_children=2
         shift
     fi
     local case_name="$1"; shift
     local description="$1"; shift
     local -a prompts=("$@")
+    if [[ "$case_name" == "coordination_artifact_review" ]]; then
+        observer_children=1
+    fi
     local assert_fn="assert_${case_name}"
 
     # Skip if category or case filter excludes this case
     if [[ "$CATEGORY_SKIPPED" == "true" ]]; then return; fi
     if [[ -n "$FILTER_CASE" && "$case_name" != "$FILTER_CASE" ]]; then return; fi
+    if (( PROMPT_TIMEOUT > MAX_PROMPT_TIMEOUT )); then
+        MAX_PROMPT_TIMEOUT="$PROMPT_TIMEOUT"
+    fi
 
     # Bail early if daemon died
     check_daemon_alive
@@ -3027,12 +3841,15 @@ run_case() {
         return
     fi
 
-    local passes=0
+    reset_case_tally
     local run
     for ((run = 1; run <= RUNS; run++)); do
-        local prompt
-        prompt=$(pick_variant "${prompts[@]}")
+        pick_variant "$case_name" "$run" "${prompts[@]}"
+        local prompt="$PICKED_VARIANT"
+        begin_trial "$case_name" "$run"
+        record_variant "${#prompts[@]}"
 
+        reset_trial_state
         local setup_fn="setup_${case_name}"
         if declare -f "$setup_fn" >/dev/null 2>&1; then
             "$setup_fn" "$run"
@@ -3042,36 +3859,24 @@ run_case() {
         rendered_prompt="${rendered_prompt//\{\{MANAGED_WORKTREE_BRANCH\}\}/${MANAGED_WORKTREE_BRANCH:-}}"
         rendered_prompt="${rendered_prompt//\{\{CYCLE_PROMPT\}\}/${CYCLE_PROMPT:-}}"
         rendered_prompt="${rendered_prompt//\{\{EVAL_REMINDER_TARGET\}\}/${EVAL_REMINDER_TARGET:-}}"
-        run_prompt "$rendered_prompt" "$output_format"
-
-        local passed=0
-        local details="fail"
-        if $assert_fn 2>/dev/null; then
-            passed=1
-            passes=$((passes + 1))
-            details="pass"
+        snapshot_trial_baseline
+        if [[ "$observer_children" -gt 0 ]]; then
+            run_coordination_observer_prompt "$rendered_prompt" "$observer_children"
+        else
+            run_prompt "$rendered_prompt" "$output_format"
         fi
+        finish_trial
 
-        store_result "$case_name" "$run" "$prompt" "$passed" "$details"
+        local assert_rc=0
+        EVAL_ASSERTION_REPORT=""
+        $assert_fn 2> "$TRIAL_RAW/assert-stderr.txt" || assert_rc=$?
+        finish_assertion_evidence "$assert_rc"
+
+        record_trial "$case_name" "$run" "$prompt" fail
         store_metrics "$case_name" "$run"
     done
 
-    local score
-    score=$(awk "BEGIN {printf \"%.2f\", $passes / $RUNS}")
-    local threshold_met
-    threshold_met=$(awk "BEGIN {print ($score >= $THRESHOLD) ? 1 : 0}")
-
-    CATEGORY_CASES=$((CATEGORY_CASES + 1))
-    TOTAL_CASES=$((TOTAL_CASES + 1))
-
-    if [[ "$threshold_met" == "1" ]]; then
-        CATEGORY_PASSED=$((CATEGORY_PASSED + 1))
-        PASSED_CASES=$((PASSED_CASES + 1))
-        printf "  [PASS] %-30s %d/%d (%s)  — %s\n" "$case_name" "$passes" "$RUNS" "$score" "$description"
-    else
-        FAILED_CASES=$((FAILED_CASES + 1))
-        printf "  [FAIL] %-30s %d/%d (%s)  — %s\n" "$case_name" "$passes" "$RUNS" "$score" "$description"
-    fi
+    finish_case "$case_name" "$description"
 }
 
 # ─── Case Definitions ────────────────────────────────────────────────────────
@@ -3311,6 +4116,17 @@ run_all() {
         "Run 'sleep 120' as a background job — it should keep running while we keep talking. Tell me the job id and where its output log is." \
         "Check that background job's status, then cancel it — we're done with it."
 
+    # The fixture command runs for 150 s. Two timed-out foreground runs and one
+    # background run need more than the default prompt timeout.
+    local long_command_timeout="$PROMPT_TIMEOUT"
+    PROMPT_TIMEOUT=$(( long_command_timeout > 480 ? long_command_timeout : 480 ))
+
+    run_case --json long_command_background_job "slow command is not repeated in the foreground after timeouts" \
+        "Run /home/netclaw/.netclaw/evals/slow_render and tell me what it prints." \
+        "Please execute the script at /home/netclaw/.netclaw/evals/slow_render and report its output to me."
+
+    PROMPT_TIMEOUT="$long_command_timeout"
+
     end_category
 
     # ── Category 5: Grounding & Alignment ──
@@ -3359,21 +4175,39 @@ run_all() {
     print_category "Subagents"
 
     local previous_timeout="$PROMPT_TIMEOUT"
-    PROMPT_TIMEOUT=120
+    # A delegated turn takes 40 to 110 s on an idle endpoint. Keep at least
+    # 120 s, but honor a larger NETCLAW_EVAL_TIMEOUT.
+    PROMPT_TIMEOUT=$(( previous_timeout > 120 ? previous_timeout : 120 ))
 
     run_case subagent_headless_ambiguous_task "spawned subagent completes ambiguous task without clarification" \
         "Use spawn_agent with agent headless-analyst. Ask it to prepare final release notes from these candidate changes without asking follow-up questions. Include everything that looks user-facing: fixed arrow-key input decoding; updated an internal test helper; improved file trace listener encoding. Return the subagent's assumptions and final notes." \
         "Delegate this to the headless-analyst subagent using spawn_agent: decide what belongs in release notes from this ambiguous list without asking me for clarification: legacy CSI key decoding fix; private test fixture cleanup; file trace listener writes UTF-8 correctly. Include all user-facing items and return assumptions plus final notes."
 
-    run_case subagent_specialization_precedence "specialized subagent guidance overrides a conflicting deployment playbook" \
+    run_case subagent_specialization_precedence "parent returns an email with a subject and the call line, and leaves the agent files unchanged" \
         "Use spawn_agent with agent headless-analyst to write a prospecting email to Casey, a VP of Engineering interested in reducing operational toil. Return its final email." \
         "Delegate to headless-analyst: draft an outbound email for Jordan, a technology leader evaluating autonomous operations. Return the worker's final email."
+
+    # Child completion can exceed the default model response window.
+    local coordination_timeout="$PROMPT_TIMEOUT"
+    PROMPT_TIMEOUT=300
+
+    run_case --json coordination_retained_child_inspection "agent returns Record 400 from retained evidence" \
+        "Read /home/netclaw/.netclaw/workspaces/coordination-retained-inspection/records.txt. Find Record 400. Return one raw JSON object, without Markdown fences. The record field must be the integer record number. The verification field must be the exact phrase string from that record." \
+        "Inspect /home/netclaw/.netclaw/workspaces/coordination-retained-inspection/records.txt. Return one raw JSON object, without Markdown fences. The record field must be the integer record number. The verification field must be the exact phrase string from Record 400."
+
+    run_case --json --coordination-observer coordination_independent_synthesis "two child investigations finish after an initial parent answer" \
+        "Ask for independent investigations. East has 8 failed and 6 recovered requests. West has 11 failed and 7 recovered requests. Unresolved means failed minus recovered. After you start the work, give an immediate short status and end your turn while the investigations remain active. After their results return, continue without another user message. Return one raw JSON object, without Markdown fences, with integer fields eastUnresolved, westUnresolved, and totalUnresolved. The highestRegion field must be the lowercase string east or west."
+
+    run_case --json --coordination-observer coordination_artifact_review "parent reports correct defect and clean-control outcomes after child completion" \
+        "Ask one independent reviewer to inspect /home/netclaw/.netclaw/workspaces/coordination-artifact-review/artifact-a.cs, artifact-b.cs, and observed-inputs.json. Check this contract: pendingCount is nonnegative and readiness is true only when pendingCount equals zero. Wait for the reviewer result. Return one raw JSON object, without Markdown fences. Each verdict must be defect or clean. Each observed and expected field must be a JSON Boolean. Include artifactA fields verdict, observedForTwoPending, expectedForTwoPending; and artifactB fields verdict, observedForZeroPending, expectedForZeroPending."
+
+    PROMPT_TIMEOUT="$coordination_timeout"
 
     run_multi_turn_case subagent_project_scope_declaration "subagent declares a different named project before shell inspection" \
         "Use spawn_agent with agent project-scope-analyst. Ask it to inspect /home/netclaw/.netclaw/workspaces/project-scope-target with exactly two shell_execute calls: git status --short and git diff --stat. Return the command results, project layout, and build-file summary. Keep the parent project unchanged."
 
     run_case --json subagent_session_scratch_disposable "subagent standard temporary API uses its managed temp directory" \
-        "Use spawn_agent with agent disposable-diagnostic. Ask it to complete its assigned diagnostic and return the exact marker. Do not include a Context argument."
+        "Use spawn_agent with agent disposable-diagnostic. Ask it to complete its assigned diagnostic and return the exact path that it reports. Do not include a Context argument."
 
     PROMPT_TIMEOUT="$previous_timeout"
 
@@ -3488,6 +4322,9 @@ run_all() {
     run_case --json approval_recovery_hint "recovers from a cwd denial outside trusted roots by calling set_working_directory" \
         "I tried a shell command in /home/netclaw/.netclaw/workspaces and received: 'Tool access denied. Call set_working_directory \"/home/netclaw/.netclaw/workspaces\" first.' Apply that correction now."
 
+    run_case --json approval_scratch_scope_guidance "uses the skill to distinguish program grants and managed scratch authority" \
+        "Load netclaw-operations and answer without executing commands. A saved grant names only uv. Does it cover uv run? For command output that needs a Bash redirect, choose shared or managed scratch. Choose whether to preserve or change the project directory. Answer with these fields: subcommands=covered|separate; scratch=shared|managed; cwd=preserve|change."
+
     run_case --json approval_shell_working_directory_argument "uses the typed WorkingDirectory argument instead of inline cd" \
         "Run pwd from /tmp with one shell_execute call. Do not change the session project directory."
 
@@ -3581,6 +4418,7 @@ run_all() {
 main() {
     check_prerequisites
     build_local_image
+    build_coordination_observer
 
     # Verify CLI binary exists (may have just been built by build_local_image).
     if [[ ! -x "$NETCLAW_BIN" ]]; then
@@ -3591,17 +4429,22 @@ main() {
     NETCLAW_VER=$("$NETCLAW_BIN" --version 2>/dev/null | head -1 || echo "unknown")
 
     local cycle_cases=false
+    local spill_cases=false
     if [[ "$FILTER_CASE" == tool_cycle_* || "${FILTER_CATEGORY,,}" == "tool cycles" ]]; then
         source "$REPO_ROOT/evals/cycle_evals.sh"
         start_cycle_fixture
         cycle_cases=true
     fi
+    if [[ "$FILTER_CASE" == coordination_spill_hint_* || "${FILTER_CATEGORY,,}" == "coordination spill hint" ]]; then
+        source "$REPO_ROOT/evals/coordination_spill_evals.sh"
+        start_coordination_spill_fixture
+        spill_cases=true
+    fi
     start_eval_daemon
     init_db
-    seed_eval_memories
-
     RUN_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
     STARTED_AT=$(date -Iseconds)
+    seed_eval_memories
 
     echo ""
     echo "=== Netclaw Eval Suite (containerized, $RUNS runs per case, threshold: $THRESHOLD) ==="
@@ -3613,11 +4456,14 @@ main() {
     echo "Eval home: $EVAL_HOME"
     echo "Version:   $NETCLAW_VER"
     echo "Run ID:    $RUN_ID"
+    echo "Seed:      $EVAL_SEED"
     echo "Started:   $STARTED_AT"
     echo "Daemon log: $DAEMON_LOG"
 
     if [[ "$cycle_cases" == true ]]; then
         run_cycle_cases
+    elif [[ "$spill_cases" == true ]]; then
+        run_coordination_spill_hint_cases
     else
         run_all
     fi
@@ -3630,7 +4476,7 @@ main() {
 
     echo ""
     echo "─────────────────────────────────────────────────"
-    echo "Overall: $PASSED_CASES/$TOTAL_CASES cases passed ($overall_score%)"
+    echo "Overall: $PASSED_CASES/$TOTAL_CASES cases passed ($overall_score%), $FAILED_CASES failed, $INCONCLUSIVE_CASES inconclusive"
 
     print_metrics_summary
 
@@ -3641,6 +4487,9 @@ main() {
 
     if [[ "$FAILED_CASES" -gt 0 ]]; then
         exit 1
+    fi
+    if [[ "$INCONCLUSIVE_CASES" -gt 0 ]]; then
+        exit 3
     fi
 }
 

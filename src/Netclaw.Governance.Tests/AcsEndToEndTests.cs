@@ -83,7 +83,8 @@ public class AcsEndToEndTests : IDisposable
                 SessionStoragePaths.CreateLegacy(
                     Path.Combine(AppContext.BaseDirectory, "netclaw-governance-e2e-workspace"),
                     Path.Combine(AppContext.BaseDirectory, "netclaw-governance-e2e-logs"),
-                    "test-session")),
+                    "test-session",
+                    ManagedTemporaryLayout.InsideSessionStorage.Instance)),
             Audience = TrustAudience.Personal,
             InlineOutputBudget = InlineOutputBudget.Default,
             InteractiveApproval = new InteractiveApprovalCapability.Unavailable(),

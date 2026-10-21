@@ -454,6 +454,42 @@ After the journal callback, the owner restores that stored context for the live 
 The actor sends the acknowledgment after the callback. The journal retains the original authority.
 Schema exposure grants no execution authority. The tool execution path still applies its authorization checks.
 
+One authority per turn (buffered input):
+
+- Owner: `SessionInputFlow.DrainBufferedBatch`. The actor calls it after a turn, after a tool batch,
+  and after a compaction.
+- Rule: a turn has one authority, fixed when the turn starts. A batch holds only the leading buffered
+  inputs of one [requester](../spec/GLOSSARY.md#requester) (`TurnContext.HasSameRequester`).
+  An input from another requester waits for its own turn. Nothing changes the authority of a running turn.
+- After a turn, the first buffered input starts a new turn. The flow adopts the recorded
+  `InputAdmitted.TurnContext` of that input. The actor then derives trust and the prompt audience for it
+  (`ApplyBufferedBatch`). Until the actor derives trust, the trust context is empty, so tool exposure fails closed.
+- Inside a turn (tool batch or compaction), only inputs of the turn's requester join. The turn keeps its authority.
+- An overflow replay is the current turn's own message. It always continues the current turn.
+- Data: the buffer and the current authority are actor-local. Each buffered command carries a copy of its
+  recorded authority. The journal keeps the durable `InputAdmitted` record.
+- Before this change, the flow sent the whole buffer in one call, and the call ran under the previous
+  turn's authority (or no authority after a failed turn).
+
+```text
+schematic: drain(continuesTurn)
+  owner = continuesTurn or buffer[0] is replay ? current authority : recorded authority of buffer[0]
+  batch = leading inputs where input is replay or HasSameRequester(input, owner)
+  if the batch starts a turn: current authority = owner; trust = derive(owner)
+  the remaining inputs keep their order and wait
+```
+
+A valid example: Alice's turn runs a tool. Alice sends a second message during the tool call.
+The message joins Alice's turn at the tool boundary.
+An invalid example: a reminder turn runs a tool, and Bob sends a message during the tool call.
+Bob's message must not join the reminder turn, and it must not run under the reminder authority.
+It waits and starts its own turn under Bob's authority.
+A focused mutation gate (`./scripts/run-input-one-authority-mutations.sh`) guards the owner choice, the join rule,
+and the automation check of `PlanNewInputAbandonment`.
+Known limit: the requester check ignores provenance. Two inputs of one sender with different payload taint can share
+a turn under the trust of the first input. Today each producer sets one provenance per sender, so no live mix exists.
+`SessionInputFlowAccordantTests` states the rule over generated sequences.
+
 Leaks today:
 
 - `ToolAccessPolicy` also parses shell text, runs hard deny, and builds the
@@ -563,6 +599,81 @@ The session accepts a project-directory change through
 This rule requires a successful `set_working_directory` receipt with a declared project directory.
 Within the tool-result journal callback, the actor applies the accepted context and refreshes the prompt when the directory changes.
 `PathAccessPolicy` continues to decide path access for each later call.
+
+#### Root sources
+
+`PathAccessPolicy` builds the root list of one call from these sources:
+
+| Source | Audiences | Operations |
+| --- | --- | --- |
+| Audience profile (`ReadFiles`, `WriteFiles`, `AttachFiles`) | all | the profile of the operation, with the Personal read rule below |
+| Shared sessions root and legacy logs root | Personal | all |
+| Session envelope and session directory | all | all |
+| Managed temporary key folder `<base>/<key>` (issue #2554) | all | all |
+| Global read roots (`{skills_dir}`, `{identity_dir}`, `{workspaces_dir}`) | Personal, Team | `Read` |
+| Declared project directory, and `{workspaces_dir}` for a write | the trusted-root list of a mode `All` profile and of a project declaration | all |
+
+The managed temporary key folder comes from
+`SessionStorage.ManagedTemporary.StorageRoot`. On POSIX it is
+`/tmp/netclaw-<uid>/<key>` (see
+[session-cwd](../../openspec/specs/session-cwd/spec.md#requirement-managed-temporary-directory-is-the-private-temporary-location)).
+The shared base `/tmp/netclaw-<uid>` is never a root. A configured Team or
+Public root can still cover the base, for example a root `/tmp`. For a Team or
+Public call, `PathAccessPolicy.Evaluate` therefore denies each path below the
+base that is outside the own key folder. The base itself stays reachable
+through such a root. Personal reaches every key folder, as it reaches every
+session directory. On Windows the storage root is the session envelope, which
+is already a root.
+
+- Valid: a Team session reads `/tmp/netclaw-1000/<own key>/p/frame.png`.
+- Invalid: a Team session with a configured root `/tmp` reads or writes
+  `/tmp/netclaw-1000/<other key>/p/frame.png`. The decision is `Denied`.
+
+`ManagedTemporaryEnvironment.EnsureFolders` is the one creator of these
+folders. It makes the base and the key folder with mode 0700, and it refuses
+when a folder is a symbolic link, has another owner, or has a group or other
+bit. It never uses another folder. The shell launch calls it through
+`Prepare`. `file_write` and `file_edit` call it before each write or edit
+below the base, because a Team session has no shell. The checks are
+call-local.
+
+The file tools use the key folder as their root. The
+[scratch redirect composition](#managed-scratch-redirects-and-command-consent)
+uses only the run folder (`.../p` or `.../c<h>`). That rule is narrower and
+fails closed.
+
+#### The Personal read rule
+
+Issue #2554 (owner decision, 18 Oct 2026) restored the #1770 guarantee in a
+form that agrees with D2: a Personal file tool reads each path that the
+Personal shell can write. The shell checks each path with the `Write`
+operation, so the shell trust zone is the `WriteFiles` profile.
+
+```text
+// schematic: protection runs later and does not change
+effective profile (audience, operation, profile):
+    access = profile of the operation
+    if audience is not Personal, or operation is not Read or Attach:
+        return access                    // Write and DeclareProjectScope keep their profile
+    if WriteFiles.Mode == All:   return All
+    if WriteFiles.Mode == Roots: return Roots(access roots + write roots)
+    return access                        // WriteFiles.Mode == None
+```
+
+`Evaluate` and `GetTrustedRoots` use the same effective profile, so the
+prompt, the reviewed-safe read check, and the decision agree. The data is
+call-local.
+
+- Valid: Personal, `ReadFiles = Roots [~/repositories]`, `WriteFiles = All`.
+  `file_read /tmp/gifcheck/a.png` is allowed.
+- Invalid: Personal, `WriteFiles = All`. `file_read <config>/secrets.json` is
+  denied, because protection wins.
+- Invalid: Team, `ReadFiles = Roots [{session_dir}]`,
+  `WriteFiles = Roots [{session_dir}, D]`. `file_read D/x` is denied. A Team
+  write-only folder stays write-only.
+
+`netclaw doctor` warns when a profile can write wider than it can read
+(`ToolAudienceProfilesDoctorCheck`, TA-16). It does not fix the profile.
 
 Leaks today:
 
@@ -690,7 +801,7 @@ Leaks today:
 | Classes | Approval part of [`LlmSessionActor`](../../src/Netclaw.Actors/Sessions/LlmSessionActor.cs), [`SessionToolWorkflow`](../../src/Netclaw.Actors/Sessions/SessionToolWorkflow.cs), [`IApprovalChannel`](../../src/Netclaw.Actors/Sessions/IApprovalChannel.cs), [`ParentSessionApprovalBridge`](../../src/Netclaw.Actors/Sessions/ParentSessionApprovalBridge.cs), [`IParentApprovalBridge`](../../src/Netclaw.Tools.Abstractions/IParentApprovalBridge.cs), the approval loop in [`SubAgentActor`](../../src/Netclaw.Actors/SubAgents/SubAgentActor.cs), [`ApprovalResponseFlow`](../../src/Netclaw.Channels/ApprovalResponseFlow.cs), [`PendingApprovalLookup`](../../src/Netclaw.Channels/PendingApprovalLookup.cs), [`ApprovalButtonValueCodec`](../../src/Netclaw.Actors/Protocol/ApprovalButtonValueCodec.cs), [`ApprovalOptionKeys`](../../src/Netclaw.Actors/Protocol/ApprovalOptionKeys.cs), the Slack, Discord, and Mattermost prompt builders |
 | Published contract | Output `ToolInteractionRequest` and input `ToolInteractionResponse` ([`SessionProtocol.Outputs.cs`](../../src/Netclaw.Actors/Sessions/SessionProtocol.Outputs.cs)). Journal events `ToolApprovalRequested` and `ToolApprovalResolved`. Option key strings such as `approve_once`. |
 | Must not know | Policy rules. It renders the options that Consent offers. |
-| Data | Durable session journal. Actor-local state for an unanswered request. A subagent request is live-only. |
+| Data | Durable session journal. Actor-local state for an unanswered request. Durable child requests use the same journal events. |
 | Rules | [TA-10](../../openspec/specs/tool-authorization/spec.md#requirement-ta-10-consent-prompts-offer-only-safe-options), [TA-11](../../openspec/specs/tool-authorization/spec.md#requirement-ta-11-an-unanswered-consent-request-survives-restart), [TA-12](../../openspec/specs/tool-authorization/spec.md#requirement-ta-12-subagent-consent-goes-through-the-parent-session) |
 
 Leaks today:
@@ -709,7 +820,171 @@ The actor writes grants, persists events, and emits outputs. The lifetime owner 
 
 The workflow releases a claimed live wait only after the actor completes the required grant and journal steps.
 The journal retains durable parent-session approval requests so a UI answer can safely resume interrupted work.
-Live-only child prompts have no journal record and expire after restart.
+Durable child prompts use the same approval owner and request/resolution events.
+The run ID identifies the child. The original child call ID identifies its concrete tool action.
+The workflow retains the original requester, authority, and offered options.
+A later user turn cannot replace those facts.
+The status tool exposes the unresolved prompt count only to the original owner.
+Child prompts do not block an unrelated parent turn or another ready child result.
+The snapshot gate still accounts for all unresolved approval evidence.
+
+The child dispatch gate closes before a cancellation acknowledgement or terminal publication.
+The acknowledgement reports durable cancellation intent. It does not report terminal completion.
+Recovery settles an uncertain child as lost and does not launch a replacement actor.
+A stale answer cannot dispatch a recovered child or grant authority for another child.
+An answer for a call with no open prompt grants nothing and runs nothing.
+Owner: `SessionToolWorkflow.RejectClosedCall`, on the live route and on the idle or recovered route.
+It selects only the nack reason and the notice:
+
+- A second answer to a prompt that has an answer gets reason `approval_already_answered` and an
+  "already has an answer" notice. It does not say "expired", because the prompt did not expire.
+- During the turn, the answer is actor-local in the workflow table. After the turn ends, and after a restart,
+  the durable fact is the tool result of the call in session history.
+- A synthetic abandonment result (text starts with `ParkedToolBatchHistory.AbandonedResultPrefix`) is not an answer.
+- An answer for a call that never existed, a call that recovery removed, or a call that an abandonment
+  closed gets reason `approval_prompt_expired` and the "expired" notice.
+- After a restart, an old child prompt is expired (TA-12), because child calls are not in the parent history.
+
+A valid example: Alice denies a prompt, the turn ends, and her second click on "approve once" gets
+"already has an answer". An invalid example: a forged answer for an unknown call ID gets "expired" and grants nothing.
+
+Child ownership (status and cancel):
+
+- Owner: `LlmSessionActor.ControlChild`. It answers `check_agent_run` for status and for cancel.
+- Check: `HasSameChildRequester`, which calls `TurnContext.CanControlChildRunOf`. The instance is the
+  requesting turn. The argument is the turn that started the run.
+- Two turns that are not reminder turns must match on six facts: session, audience, boundary, channel type,
+  sender ID, and principal classification (`TurnContext.HasSameRequester`). See
+  [requester](../spec/GLOSSARY.md#requester).
+- A reminder turn is a turn with principal `VerifiedAutomation`, source kind `reminder`, and transport authenticity
+  `LocalProcess`. The reminder path sets all three in code. A webhook turn also has `VerifiedAutomation`, and the
+  webhook sender sets its source kind through the event header or the route name. The webhook path sets the
+  authenticity `Verified`, so a webhook turn is not a reminder turn.
+- When the requester or the turn that started the run is a reminder turn, the check compares four facts: session,
+  audience, boundary, and channel type. It ignores the sender ID and the principal (issue #2524, owner decisions of
+  16 and 18 October 2026). Thus a reminder turn and any other turn of one session manage each other's child runs.
+  The other turn can be a person turn or an automated turn, such as the delivery turn of a background job.
+- The check ignores the turn ID, provenance, delivery targets, adopted-context fields, and the
+  interactive approval flag. These fields describe one message, and they change between turns of one person.
+- Data: the `OriginalContext` of the run is durable in the session journal. The context of the request is call-local.
+  The check adds no durable data.
+- The child start keeps the full authority check (`HasSameChildAuthority`, `TurnContext.HasSameAuthority`)
+  for start idempotency. Approval recovery and child continuation also keep the full authority check.
+- Input batching keeps `HasSameRequester`. A reminder input never joins the turn of a person (section 3.1).
+
+| Run started by | Requester | Result |
+| --- | --- | --- |
+| Alice (person) | Alice, a later turn | allowed |
+| Alice | Bob, same session | denied |
+| person (`local`, Operator), TUI session S | reminder fire in S, same audience, boundary, and channel type | allowed |
+| reminder fire in S | person turn in S, same audience, boundary, and channel type | allowed |
+| reminder fire in S | background-job delivery turn in S, same audience, boundary, and channel type | allowed |
+| background-job delivery turn in S | reminder fire in S, same audience, boundary, and channel type | allowed |
+| reminder fire in a shared channel session S | Bob, any person of S | allowed |
+| reminder fire in S | later reminder fire in S | allowed |
+| person in session A | reminder fire in session B | denied |
+| reminder fire in session A | person turn in session B | denied |
+| person | reminder fire with another audience, boundary, or channel type | denied |
+| reminder fire | person turn with another audience, boundary, or channel type | denied |
+| person | turn with `VerifiedAutomation` and another source kind (a webhook) | denied |
+| turn with `VerifiedAutomation` and another source kind | person of another sender | denied |
+| person | webhook turn with source kind `reminder` and authenticity `Verified` | denied |
+| webhook turn with source kind `reminder` and authenticity `Verified` | person, same session | denied |
+
+A valid example: Alice starts a child in a Slack thread turn that quotes earlier messages.
+In a later turn with no quoted context, Alice asks for status and then cancels. Both calls succeed.
+A valid example: an operator starts a child in a TUI session. A `current_session` reminder of that session fires
+and calls `check_agent_run` for the run. The call returns the status.
+An invalid example: Bob asks for the status of Alice's child in the same thread.
+The check denies the request, and Bob does not see the pending approval count.
+A valid example: a reminder fire starts a child in a TUI session. The operator later asks for the status of the run
+in the same session. The call returns the status.
+An invalid example: a reminder turn of session B asks for the status of a child run of session A.
+The check denies the request, because the session differs. The same holds for a person turn of session B and a
+child run that a reminder fire started in session A.
+An invalid example: a webhook sender sends the event header `reminder`. The turn has `VerifiedAutomation` and the
+source kind `reminder`, but its authenticity is `Verified`. The check denies status and cancel for the run of a person.
+A valid example: a background job finishes and its delivery turn runs in the session where a reminder fire started
+a child. The delivery turn asks for the status of the run. The call returns the status.
+A reminder turn that cancels a run grants no tool authority. A child result never grants authority.
+
+Limits of the reminder rule (the owner accepted them on 18 October 2026):
+
+- All reminders of a session share the sender `reminder-system`. A reminder that Bob wrote in a shared channel
+  session can check or cancel a run that Alice started in the same session.
+- In the same way, any turn of a shared channel session can check or cancel a run that a reminder fire started. This
+  includes the turn of any person and the delivery turn of a background job.
+  The session is the unit of trust for a reminder. The audience, boundary, and channel type must still match.
+- Two person turns of different senders still deny each other (Alice and Bob above).
+- A reminder fire that delivers to a channel or to a new session runs in a session that has no relation to the
+  run, so it owns no run of the person's session.
+
+Two focused mutation gates guard the requester checks. `./scripts/run-child-owner-mutations.sh` covers
+`HasSameRequester`. `./scripts/run-child-control-mutations.sh` covers `CanControlChildRunOf` and the reminder turn test.
+The testable rules are the scenario "Status enforces run ownership" of the requirement "Child execution keeps the
+parent's authority", and the requirement
+"A reminder turn shares child runs with the other turns of its own session", in
+[background-subagent-runs](../../openspec/specs/background-subagent-runs/spec.md).
+
+```mermaid
+sequenceDiagram
+    participant Child
+    participant Workflow as SessionToolWorkflow
+    participant Journal
+    participant Owner
+    Child->>Workflow: Concrete call and original authority
+    Workflow->>Journal: ToolApprovalRequested with child correlation
+    Workflow->>Owner: Original options and requester
+    Owner->>Workflow: Answer for this prompt
+    Workflow->>Workflow: Validate requester, options, and live wait
+    Workflow->>Journal: ToolApprovalResolved
+    Workflow->>Child: Exact-call consent
+```
+
+A valid example is Alice's child request that Alice approves while the parent serves another turn.
+An invalid example is Bob's answer to that prompt. The workflow rejects it before consent or a grant.
+A terminal child result is tool output. It never supplies user authority through `InputAdmitted`.
+The parent retains the child's original authority through subsequent tool calls and approvals.
+
+### Managed scratch redirects and command consent
+
+`ToolAccessPolicy.WithManagedTemporaryRedirects` owns a call-local composition decision for Personal Bash calls.
+It reads the current run's managed temporary location from `ToolInvocationContext.SessionStorage`.
+See [Root sources](#root-sources) for the folder layout and the key-folder root of the file tools.
+For exact, link-free scratch redirects, the matcher projects the command directory and ordinary operand scopes without the redirect scopes.
+The occurrence must have resolved command candidates, and every file target must stay in that run's managed directory or name the null device.
+An ineligible occurrence retains its ordinary command and redirect scopes.
+The candidate's transient `UsesFileToolRedirects` fact selects the existing file-tool admission, read checks, and consent rules.
+The grant actor still receives the canonical command words and ordinary scopes. Persistent grants do not change.
+Each file operation that needs consent has its own exact candidate.
+A composed redirect also retains an exact command candidate.
+The Once answer binds both candidates, their scopes, and their assignment digests.
+
+```mermaid
+flowchart TD
+  A[Admission and hard deny] --> B[Protected paths and trusted roots]
+  B --> C[Prove current-run scratch targets]
+  C --> D[File-tool restrictions and stored file consent]
+  D --> E[Command grant and ordinary operand scopes]
+  E --> F[Launch verification]
+```
+
+A repository grant for `uv export` can cover the command in its repository with output in the current run's managed temporary directory.
+The file-write policy must also permit that output.
+The same grant supplies no scratch exemption for another run's directory, a link escape, or an arbitrary external file.
+Unknown targets retain ordinary exact-consent rules.
+An automatic shell policy does not bypass file-tool restrictions on a composed redirect.
+See [TA-8](../../openspec/specs/tool-authorization/spec.md#requirement-ta-8-every-candidate-needs-coverage).
+
+`TemporaryPathCorrectionPolicy` also recognizes proved platform-temporary outputs from a project command.
+It preserves the command directory and ordinary operands.
+It refuses this advice for input redirects, outputs inside the project, and commands that run no program.
+The model submits a new call. Advice neither changes source nor grants authority.
+See [TA-9](../../openspec/specs/tool-authorization/spec.md#requirement-ta-9-agent-correction-precedes-a-prompt-and-grants-no-authority).
+
+`ShellPolicyCoordinator` adds bounded grant-reach and validated mismatch explanations to the existing consent display text.
+This text changes no candidate words, grant scopes, option keys, or one-time identity.
+See [TA-10](../../openspec/specs/tool-authorization/spec.md#requirement-ta-10-consent-prompts-offer-only-safe-options).
 
 ### 3.7 Advice (support module)
 
@@ -721,6 +996,14 @@ Live-only child prompts have no journal record and expire after restart.
 | Must not know | It must not be an input to authority. |
 | Data | Call-local. The managed-temp retry key is call-local state in `ToolApprovalAttempt`. |
 | Rules | [TA-9](../../openspec/specs/tool-authorization/spec.md#requirement-ta-9-agent-correction-precedes-a-prompt-and-grants-no-authority) |
+
+On POSIX the managed temporary folder is below `/tmp` (issue #2554). Each
+advice route skips the own folder of the call, so the advice never sends the
+agent from its own folder to the same folder:
+
+- the `file_write` and `file_edit` route skips a path inside the run folder;
+- the project-output route (#2563) skips a redirect into the run folder;
+- the working-directory route starts only at the platform temporary root.
 
 Leak today: `IsEligiblePlatformTemporaryPath` is also an authority input for
 causal intent. **Planned:** move that rule into Filesystem authority as a named
@@ -817,8 +1100,33 @@ Facts behind the diagram (current code):
 - No timer denies an unanswered request. The session and its subagents ask
   through one prompt, `ParentSessionApprovalBridge`, which waits with the
   session's approval timeout. The daemon sets that timeout to infinite. The
-  request waits until the operator answers, the run is cancelled, or a new user
-  message abandons the parked batch.
+  request waits until the operator answers, the run is cancelled, or a new
+  message from a person abandons the parked batch.
+- Automated input never abandons an open approval
+  (`SessionToolWorkflow.PlanNewInputAbandonment`). Input with the principal
+  `VerifiedAutomation` or `SystemProcess` (a reminder fire, a webhook, a
+  background job completion) waits in the buffer. It runs as its own turn after
+  the turn that closes the approval. If the approval closes with no re-drive,
+  the actor starts the waiting turn (`StartWaitingInputAfterApproval`).
+- The session acknowledges a waiting input after the journal stores it
+  (`InputAdmitted`). The waiting queue is actor-local. A restart or an idle
+  passivation drops the queue, and the session still passivates while input
+  waits. On recovery, when a parked approval remains, the actor rebuilds the
+  queue from the pending `InputAdmitted` records (`RestoreWaitingInputs`).
+  Each input keeps its recorded authority. The flow rebuilds the source from
+  the record, so a reminder keeps its id (`SourceMessageId`).
+- When the idle handler closes a half-answered batch and input waits behind
+  it, no approval stays parked, so a recovery would not rebuild that input.
+  The session runs the waiting input first, and then it passivates
+  (`SessionExecutionLifetime.DeferIdlePassivationUntilWaitingInputEnds`).
+- An actor restart can rebuild an input and also requeue it. Activation removes
+  the queued copy, so each input reaches the model once.
+- Any person can abandon the approval, not only its requester. The check is
+  fail-safe: an abandonment cancels the call and grants nothing.
+  A valid example: a reminder fires while Alice's `git status` prompt is open.
+  Alice approves, the command runs once, and then the reminder turn runs.
+  An invalid example: the reminder fire closes Alice's prompt with the
+  "superseded by a new message" result. The session must not do this.
 - A subagent request goes to the parent through `ParentSessionApprovalBridge`.
   It is live-only. After a restart, Netclaw rejects the old prompt as expired.
   A subagent without a parent bridge cannot ask. Its whole run fails with
@@ -1289,10 +1597,14 @@ B), a store round trip in `ToolApprovalActorTests`, a rehydration case in
 
 1. Filesystem authority: add the root source to the catalog in
    `PathAccessPolicy` (`ResolveAndMergeRoots` or the session roots). State which
-   audiences get it.
+   audiences get it, and add a row to the root-source table in section 3.3.
+   Example: the managed temporary key folder (issue #2554) is a session root
+   for every audience. Its shared parent is not a root.
 2. Choose the link rule on purpose: links below the root, links at or below the
    root, or links from the filesystem root.
 3. Protected paths still win.
+4. Check the Personal read rule (section 3.3). A new write root source widens
+   Personal reads too. A new read-only root source does not widen writes.
 
 Tests: `UnattendedPathAccessTests` (attended and unattended reach are equal)
 and `PublicAudienceFileAccessPolicyTests` style cases for each audience, a link escape case, a protected path case, and a

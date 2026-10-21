@@ -11,6 +11,7 @@ using Netclaw.Actors.Protocol;
 using Netclaw.Actors.Sessions.Handlers;
 using Netclaw.Actors.Sessions.Pipelines;
 using Netclaw.Actors.Tools;
+using Netclaw.Actors.SubAgents;
 using Netclaw.Configuration;
 using Netclaw.Security;
 using Netclaw.Tools;
@@ -55,6 +56,9 @@ internal sealed record ToolInteractionRequestDispatch(
     bool PersistApprovalState) : INoSerializationVerificationNeeded
 {
     internal string? ManagedTemporaryDirectory { get; init; }
+    internal SubAgentRunId? SourceChildRunId { get; init; }
+    internal ToolCallId? OriginalChildCallId { get; init; }
+    internal TurnContext? ChildContext { get; init; }
 }
 
 internal enum ApprovalTurnPhase
@@ -73,16 +77,12 @@ internal sealed record ApprovalRedrivePlan(
     IReadOnlyDictionary<string, string>? ManagedTemporaryDenialDirectories,
     IReadOnlyDictionary<string, AuthorizationAttemptId>? AuthorizationAttemptIds);
 
-internal abstract record PreparedFreshBatch(ToolCycleDecision Decision)
-{
-    internal sealed record Stop(ToolCycleDecision Decision) : PreparedFreshBatch(Decision);
-
-    internal sealed record Ready(
-        List<FunctionCallContent> Calls,
-        PreparedToolCycleBatch Cycle,
-        ToolCycleDecision Decision,
-        SerializableChatMessage AssistantMessage) : PreparedFreshBatch(Decision);
-}
+// A fresh batch always dispatches. A refused call gets a synthetic correction result in the pipeline.
+internal sealed record PreparedFreshBatch(
+    List<FunctionCallContent> Calls,
+    PreparedToolCycleBatch Cycle,
+    ToolCycleBatchDecision Decision,
+    SerializableChatMessage AssistantMessage);
 
 internal abstract record ToolApprovalCallState(PendingToolInteraction Pending);
 
@@ -115,9 +115,7 @@ internal sealed partial class SessionToolWorkflow
         // Canonical names must reach the journal, cycle policy, outputs, and executor.
         registry?.CanonicalizeToolCalls(response, calls);
         var cycle = ToolCycleSignatureFactory.Prepare(calls, executor);
-        var decision = turn.EvaluateBeforeDispatch(cycle.Action);
-        if (decision.Kind == ToolCycleDecisionKind.Stop)
-            return new PreparedFreshBatch.Stop(decision);
+        var decision = turn.EvaluateBeforeDispatch(cycle);
 
         // Persist the exact arguments that the executor will interpret.
         var assistant = ChatMessageConverter.FromAiMessage(
@@ -127,12 +125,13 @@ internal sealed partial class SessionToolWorkflow
                 var (meta, cleaned) = executor.PrepareToolCall(call);
                 return (meta, cleaned.Arguments);
             });
-        return new PreparedFreshBatch.Ready(calls, cycle, decision, assistant);
+        return new PreparedFreshBatch(calls, cycle, decision, assistant);
     }
 
     public SessionState ApplyBatchStarted(SessionState state, ToolBatchStarted started)
     {
-        if (state.FindLastUserMessage() != started.UserMessage)
+        state = state.CommitChildContinuation(started.ChildContinuation, close: false);
+        if (started.ChildContinuation is null && state.FindLastUserMessage() != started.UserMessage)
             state = state with { History = state.History.Add(started.UserMessage) };
         if (!state.History.Contains(started.AssistantMessage))
             state = state with { History = state.History.Add(started.AssistantMessage) };
@@ -154,6 +153,9 @@ internal sealed partial class SessionToolWorkflow
         _activeBatch.Start(calls, cycle);
     }
 
+    /// <summary>Add the repeat nudge after the results of the batch that <see cref="StartDispatch"/> started.</summary>
+    public void AddRepeatNudgeAfterBatch(string nudge) => _activeBatch.AddNudgeAfterResults(nudge);
+
     public SessionToolBatch CreateBatch(
         TurnContext turnContext,
         SessionToolRunEnvironment environment,
@@ -166,10 +168,12 @@ internal sealed partial class SessionToolWorkflow
         bool setWorkingDirectoryAvailable,
         Func<string, ToolInvocationContext, bool>? canDeclareWorkingDirectory,
         ApprovalRedrivePlan? approvalPlan,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlySet<string> refusedCallIds)
         => new(turnContext, environment)
         {
             ToolCalls = calls,
+            RefusedCallIds = refusedCallIds,
             DefaultTimeout = timeout,
             ReplyTo = replyTo,
             EmitSubAgentOutput = emitSubAgentOutput,
@@ -209,8 +213,8 @@ internal sealed partial class SessionToolWorkflow
 
     public ToolCallId RecordOutcome(ToolCallResult result) => _activeBatch.RecordOutcome(result);
 
-    public BatchCompletion CompleteIfReady(SessionState state, TurnStateTracker turn, int limit)
-        => _activeBatch.CompleteIfReady(state, turn, limit);
+    public BatchCompletion CompleteIfReady(SessionState state, TurnStateTracker turn)
+        => _activeBatch.CompleteIfReady(state, turn);
 
     public void ClearCompletedBatch() => _activeBatch.Clear();
 
@@ -218,8 +222,7 @@ internal sealed partial class SessionToolWorkflow
         => _activeBatch.HasOnlyPendingDurableApprovals(HasRecoverablePending);
 
     public bool AllowsSnapshot(SessionState state)
-        => PendingCount == 0
-           && ResolvedCount == 0
+        => _calls.Count == 0
            && ParkedToolBatchHistory.FindRedrivableAssistantMessage(state.History, null) is null;
 
     public void ClearApprovalTurn()
@@ -254,9 +257,9 @@ internal sealed partial class SessionToolWorkflow
         MarkRunningAfterRedrive();
     }
 
-    private int PendingCount => _calls.Values.Count(static call => call is PendingToolApproval);
+    private int PendingParentCount => _calls.Values.Count(static call => call is PendingToolApproval && call.Pending.Request.SourceChildRunId is null);
 
-    private int ResolvedCount => _calls.Values.Count(static call => call is ResolvedToolApproval);
+    private int ResolvedParentCount => _calls.Values.Count(static call => call is ResolvedToolApproval && call.Pending.Request.SourceChildRunId is null);
 
     private ApprovalTurnPhase TurnPhase { get; set; }
 
@@ -268,7 +271,7 @@ internal sealed partial class SessionToolWorkflow
         var pending = PendingToolInteraction.From(evt, persistApprovalState);
         _calls[evt.CallId] = new PendingToolApproval(pending);
 
-        if (persistApprovalState && pending.TurnContext is not null)
+        if (evt.SourceChildRunId is null && persistApprovalState && pending.TurnContext is not null)
         {
             TurnPhase = recovered
                 ? ApprovalTurnPhase.RecoveredWaiting
@@ -328,7 +331,7 @@ internal sealed partial class SessionToolWorkflow
             return false;
 
         _calls[callId] = new ResolvedToolApproval(pending, answer);
-        if (PendingCount == 0 && pending.TurnContext is not null)
+        if (pending.Request.SourceChildRunId is null && PendingParentCount == 0 && pending.TurnContext is not null)
         {
             TurnPhase = ApprovalTurnPhase.Running;
         }
@@ -392,7 +395,12 @@ internal sealed partial class SessionToolWorkflow
         return builder.Build();
     }
 
-    private void ClearCalls() => _calls.Clear();
+    private void ClearCalls()
+    {
+        foreach (var key in _calls.Where(pair => pair.Value.Pending.Request.SourceChildRunId is null)
+                     .Select(pair => pair.Key).ToArray())
+            _calls.Remove(key);
+    }
 
     private void ClearTurn() => TurnPhase = ApprovalTurnPhase.None;
 

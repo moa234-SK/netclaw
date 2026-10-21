@@ -54,6 +54,7 @@ public sealed class SubAgentSpawnObservabilityTests : IDisposable
                 new GitWorkingContextInspector(TimeProvider.System),
                 NullLogger<WorkingContextSnapshotProvider>.Instance),
             logger,
+            new SessionConfig(),
             NoOpToolInvocationGovernor.Instance);
 
         // A context with a session id but no SpawnChildActor factory — the

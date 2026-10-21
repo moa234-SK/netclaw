@@ -476,34 +476,76 @@ public sealed class InitExistingInstallViewModelTests : IDisposable
     {
         // The unit's Restart=always would bring a directly killed daemon back under the data
         // being deleted, so the reset has to use the same stop as `netclaw daemon stop`.
-        var fakeDaemon = Path.Combine(_dir.Path, "netclawd");
-        File.Copy("/bin/sleep", fakeDaemon, overwrite: true);
-        if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(fakeDaemon, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-        using var daemon = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(fakeDaemon, "600") { UseShellExecute = false })!;
-        try
-        {
-            File.WriteAllText(_paths.PidFilePath, daemon.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            // No lock file on purpose: a real daemon's lock dies with the process, but a lock held by
-            // this test process would be released by an Exited callback that can run after the stop
-            // has already seen the exit, making the reset abort as "still running".
-            var unitPath = Path.Combine(_dir.Path, "netclaw.service");
-            File.WriteAllText(unitPath, "[Service]\nExecStart=/opt/netclaw/netclawd\n");
-            var runner = new RecordingCommandRunner(daemon.Id);
-            var systemd = new SystemdUserService(_paths.BasePath, unitPath, runner, enabledOnThisPlatform: true,
-                environReader: _ => null);
-            using var vm = new InitExistingInstallViewModel(
-                _paths, _nav, new DaemonManager(_paths, TimeProvider.System), systemd, _time);
+        // The stand-in gives the home its own port and listener, so the shutdown notice of the
+        // reset reaches this test and not port 5199.
+        using var standIn = StandInDaemon.Start(_paths.BasePath, _dir.Path);
+        // No lock file on purpose: a real daemon's lock dies with the process, but a lock held by
+        // this test process would be released by an Exited callback that can run after the stop
+        // has already seen the exit, making the reset abort as "still running".
+        var unitPath = Path.Combine(_dir.Path, "netclaw.service");
+        File.WriteAllText(unitPath, "[Service]\nExecStart=/opt/netclaw/netclawd\n");
+        var runner = new RecordingCommandRunner(standIn.Pid);
+        var systemd = new SystemdUserService(_paths.BasePath, unitPath, runner, enabledOnThisPlatform: true,
+            environReader: _ => null);
+        using var vm = new InitExistingInstallViewModel(
+            _paths, _nav, new DaemonManager(_paths, TimeProvider.System), systemd, _time);
 
-            StartFullReset(vm);
-            await CompleteResetAsync(vm);
-            await runner.StopSeen.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-        }
-        finally
-        {
-            if (!daemon.HasExited)
-                daemon.Kill();
-        }
+        StartFullReset(vm);
+        await CompleteResetAsync(vm);
+        await runner.StopSeen.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        // #2527 rule 1: the notice names the PID and the home of the daemon, and that daemon accepts it.
+        var notice = Assert.Single(standIn.ShutdownNotices);
+        Assert.Equal("factory-reset", notice.Reason);
+        Assert.Equal(standIn.Pid.ToString(System.Globalization.CultureInfo.InvariantCulture), notice.Pid);
+        Assert.True(notice.Home is not null && StandInDaemon.SameDirectory(notice.Home, _paths.BasePath),
+            $"The notice named home '{notice.Home}', not '{_paths.BasePath}'.");
+        Assert.Equal(200, notice.Status);
+    }
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Reset_SignalsNothingAndDeletesNothing_WhenThePidFileNamesTheDaemonOfAnotherHome()
+    {
+        // #2527 rule 4: the reset sends the same notice and needs the same proof as `netclaw daemon stop`.
+        // A stale PID file in the home to reset must not stop the daemon of another home. The reset
+        // then refuses to delete, because the PID file still names a running daemon.
+        var otherHome = Path.Combine(_dir.Path, "other-home");
+        Directory.CreateDirectory(otherHome);
+        using var other = StandInDaemon.Start(otherHome, _dir.Path);
+        using var thisHome = StandInDaemon.ListenOnly(_paths.BasePath);
+        File.WriteAllText(_paths.PidFilePath, other.Pid.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        File.WriteAllText(_paths.SqliteDbPath, "db");
+        var unitPath = Path.Combine(_dir.Path, "netclaw.service");
+        File.WriteAllText(unitPath, "[Service]\nExecStart=/opt/netclaw/netclawd\n");
+        var systemd = new SystemdUserService(
+            _paths.BasePath, unitPath, new InactiveUnitRunner(), enabledOnThisPlatform: true, environReader: _ => null);
+        using var vm = new InitExistingInstallViewModel(
+            _paths, _nav, new DaemonManager(_paths, TimeProvider.System), systemd, _time);
+
+        StartFullReset(vm);
+        // The reset either fails or goes on to delete. Wait for the first of the two.
+        var failed = WaitForProgressMessageAsync(vm, "Reset failed:");
+        var deleting = WaitForProgressAsync(vm, 3);
+        await Task.WhenAny(failed, deleting);
+        Assert.True(failed.IsCompletedSuccessfully, "The reset went on to delete after the stop.");
+
+        Assert.False(other.HasExited, "The reset stopped the daemon of another home.");
+        Assert.Empty(other.ShutdownNotices);
+        Assert.All(thisHome.ShutdownNotices, notice => Assert.Equal(409, notice.Status));
+        Assert.True(File.Exists(_paths.SqliteDbPath), "The reset deleted data.");
+        Assert.Contains("Nothing was deleted", vm.ProgressMessage.Value, StringComparison.Ordinal);
+        // S4: the PID may belong to the daemon of another home, so the default unit is the wrong thing to stop.
+        // The operator gets the recovery of the refusal instead.
+        Assert.Contains($"PID {other.Pid} is not shown to serve {_paths.BasePath}.", vm.ProgressMessage.Value, StringComparison.Ordinal);
+        Assert.Contains($"delete {_paths.PidFilePath}", vm.ProgressMessage.Value, StringComparison.Ordinal);
+        Assert.Contains($"'kill {other.Pid}'", vm.ProgressMessage.Value, StringComparison.Ordinal);
+        Assert.DoesNotContain("systemctl --user stop netclaw.service", vm.ProgressMessage.Value, StringComparison.Ordinal);
+    }
+
+    private sealed class InactiveUnitRunner : ISystemCommandRunner
+    {
+        public Task<SystemCommandResult> RunAsync(string command, string arguments)
+            => Task.FromResult(new SystemCommandResult(3, string.Empty, StandardOutput: "inactive\n"));
     }
 
     public static bool IsLinux => OperatingSystem.IsLinux();

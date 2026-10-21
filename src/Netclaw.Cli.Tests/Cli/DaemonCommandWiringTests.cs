@@ -27,7 +27,7 @@ public sealed class DaemonCommandWiringTests : IDisposable
     private readonly string _home;
     private readonly string _fakeBin;
     private readonly string _systemctlState;
-    private readonly List<Process> _children = [];
+    private readonly List<StandInDaemon> _standIns = [];
 
     public DaemonCommandWiringTests()
     {
@@ -63,12 +63,8 @@ public sealed class DaemonCommandWiringTests : IDisposable
 
     public void Dispose()
     {
-        foreach (var child in _children)
-        {
-            if (!child.HasExited)
-                child.Kill();
-            child.Dispose();
-        }
+        foreach (var standIn in _standIns)
+            standIn.Dispose();
 
         _dir.Dispose();
     }
@@ -103,6 +99,15 @@ public sealed class DaemonCommandWiringTests : IDisposable
         string[] args,
         Dictionary<string, string>? extraEnvironment = null)
     {
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(netclawHome, args, extraEnvironment);
+        return (exitCode, stdout + stderr);
+    }
+
+    private async Task<(int ExitCode, string Stdout, string Stderr)> RunWithStreamsAsync(
+        string netclawHome,
+        string[] args,
+        Dictionary<string, string>? extraEnvironment = null)
+    {
         Directory.CreateDirectory(netclawHome);
         var cliAssembly = Path.Combine(AppContext.BaseDirectory, "netclaw.dll");
         var psi = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
@@ -126,11 +131,13 @@ public sealed class DaemonCommandWiringTests : IDisposable
         foreach (var (key, value) in extraEnvironment ?? [])
             psi.Environment[key] = value;
 
+        StandInDaemon.RequireExplicitEndpoint(netclawHome, psi.Environment);
+
         using var process = Process.Start(psi)!;
         var stdout = process.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken);
         var stderr = process.StandardError.ReadToEndAsync(TestContext.Current.CancellationToken);
         await process.WaitForExitAsync(TestContext.Current.CancellationToken);
-        return (process.ExitCode, await stdout + await stderr);
+        return (process.ExitCode, await stdout, await stderr);
     }
 
     private static int FreePort()
@@ -159,23 +166,46 @@ public sealed class DaemonCommandWiringTests : IDisposable
             FileShare.None);
     }
 
-    /// <summary>Runs a stand-in process that <c>netclaw daemon</c> recognises as netclawd.</summary>
-    private Process StartFakeDaemonProcess(string netclawHome)
+    /// <summary>
+    /// Runs a stand-in daemon that <c>netclaw daemon</c> recognises as netclawd. It also gives
+    /// the home a port and a listener, so the shutdown notice reaches this test and not port 5199.
+    /// </summary>
+    private StandInDaemon StartFakeDaemonProcess(string netclawHome)
     {
         Directory.CreateDirectory(netclawHome);
-        var fakeDaemon = Path.Combine(_dir.Path, "netclawd");
-        File.Copy("/bin/sleep", fakeDaemon, overwrite: true);
-        MakeExecutable(fakeDaemon);
-        var psi = new ProcessStartInfo(fakeDaemon, "600") { UseShellExecute = false };
-        psi.Environment["NETCLAW_HOME"] = netclawHome; // the home this daemon serves, as the real one's environment says
-        var process = Process.Start(psi)!;
-        _children.Add(process);
-        File.WriteAllText(Path.Combine(netclawHome, "netclaw.pid"), process.Id.ToString());
+        var standIn = StandInDaemon.Start(netclawHome, _dir.Path);
+        _standIns.Add(standIn);
+        return standIn;
+    }
 
-        // No lock file on purpose: a lock held by this process would be released by an Exited
-        // callback that can run after the CLI has already seen the daemon exit, so the CLI would
-        // still report it as running.
-        return process;
+    /// <summary>A stand-in whose process environment the test sets. Its PID file and port go to <paramref name="netclawHome"/>.</summary>
+    private StandInDaemon StartFakeDaemonProcessWith(
+        string netclawHome, Action<IDictionary<string, string?>> configureEnvironment, string? workingDirectory = null)
+    {
+        Directory.CreateDirectory(netclawHome);
+        var standIn = StandInDaemon.Start(netclawHome, _dir.Path, configureEnvironment, workingDirectory);
+        _standIns.Add(standIn);
+        return standIn;
+    }
+
+    /// <summary>Gives a home a port and a listener, with no process, so a command on it cannot reach port 5199.</summary>
+    private StandInDaemon ListenForHome(string netclawHome)
+    {
+        Directory.CreateDirectory(netclawHome);
+        var standIn = StandInDaemon.ListenOnly(netclawHome);
+        _standIns.Add(standIn);
+        return standIn;
+    }
+
+    // #2527 rule 1: the notice names the PID and the home of the daemon it is for, and that daemon accepts it.
+    private static void AssertOneCliStopNotice(StandInDaemon daemon)
+    {
+        var notice = Assert.Single(daemon.ShutdownNotices);
+        Assert.Equal("cli-stop", notice.Reason);
+        Assert.Equal(daemon.Pid.ToString(System.Globalization.CultureInfo.InvariantCulture), notice.Pid);
+        Assert.True(notice.Home is not null && StandInDaemon.SameDirectory(notice.Home, daemon.Home),
+            $"The notice named home '{notice.Home}', not '{daemon.Home}'.");
+        Assert.Equal(200, notice.Status);
     }
 
     private static HttpListener Listen(int port, Func<HttpListenerRequest, (int Status, string Body)> handler)
@@ -227,13 +257,13 @@ public sealed class DaemonCommandWiringTests : IDisposable
     // ── daemon stop / start ownership ───────────────────────────────────────
 
     /// <summary>The unit is active and its MainPID is the daemon this home's pid file records.</summary>
-    private Process UnitRunsDaemonOf(string netclawHome)
+    private StandInDaemon UnitRunsDaemonOf(string netclawHome)
     {
         InstallUnit();
         var daemon = StartFakeDaemonProcess(netclawHome);
         FakeSystemctl("active.code", "0");
         FakeSystemctl("active.out", "active\n");
-        FakeSystemctl("mainpid.out", daemon.Id + "\n");
+        FakeSystemctl("mainpid.out", daemon.Pid + "\n");
         return daemon;
     }
 
@@ -241,13 +271,14 @@ public sealed class DaemonCommandWiringTests : IDisposable
     [Fact(SkipUnless = nameof(IsLinux), Skip = "Drives the Linux systemd user-service path through a fake systemctl.")]
     public async Task Stop_GoesThroughTheUnit_ForTheDefaultHome()
     {
-        UnitRunsDaemonOf(DefaultNetclawHome);
+        var daemon = UnitRunsDaemonOf(DefaultNetclawHome);
 
         var (exitCode, output) = await RunAsync(DefaultNetclawHome, ["daemon", "stop"]);
 
         Assert.Equal(0, exitCode);
         Assert.Contains("--user stop netclaw.service", SystemctlCalls);
         Assert.Contains("Stopped systemd user service.", output);
+        AssertOneCliStopNotice(daemon);
     }
 
     [SlopwatchSuppress("SW001", "Drives the Linux systemd user-service path through a fake systemctl.")]
@@ -255,20 +286,21 @@ public sealed class DaemonCommandWiringTests : IDisposable
     public async Task Stop_GoesThroughTheUnit_ForANonDefaultHomeTheUnitServes()
     {
         // A drop-in `Environment=NETCLAW_HOME=...` makes the unit serve another home.
-        UnitRunsDaemonOf(ScratchHome);
+        var daemon = UnitRunsDaemonOf(ScratchHome);
 
         var (exitCode, output) = await RunAsync(ScratchHome, ["daemon", "stop"]);
 
         Assert.Equal(0, exitCode);
         Assert.Contains("--user stop netclaw.service", SystemctlCalls);
         Assert.Contains("Stopped systemd user service.", output);
+        AssertOneCliStopNotice(daemon);
     }
 
     [SlopwatchSuppress("SW001", "Drives the Linux systemd user-service path through a fake systemctl.")]
     [Fact(SkipUnless = nameof(IsLinux), Skip = "Drives the Linux systemd user-service path through a fake systemctl.")]
     public async Task Stop_GoesThroughTheUnit_ForASymlinkedSpellingOfTheDefaultHome()
     {
-        UnitRunsDaemonOf(DefaultNetclawHome);
+        var daemon = UnitRunsDaemonOf(DefaultNetclawHome);
         var link = Path.Combine(_dir.Path, "link-to-default");
         Directory.CreateSymbolicLink(link, DefaultNetclawHome);
 
@@ -277,6 +309,7 @@ public sealed class DaemonCommandWiringTests : IDisposable
         Assert.Equal(0, exitCode);
         Assert.Contains("--user stop netclaw.service", SystemctlCalls);
         Assert.Contains("Stopped systemd user service.", output);
+        AssertOneCliStopNotice(daemon);
     }
 
     [SlopwatchSuppress("SW001", "Drives the Linux systemd user-service path through a fake systemctl.")]
@@ -293,6 +326,7 @@ public sealed class DaemonCommandWiringTests : IDisposable
 
         Assert.Equal(0, exitCode);
         Assert.True(scratchDaemon.WaitForExit(5000), output);
+        AssertOneCliStopNotice(scratchDaemon);
         Assert.DoesNotContain("--user stop", SystemctlCalls);
         Assert.DoesNotContain("systemd user service", output);
     }
@@ -351,6 +385,7 @@ public sealed class DaemonCommandWiringTests : IDisposable
         Assert.Contains("--user stop netclaw.service", SystemctlCalls);
         Assert.Contains("Stopped systemd user service.", output);
         Assert.Contains("Daemon stopped", output);
+        AssertOneCliStopNotice(daemon);
     }
 
     [SlopwatchSuppress("SW001", "Drives the Linux systemd user-service path through a fake systemctl.")]
@@ -359,15 +394,23 @@ public sealed class DaemonCommandWiringTests : IDisposable
     {
         // F4: the pid file in the scratch home holds the PID of the default home's live daemon. The
         // unit's MainPID matches it, but that process serves the default home (its environment
-        // says so), so the scratch home's stop must not go through the unit.
+        // says so), so the scratch home's stop must not go through the unit. #2527: it must not
+        // signal that process either.
         var unitDaemon = UnitRunsDaemonOf(DefaultNetclawHome);
-        Directory.CreateDirectory(ScratchHome);
-        File.WriteAllText(Path.Combine(ScratchHome, "netclaw.pid"), unitDaemon.Id.ToString());
+        // The scratch home needs a port of its own, or its notice goes to port 5199.
+        var scratchListener = ListenForHome(ScratchHome);
+        File.WriteAllText(Path.Combine(ScratchHome, "netclaw.pid"), unitDaemon.Pid.ToString());
 
-        var (_, output) = await RunAsync(ScratchHome, ["daemon", "stop"]);
+        var (exitCode, output) = await RunAsync(ScratchHome, ["daemon", "stop"]);
 
+        Assert.Equal(1, exitCode);
         Assert.DoesNotContain("--user stop", SystemctlCalls);
         Assert.DoesNotContain("systemd user service", output);
+        Assert.False(unitDaemon.HasExited, output);
+        Assert.Empty(unitDaemon.ShutdownNotices);
+        // A notice for the scratch home, if the CLI sends one, goes to the endpoint of that home. The
+        // listener has no daemon behind it, so it refuses the notice.
+        Assert.All(scratchListener.ShutdownNotices, notice => Assert.Equal(409, notice.Status));
     }
 
     [SlopwatchSuppress("SW001", "Drives the Linux systemd user-service path through a fake systemctl.")]
@@ -416,6 +459,7 @@ public sealed class DaemonCommandWiringTests : IDisposable
         Assert.Equal(0, exitCode);
         Assert.True(daemon.WaitForExit(5000), output);
         Assert.DoesNotContain("--user stop", SystemctlCalls);
+        AssertOneCliStopNotice(daemon);
     }
 
     [SlopwatchSuppress("SW001", "Drives the Linux systemd user-service path through a fake systemctl.")]
@@ -484,6 +528,293 @@ public sealed class DaemonCommandWiringTests : IDisposable
         Assert.Contains("Cannot find netclawd", output); // reached the detached spawn path
     }
 
+    // ── #2527: a stop for one home never signals the daemon of another home ──
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Stop_RefusesAndSignalsNothing_WhenThisHomesPidFileNamesTheDaemonOfAnotherHome()
+    {
+        var otherHome = Path.Combine(_dir.Path, "other-home");
+        var other = StartFakeDaemonProcess(otherHome);
+        var scratchListener = ListenForHome(ScratchHome);
+        File.WriteAllText(Path.Combine(ScratchHome, "netclaw.pid"), other.Pid.ToString());
+
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(ScratchHome, ["daemon", "stop"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.False(other.HasExited, stdout + stderr);
+        Assert.Empty(other.ShutdownNotices);
+        Assert.All(scratchListener.ShutdownNotices, notice => Assert.Equal(409, notice.Status));
+        Assert.True(File.Exists(Path.Combine(ScratchHome, "netclaw.pid")), "The refusal removed the PID file.");
+        Assert.Contains("Nothing was stopped.", stderr, StringComparison.Ordinal);
+        Assert.Contains($"PID {other.Pid}", stderr, StringComparison.Ordinal);
+        Assert.Contains(ScratchHome, stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("Daemon stopped", stdout + stderr, StringComparison.Ordinal);
+        AssertRefusalPrintedOnceOnStderr(stdout, stderr, other.Pid, ScratchHome);
+        Assert.Contains($"http://127.0.0.1:{scratchListener.Port} answered for another daemon or home.", stderr, StringComparison.Ordinal);
+    }
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Stop_RefusesAndSignalsNothing_WhenThisHomesPortBelongsToTheDaemonOfAnotherHome()
+    {
+        // The config of the scratch home names the port of the other daemon, and its PID file names the
+        // PID of that daemon. The PID matches. The home does not, so the other daemon refuses the notice.
+        var otherHome = Path.Combine(_dir.Path, "other-home");
+        var other = StartFakeDaemonProcess(otherHome);
+        Directory.CreateDirectory(ScratchHome);
+        StandInDaemon.WriteDaemonPort(ScratchHome, other.Port);
+        File.WriteAllText(Path.Combine(ScratchHome, "netclaw.pid"), other.Pid.ToString());
+
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(ScratchHome, ["daemon", "stop"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.False(other.HasExited, stdout + stderr);
+        Assert.All(other.ShutdownNotices, notice => Assert.Equal(409, notice.Status));
+        Assert.Contains("Nothing was stopped.", stderr, StringComparison.Ordinal);
+        Assert.Contains($"PID {other.Pid}", stderr, StringComparison.Ordinal);
+        AssertRefusalPrintedOnceOnStderr(stdout, stderr, other.Pid, ScratchHome);
+    }
+
+    // S3: one writer. The first line of the refusal is on stderr once and not on stdout. The second line names
+    // the recovery for a stale PID file (delete it) and for a wedged daemon of this home (kill it by hand).
+    private static void AssertRefusalPrintedOnceOnStderr(string stdout, string stderr, int pid, string home)
+    {
+        var firstLine = $"PID {pid} is not shown to serve {home}.";
+        Assert.Equal(1, Occurrences(stderr, firstLine));
+        Assert.Equal(0, Occurrences(stdout, "is not shown to serve"));
+        Assert.Equal(0, Occurrences(stdout, "Nothing was stopped."));
+        Assert.Contains($"delete {Path.Combine(home, "netclaw.pid")}", stderr, StringComparison.Ordinal);
+        Assert.Contains($"'kill {pid}'", stderr, StringComparison.Ordinal);
+    }
+
+    private static int Occurrences(string text, string value)
+    {
+        var count = 0;
+        for (var index = text.IndexOf(value, StringComparison.Ordinal); index >= 0;
+             index = text.IndexOf(value, index + value.Length, StringComparison.Ordinal))
+            count++;
+
+        return count;
+    }
+
+    // ── B1: the CLI reads the target as the target would read itself ────────
+
+    private string OtherProfile => Path.Combine(_dir.Path, "other-profile");
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Stop_RefusesAndSignalsNothing_WhenTheDaemonHasNoNetclawHomeAndItsHomeFolderIsAnotherOne()
+    {
+        // The review scenario. The CLI runs with HOME=<_home> and no NETCLAW_HOME of its own choice: its home is
+        // the default home of the CLI. Daemon A runs from the unit: no NETCLAW_HOME, HOME=<another profile>.
+        // A stale PID file in the home of the CLI names A. Nothing answers on the port of the CLI home.
+        var daemon = StartFakeDaemonProcessWith(DefaultNetclawHome, environment =>
+        {
+            environment.Remove("NETCLAW_HOME");
+            environment["HOME"] = OtherProfile;
+        });
+        daemon.StopListening();
+
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(DefaultNetclawHome, ["daemon", "stop"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.False(daemon.HasExited, "The CLI sent SIGTERM to a daemon that serves another profile. " + stdout + stderr);
+        Assert.True(File.Exists(Path.Combine(DefaultNetclawHome, "netclaw.pid")), "The refusal removed the PID file.");
+        AssertRefusalPrintedOnceOnStderr(stdout, stderr, daemon.Pid, DefaultNetclawHome);
+        Assert.Contains("did not confirm PID", stderr, StringComparison.Ordinal);
+    }
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Stop_StopsTheDaemon_WhenItHasNoNetclawHomeAndItsOwnHomeFolderHoldsThisHome()
+    {
+        // The matching positive case. The daemon has no NETCLAW_HOME. The HOME of the daemon is not the HOME of
+        // the CLI, and the CLI acts on <that HOME>/.netclaw through NETCLAW_HOME.
+        var profileHome = Path.Combine(OtherProfile, ".netclaw");
+        var daemon = StartFakeDaemonProcessWith(profileHome, environment =>
+        {
+            environment.Remove("NETCLAW_HOME");
+            environment["HOME"] = OtherProfile;
+        });
+        daemon.StopListening();
+
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(profileHome, ["daemon", "stop"]);
+
+        Assert.Equal(0, exitCode);
+        Assert.True(daemon.WaitForExit(5000), stdout + stderr);
+        Assert.Contains("Daemon stopped", stdout, StringComparison.Ordinal);
+    }
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Stop_RefusesAndSignalsNothing_WhenTheDaemonHasNeitherNetclawHomeNorHome()
+    {
+        var daemon = StartFakeDaemonProcessWith(DefaultNetclawHome, environment =>
+        {
+            environment.Remove("NETCLAW_HOME");
+            environment.Remove("HOME");
+        });
+        daemon.StopListening();
+
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(DefaultNetclawHome, ["daemon", "stop"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.False(daemon.HasExited, "The CLI sent SIGTERM to a daemon that shows no home. " + stdout + stderr);
+        AssertRefusalPrintedOnceOnStderr(stdout, stderr, daemon.Pid, DefaultNetclawHome);
+    }
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Stop_RefusesAndSignalsNothing_WhenTheDaemonHasARelativeNetclawHome()
+    {
+        // The daemon started as `NETCLAW_HOME=.netclaw-dev netclawd` in /proj-a. The CLI runs in a folder where
+        // the same relative value names its own home. The CLI cannot know the folder of the daemon, so it must not
+        // guess that the folder is its own.
+        var cliHome = Path.Combine(_dir.Path, ".netclaw-dev");
+        var projectA = Path.Combine(_dir.Path, "proj-a");
+        Directory.CreateDirectory(projectA);
+        var daemon = StartFakeDaemonProcessWith(
+            cliHome, environment => environment["NETCLAW_HOME"] = ".netclaw-dev", projectA);
+        daemon.StopListening();
+
+        // WorkingDirectory of the CLI process is the scratch folder, so the relative value names cliHome there.
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(
+            cliHome, ["daemon", "stop"], new Dictionary<string, string> { ["NETCLAW_HOME"] = ".netclaw-dev" });
+
+        Assert.Equal(1, exitCode);
+        Assert.False(daemon.HasExited, "The CLI sent SIGTERM to a daemon with a relative NETCLAW_HOME. " + stdout + stderr);
+        Assert.True(File.Exists(Path.Combine(cliHome, "netclaw.pid")), "The refusal removed the PID file.");
+    }
+
+    // ── S2 at process level ─────────────────────────────────────────────────
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Stop_RefusesAndSignalsNothing_WhenAnOlderDaemonOfAnotherHomeAnswers200WithItsPidAndNoHome()
+    {
+        // The mixed-version window of `netclaw update`. The PID is right. The home is not proven, and the
+        // environment of the process names another home.
+        var otherHome = Path.Combine(_dir.Path, "other-home");
+        var other = StartFakeDaemonProcess(otherHome);
+        var scratchListener = ListenForHome(ScratchHome);
+        scratchListener.AnswerAsLegacyDaemon(other.Pid);
+        File.WriteAllText(Path.Combine(ScratchHome, "netclaw.pid"), other.Pid.ToString());
+
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(ScratchHome, ["daemon", "stop"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.False(other.HasExited, "The CLI sent SIGTERM on a 200 that proves the PID only. " + stdout + stderr);
+        AssertRefusalPrintedOnceOnStderr(stdout, stderr, other.Pid, ScratchHome);
+    }
+
+    // ── S3: status and start ────────────────────────────────────────────────
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Status_SaysThePidIsNotShownToServeThisHome_AndExitsNonZero_ForTheDaemonOfAnotherHome()
+    {
+        var otherHome = Path.Combine(_dir.Path, "other-home");
+        var other = StartFakeDaemonProcess(otherHome);
+        var scratchListener = ListenForHome(ScratchHome);
+        File.WriteAllText(Path.Combine(ScratchHome, "netclaw.pid"), other.Pid.ToString());
+
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(ScratchHome, ["daemon", "status"]);
+
+        Assert.Equal(1, exitCode);
+        var output = stdout + stderr;
+        Assert.Equal(1, Occurrences(output, $"PID {other.Pid} is not shown to serve {ScratchHome}."));
+        Assert.Contains($"No daemon of this home was proven to own PID {other.Pid}.", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("did not confirm", output, StringComparison.Ordinal);
+        Assert.Contains($"delete {Path.Combine(ScratchHome, "netclaw.pid")}", output, StringComparison.Ordinal);
+        Assert.Contains($"'kill {other.Pid}'", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("running", output, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("health/ready", output, StringComparison.Ordinal);
+        Assert.Empty(scratchListener.Requests);
+        Assert.Empty(other.Requests);
+        Assert.True(File.Exists(Path.Combine(ScratchHome, "netclaw.pid")), "Status removed the PID file.");
+        Assert.False(other.HasExited);
+    }
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Status_ReportsTheDaemonOfThisHome_AndExitsZero_WhenItIsReady()
+    {
+        var daemon = StartFakeDaemonProcess(ScratchHome);
+
+        var (exitCode, output) = await RunAsync(ScratchHome, ["daemon", "status"]);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains($"Daemon running (PID {daemon.Pid},", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("is not shown to serve", output, StringComparison.Ordinal);
+    }
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Start_RefusesOnStderrOnce_AndDoesNotSayAlreadyRunning_ForTheDaemonOfAnotherHome()
+    {
+        var otherHome = Path.Combine(_dir.Path, "other-home");
+        var other = StartFakeDaemonProcess(otherHome);
+        ListenForHome(ScratchHome);
+        File.WriteAllText(Path.Combine(ScratchHome, "netclaw.pid"), other.Pid.ToString());
+
+        var (exitCode, stdout, stderr) = await RunWithStreamsAsync(ScratchHome, ["daemon", "start"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.DoesNotContain("already running", stdout + stderr, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, Occurrences(stderr, $"Daemon was not started. PID {other.Pid} is not shown to serve {ScratchHome}."));
+        Assert.Equal(0, Occurrences(stdout, "is not shown to serve"));
+        Assert.Contains($"No daemon of this home was proven to own PID {other.Pid}.", stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("did not confirm", stdout + stderr, StringComparison.Ordinal);
+        Assert.Contains($"delete {Path.Combine(ScratchHome, "netclaw.pid")}", stderr, StringComparison.Ordinal);
+        Assert.Contains($"'kill {other.Pid}'", stderr, StringComparison.Ordinal);
+        Assert.True(File.Exists(Path.Combine(ScratchHome, "netclaw.pid")), "Start removed the PID file.");
+        Assert.False(other.HasExited);
+    }
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Start_ReportsTheDaemonOfThisHomeAsAlreadyRunning()
+    {
+        var daemon = StartFakeDaemonProcess(ScratchHome);
+
+        var (exitCode, output) = await RunAsync(ScratchHome, ["daemon", "start"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains($"Daemon already running (PID {daemon.Pid}).", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Daemon_help_names_the_refusal_and_its_recovery()
+    {
+        var (_, output) = await RunAsync(ScratchHome, ["daemon", "--help"]);
+
+        Assert.Contains("is not shown to serve", output, StringComparison.Ordinal);
+        Assert.Contains("netclaw.pid", output, StringComparison.Ordinal);
+        Assert.Contains("kill", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("pkill", output, StringComparison.Ordinal);
+    }
+
+    [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    [Fact(SkipUnless = nameof(IsLinux), Skip = "Uses a copy of /bin/sleep as the stand-in daemon process.")]
+    public async Task Stop_SendsTheNoticeToThisHomesOwnPort_NotToTheEndpointVariable()
+    {
+        // NETCLAW_DAEMON_ENDPOINT can name a remote or another local daemon. The signal always goes to
+        // a local PID, so the proof must come from the daemon at the port of this home.
+        var daemon = StartFakeDaemonProcess(ScratchHome);
+        var decoy = ListenForHome(Path.Combine(_dir.Path, "decoy-home"));
+
+        var (exitCode, output) = await RunAsync(
+            ScratchHome,
+            ["daemon", "stop"],
+            new Dictionary<string, string> { ["NETCLAW_DAEMON_ENDPOINT"] = $"http://127.0.0.1:{decoy.Port}" });
+
+        Assert.Equal(0, exitCode);
+        Assert.True(daemon.WaitForExit(5000), output);
+        AssertOneCliStopNotice(daemon);
+        Assert.Empty(decoy.Requests);
+    }
+
     // ── daemon stop under the container supervisor ──────────────────────────
 
     [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
@@ -500,6 +831,7 @@ public sealed class DaemonCommandWiringTests : IDisposable
         Assert.Equal(0, exitCode);
         Assert.True(daemon.WaitForExit(5000), output);
         Assert.Contains("The container supervisor will restart the daemon.", output);
+        AssertOneCliStopNotice(daemon);
     }
 
     [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]
@@ -513,6 +845,7 @@ public sealed class DaemonCommandWiringTests : IDisposable
         Assert.Equal(0, exitCode);
         Assert.True(daemon.WaitForExit(5000), output);
         Assert.DoesNotContain("supervisor", output);
+        AssertOneCliStopNotice(daemon);
     }
 
     [SlopwatchSuppress("SW001", "Uses a copy of /bin/sleep as the stand-in daemon process.")]

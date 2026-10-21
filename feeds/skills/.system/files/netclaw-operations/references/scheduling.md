@@ -13,7 +13,7 @@ The tools are deferred: call `load_tool(name)` first.
 |-----------|--------------------|------------------|
 | List reminders; read a schedule, a status, or the next fire time | `list_reminders` (`Filter`: `active` or `all`; `all` adds disabled reminders) | `netclaw reminder list` |
 | Create or change a reminder | `set_reminder` (see below) | none |
-| Stop a reminder (disable it) | `cancel_reminder` (`ReminderId`) | `netclaw reminder cancel <id>` |
+| Stop a reminder (a one-shot is deleted; a recurring reminder is disabled) | `cancel_reminder` (`ReminderId`) | `netclaw reminder cancel <id>` |
 | Read the run history | `get_reminder_history` (`ReminderId`, optional `Last`) | `netclaw reminder history <id>` |
 | Test a reminder in this chat | `run_reminder` (`Id`) | `netclaw reminder run <id>` |
 
@@ -52,7 +52,7 @@ Delivery contract parameters:
 - `delivery_kind`: required, one of `current_session`, `channel`, `none`
 - `delivery_transport`: required when `delivery_kind=channel` (e.g. `slack`, `discord`, `mattermost`)
 - `delivery_address`: required when `delivery_kind=channel` (`#channel`, `@user`, or canonical ID)
-- `delivery_required`: optional bool, default `true`; set `false` only for audit/cleanup tasks
+- `delivery_required`: optional bool, default `true`; set `false` only for audit/cleanup tasks. It applies to `channel` delivery. It has no effect for `current_session`
 - `delivery_instructions`: optional content guidance only (never routing)
 - `expires_in`: optional recurring-reminder expiry duration (for `interval`/`cron` only), e.g. `"24h"`, `"7d"`
 
@@ -68,6 +68,28 @@ Rules:
   Mattermost uses the original channel and thread root ID.
   Omit `delivery_transport` and `delivery_address` for this route.
   Netclaw preserves the stored reminder audience when the reminder executes.
+  The reminder turn may check and cancel the child runs of its own session with
+  `check_agent_run`, including runs that a person started. Any other turn of that
+  session may check and cancel a child run that a reminder turn started. The
+  audience, boundary, and channel type must match. A turn cannot reach a child
+  run of another session.
+  The reminder run ends when the session accepts the fire. A later failed post
+  is not a reminder failure, and the reminder system does not retry it.
+  The history row records the acceptance and stays `ok`. When the session gives
+  up on the reply, it writes an Error log in the daemon log. The log names the
+  reminder. The session also raises a `reminder.delivery.failed` alert once for
+  each failed reply. The alert `Source` is the reminder ID. The alert reaches
+  only the notification webhooks that the operator configured in
+  `Notifications.Webhooks`. With no webhook, only the Error log shows the
+  failure. Look in the daemon log and the webhook channel, not in the history,
+  for a reply that did not arrive. This holds for Slack, Discord, and
+  Mattermost. It also holds when the reminder turn starts a child run, with a
+  routed skill or an async sub-agent: that turn posts only the acceptance, and
+  a later turn posts the child result. A failed post of either reply raises
+  the alert.
+  A session keeps one waiting fire per reminder: if a fire arrives while an
+  earlier fire of the same reminder still waits for its turn, Netclaw drops the
+  newer fire and logs `reminder_fire_dropped`.
 - `channel` requires both transport + address and resolves names/handles to
   canonical IDs at set time; unresolved targets fail loud.
 - Discord reminder targets must be explicit because channel IDs and user IDs are
@@ -80,14 +102,16 @@ Rules:
   incident resolved), call `cancel_reminder` with that reminder's ID so it does
   not keep firing indefinitely.
 
-`cancel_reminder` **disables** the reminder — it stops future executions but
-preserves the definition file on disk for diagnosis and re-enablement.
-`netclaw reminder delete <id>` permanently deletes a reminder and its history.
+`cancel_reminder` deletes a one-shot reminder and disables a recurring reminder.
+A disabled recurring reminder keeps its definition, so `netclaw reminder enable <id>`
+can start it again. `netclaw reminder delete <id>` permanently deletes any reminder
+and its history.
 
 Reminders that hit 5 consecutive failures are auto-disabled with a
-`ReminderAutoDisabled` critical alert. The definition stays on disk so the
-operator can diagnose and re-enable after fixing the root cause. Both execution
-failures and scheduling failures count toward the same threshold.
+`ReminderAutoDisabled` critical alert. A recurring reminder stays on disk, so the
+operator can diagnose and re-enable it after fixing the root cause. A one-shot ends
+as `Failed` instead: its definition is deleted, and its record and history stay for
+12 days. Both execution failures and scheduling failures count toward the same threshold.
 
 A **scheduling failure** is a failure to compute the next fire time. A cron with
 no future occurrence, or an unresolvable `CRON_TZ` time zone, is a scheduling
@@ -100,18 +124,19 @@ A known execution or delivery failure starts the Akka.Reminders retry policy.
 The retry uses bounded backoff and the same durable occurrence identity. A
 successful execution resets the consecutive failure count.
 
-A one-shot reminder stays enabled while an occurrence can retry. After a
-successful acknowledgement, it becomes disabled with a `Completed` outcome. A
-poison one-shot becomes disabled with a `Failed` outcome. Either way the
-definition and its history stay available (`netclaw reminder history <id>`,
-`netclaw reminder status <id>`). A `Completed` one-shot is pruned with its
-history 12 days after it ran. Netclaw never prunes a `Failed` one-shot or any
-recurring reminder, whatever its state; only `netclaw reminder delete <id>`
-removes those (or removes a completed one sooner). Reminders that are disabled
-or auto-disabled do not count in the `failed` figure of `netclaw stats`, which
-counts only enabled reminders with failures. Creating a reminder with the id of
-a completed one-shot replaces it and drops its old history; a failed one-shot
-keeps its id until you delete it.
+A one-shot reminder stays enabled while an occurrence can retry. It deletes
+itself after it runs, after its failures reach the limit, after its expiry time,
+or after it is cancelled. Netclaw then keeps a small record of the end (the
+outcome and the time) and the run history for 12 days. `netclaw reminder status <id>`
+and `netclaw reminder history <id>` work in that period. `netclaw reminder show <id>`
+reports that the reminder ended. `list_reminders` does not show it. A one-shot that
+ended as `Failed` also keeps its prompt in that record. Read it with
+`netclaw reminder status <id>`, and set the reminder again if you need it. To run the
+same one-shot again, call `set_reminder` with the same ID. This starts a new reminder
+and discards the old history and the old record. Netclaw never deletes a recurring
+reminder on its own. Only `netclaw reminder delete <id>` removes it. Reminders that
+are disabled or auto-disabled do not count in the `failed` figure of `netclaw stats`,
+which counts only enabled reminders with failures.
 
 Each attempt has a 20-minute inactivity limit and a one-hour absolute limit.
 The durable acknowledgement lease is 70 minutes. A daemon crash therefore lets
@@ -314,75 +339,6 @@ change opens it. Use the CLI command for that setting.
 
 ## Background Jobs
 
+Background shell jobs and long commands have their own page:
+`skill_read_resource('netclaw-operations', 'references/long-running-commands.md')`.
 
-A background job is a **detached process with no expectation of completion** —
-use it for anything that outlives a single tool call: long builds, test suites,
-dev servers, watchers. Output streams to the job's log file while it runs, and
-you are notified whenever the process terminates, by whatever cause.
-
-To submit: set `_background: true` in the `shell_execute` tool call metadata.
-Approval gates are evaluated before the job starts. The submit result includes
-the output log path.
-
-Lifecycle:
-
-- **No `_timeout_seconds` = no kill timer.** The job runs until it exits, you
-  cancel it, or the session passivates. A positive `_timeout_seconds` arms an
-  explicit kill timer.
-- **Jobs are killed when the session passivates** (conversation idle past the
-  idle timeout). A job killed this way shows as `reaped` in
-  `[active-background-jobs]` on your next turn — its process is gone; resubmit
-  if still needed (its output log remains readable). For work that must survive
-  an idle conversation, use a scheduled task; check-back reminders also keep
-  the session (and its jobs) alive across a long wait.
-- On daemon restart, running jobs are killed and you receive a `lost`
-  notification with the log path — relaunch if still needed.
-- Process exit (success or failure) delivers a result turn with exit code,
-  output tail, and log path — even if the session was passivated mid-flight.
-- Netclaw retains every terminal job definition and its logs for 24 hours after
-  completion. The hourly cleanup sweep then deletes both artifact types.
-
-Monitoring a running job (e.g. waiting for a dev server to come up):
-
-- `file_read`/`grep` the output log — it streams live (secret-redacted,
-  rotation-bounded) at `~/.netclaw/jobs/{id}/output.log`.
-- `check_background_job(JobId: "id")` — status, elapsed time, live output tail
-- Probe the service directly (e.g. curl the port) once the log shows it started.
-- `check_background_job(JobId: "id", Cancel: true)` — cancel a running job.
-  **Cancel servers and watchers when you are done validating** — do not leave
-  them holding one of the 5 concurrent job slots.
-
-Rules:
-
-- Only `shell_execute` supports background mode. Other tools ignore `_background`.
-- `_timeout_seconds` alone does NOT trigger background execution.
-- For synchronous calls `_timeout_seconds` is honored as you set it (no ceiling
-  or floor); when omitted, the default tool timeout applies. Background jobs
-  differ: omitted means no timer at all.
-- Synchronous tool timeouts are wall-clock budgets for opaque tools; repeated
-  stdout/progress output does not extend them. `spawn_agent` is self-monitoring:
-  the parent applies NO timeout to it at all — the subagent owns its liveness end
-  to end (its own prefill/no-progress watchdog reports a stall, and it always
-  returns a final result). A spawned subagent is bounded only by its own internal
-  watchdog or by you cancelling the turn (send another message in the thread).
-- **Long-running delegation calls** (e.g. `curl` to a local coding-agent or
-  model server that takes minutes to respond) should run as background jobs.
-- The user must approve the command before it starts running in the background.
-- Maximum 5 concurrent background jobs; overflow queues FIFO.
-- Submission confirms acceptance. A queued job still needs a policy check when its slot opens.
-- The job keeps its exact command, cwd, shell, and child environment while it waits.
-- Use an absolute `WorkingDirectory`, or omit it to use the session or project directory.
-- A revoked grant or a newly protected path can cause a failed launch. Read the job result before another request.
-- A background job keeps its own lifetime after submission. Use its job identifier to cancel it.
-- Job definitions persist to `~/.netclaw/jobs/{id}.json` until 24 hours after
-  the job reaches a terminal state.
-
-`check_background_job` is only available when `shell_execute` is available: the
-Personal audience and a host shell mode. It validates that the requesting session matches the
-submitting session's audience and boundary.
-
-After submitting a long finite job, schedule a check-back reminder so you report
-results proactively when it completes.
-
-Active background jobs appear in the `[active-background-jobs]` section of the
-session context on every turn.

@@ -94,7 +94,17 @@ public static class SessionOutputDtoMapper
             TimestampMs = msg.TimestampMs,
             TurnNumber = msg.TurnNumber,
             TurnOutcome = msg.Outcome.ToString().ToLowerInvariant(),
-            SourceReminderId = msg.SourceReminderId?.Value
+            SourceReminderId = msg.SourceReminderId?.Value,
+            QuietEnd = msg.QuietEnd,
+            // Always an array, never null: an absent field means an earlier daemon.
+            OpenChildRunIds = [.. msg.OpenChildRunIds.Select(id => id.Value)]
+        },
+
+        SessionDeactivated msg => new SessionOutputDto
+        {
+            Type = SessionOutputTypes.SessionDeactivated,
+            SessionId = msg.SessionId.Value,
+            TimestampMs = msg.TimestampMs
         },
 
         SessionTitleOutput msg => new SessionOutputDto
@@ -280,7 +290,16 @@ public static class SessionOutputDtoMapper
                 Outcome = Enum.TryParse<TurnOutcome>(dto.TurnOutcome, ignoreCase: true, out var outcome)
                     ? outcome
                     : TurnOutcome.Completed,
-                SourceReminderId = dto.SourceReminderId is null ? null : new ReminderId(dto.SourceReminderId)
+                SourceReminderId = dto.SourceReminderId is null ? null : new ReminderId(dto.SourceReminderId),
+                QuietEnd = dto.QuietEnd ?? false,
+                OpenChildRunIds = dto.OpenChildRunIds is null
+                    ? []
+                    : [.. dto.OpenChildRunIds.Select(id => new SubAgentRunId(id))]
+            },
+            SessionOutputTypes.SessionDeactivated => new SessionDeactivated
+            {
+                SessionId = sessionId,
+                TimestampMs = dto.TimestampMs
             },
             SessionOutputTypes.SessionTitle => new SessionTitleOutput(dto.Title ?? string.Empty)
             {
@@ -293,7 +312,7 @@ public static class SessionOutputDtoMapper
                 TimestampMs = dto.TimestampMs,
                 Message = dto.ErrorMessage ?? "Unknown daemon error",
                 CorrelationId = Guid.TryParse(dto.ErrorCorrelationId, out var cid) ? cid : Guid.NewGuid(),
-                Category = Enum.TryParse<ErrorCategory>(dto.ErrorCategory, out var cat) ? cat : ErrorCategory.Unknown,
+                Category = ParseErrorCategory(dto.ErrorCategory),
                 Cause = dto.ErrorDetail is not null
                     ? new Exception(dto.ErrorDetail) : null
             },
@@ -372,6 +391,14 @@ public static class SessionOutputDtoMapper
 
         return success == false ? SubAgentRunOutcome.Failed : SubAgentRunOutcome.Completed;
     }
+
+    // The wire carries a member name. Enum.TryParse also accepts a number and a comma list, and a comma list
+    // such as "StreamFailure, Unknown" can parse to a defined member (ModelBehavior, the model verdict) that
+    // the sender never named. Accept a defined name only. Anything else is Unknown, which is infra.
+    private static ErrorCategory ParseErrorCategory(string? name)
+        => name is not null && Enum.IsDefined(typeof(ErrorCategory), name)
+            ? Enum.Parse<ErrorCategory>(name)
+            : ErrorCategory.Unknown;
 
     private static SubAgentOutput MapSubAgentOutput(SessionOutputDto dto, SessionId sessionId)
     {
