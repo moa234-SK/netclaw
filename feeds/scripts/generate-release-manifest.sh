@@ -145,8 +145,9 @@ PY
 LATEST=$(printf '%s\n' "$POINTERS" | sed -n '1p')
 LATEST_PRERELEASE=$(printf '%s\n' "$POINTERS" | sed -n '2p')
 
-# GitHub release notes URL
-RELEASE_NOTES_URL="https://github.com/netclaw-dev/netclaw/releases/tag/${VERSION}"
+# GitHub release notes URL. GITHUB_REPOSITORY is set in Actions ("owner/repo");
+# local runs fall back to the upstream repo.
+RELEASE_NOTES_URL="https://github.com/${GITHUB_REPOSITORY:-netclaw-dev/netclaw}/releases/tag/${VERSION}"
 
 mkdir -p "$(dirname "$MANIFEST_PATH")"
 cat > "$MANIFEST_PATH" << EOF

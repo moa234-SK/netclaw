@@ -127,8 +127,8 @@ public class MinisignVerifierTests
         // Verify the embedded key matches what ParsePublicKey would extract
         // from the production manifest.pub file
         const string productionPubKeyFile =
-            "untrusted comment: minisign public key C29536096818F582\n" +
-            "RWSC9RhoCTaVwiEndieBGwzLy8wWUSzm3p0FsgOEWhEHv95/B5R9WOTD\n";
+            "untrusted comment: minisign public key DDD8AE9592A59F27\n" +
+            "RWQnn6WSla7Y3TYF8wRM4Egp5gSAF3y7hFMtvgHvbZLwYcYjmuBAvMqT\n";
 
         var parsed = MinisignVerifier.ParsePublicKey(productionPubKeyFile);
 

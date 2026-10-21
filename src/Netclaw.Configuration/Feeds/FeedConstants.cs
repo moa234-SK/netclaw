@@ -26,12 +26,12 @@ public static class FeedConstants
     /// URL for the binary releases manifest.
     /// Binary assets are hosted on the dedicated releases domain, not the skills feed domain.
     /// </summary>
-    public const string BinaryManifestUrl = "https://releases.netclaw.dev/manifest.json";
+    public const string BinaryManifestUrl = "https://moa234-sk.github.io/netclaw/manifest.json";
 
     /// <summary>
     /// URL for the binary releases manifest signature (minisign detached signature).
     /// </summary>
-    public const string BinaryManifestSignatureUrl = "https://releases.netclaw.dev/manifest.json.sig";
+    public const string BinaryManifestSignatureUrl = "https://moa234-sk.github.io/netclaw/manifest.json.sig";
 
     /// <summary>
     /// Base URL for skill file downloads (Cloudflare R2 + custom domain).
