@@ -82,7 +82,8 @@ public abstract class ChildLifetimeTestBase : ApprovalWaitTestBase
             new ShellCommandPolicy(), new ToolPathPolicy([]));
         var prompt = new AudienceNamingPromptProvider();
         var spawner = new SubAgentSpawner(Clients, registry, policy, null, prompt,
-            new PlainSnapshotProvider(), NullLogger<SubAgentSpawner>.Instance, new SessionConfig());
+            new PlainSnapshotProvider(), NullLogger<SubAgentSpawner>.Instance, new SessionConfig(),
+            NoOpToolInvocationGovernor.Instance);
         registry.RegisterCore(new SpawnAgentTool(profiles, spawner, TestPaths));
         registry.RegisterCore(First);
         registry.RegisterCore(Second);

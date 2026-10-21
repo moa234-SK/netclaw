@@ -100,7 +100,8 @@ public sealed class RoutedSkillReminderDeliveryTests : ReminderDeliveryTestBase
             new WorkingContextSnapshotProvider(
                 new GitWorkingContextInspector(TimeProvider.System),
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<WorkingContextSnapshotProvider>.Instance),
-            Microsoft.Extensions.Logging.Abstractions.NullLogger<SubAgentSpawner>.Instance, new SessionConfig());
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<SubAgentSpawner>.Instance, new SessionConfig(),
+            NoOpToolInvocationGovernor.Instance);
 
         services.AddSingleton(toolRegistry);
         services.AddSingleton(subAgentRegistry);

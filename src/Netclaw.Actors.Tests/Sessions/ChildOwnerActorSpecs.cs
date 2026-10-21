@@ -72,7 +72,8 @@ public sealed class ChildOwnerActorSpecs(ITestOutputHelper output) : LlmSessionT
             new ShellCommandPolicy(), new ToolPathPolicy([]));
         var prompt = new StaticSystemPromptProvider("Test parent.");
         var spawner = new SubAgentSpawner(_clients, registry, policy, null, prompt,
-            _preparation, NullLogger<SubAgentSpawner>.Instance, new SessionConfig());
+            _preparation, NullLogger<SubAgentSpawner>.Instance, new SessionConfig(),
+            NoOpToolInvocationGovernor.Instance);
         registry.RegisterCore(new SpawnAgentTool(profiles, spawner, TestPaths));
         registry.RegisterCore(new CheckAgentRunTool());
         registry.RegisterCore(_tool);

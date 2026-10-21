@@ -399,6 +399,7 @@ public sealed class HeadlessTurnErrorCategoryEndToEndTests : IAsyncDisposable
             new FixedWorkingContext(),
             TimeProvider.System,
             paths,
+            new ActiveSessionInterventionStateReader(),
             storage));
         builder.Services.AddSingleton(new SessionToolServices(new FixedToolExecutor(), registry, null, null, null));
         builder.Services.AddSingleton(TimeProvider.System);

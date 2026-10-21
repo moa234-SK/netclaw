@@ -800,7 +800,7 @@ public sealed class SubAgentSpawnerTests : TestKit, IAsyncDisposable
             new StaticSystemPromptProvider("You are an inspector."),
             workingContextSnapshots,
             NullLogger<SubAgentSpawner>.Instance,
-            new SessionConfig(),
+            sessionConfig,
             NoOpToolInvocationGovernor.Instance);
     }
 
