@@ -342,7 +342,7 @@ jobs:
         VERSION="${{ github.ref_name }}"
         STRIPPED="${VERSION#v}"
         MAJOR_MINOR=$(echo "$STRIPPED" | awk -F. '{print $1"."$2}')
-        REPO="ghcr.io/moa234-SK/netclaw"
+        REPO="ghcr.io/moa234-sk/netclaw"
 
         # A prerelease tag (e.g. 0.19.0-beta1) must NOT move the floating stable tags
         # (:latest, :major.minor). It only gets its exact-version tag. The rolling
@@ -530,7 +530,7 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        REPO="ghcr.io/moa234-SK/netclaw"
+        REPO="ghcr.io/moa234-sk/netclaw"
         LP="${{ needs.publish-binary-manifest.outputs.latest_prerelease }}"
         if [ -z "$LP" ]; then
           echo "latest_prerelease output is empty — cannot move :beta" >&2
